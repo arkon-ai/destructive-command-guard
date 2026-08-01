@@ -3,7 +3,9 @@
 # Pack E2E Tests — transformate.secrets_emit
 #
 # Tests blocking/allowing behavior for the secret-emission guard pack.
-# Pack covers v1.0.0 (8 patterns) + v1.1.0 (2 added: at-c-job-env-dump, proc-environ-read).
+# Pack covers v1.0.0 (8 patterns) + v1.1.0 (at-c-job-env-dump, proc-environ-read)
+# + v1.3.0 (proc-cmdline-bulk, ps-argv-env-dump, pgrep-list-full — argv/env leak class,
+#   transformate WI-750; each carries a --no-secrets-near legit-use escape).
 #
 # Usage:
 #   ./scripts/test_pack_secrets_emit.sh [--verbose] [--binary PATH]
@@ -172,6 +174,55 @@ test_cmd "cat /proc/version" "allow" "cat /proc/version"
 test_cmd "cat /proc/meminfo" "allow" "cat /proc/meminfo"
 test_cmd "cat /proc/loadavg" "allow" "cat /proc/loadavg"
 test_cmd "head /proc/123/status" "allow" "head /proc/<pid>/status (not environ)"
+
+# --- v1.3.0 patterns (new: proc-cmdline-bulk, ps-argv-env-dump, pgrep-list-full) ---
+
+# proc-cmdline-bulk (DENY)
+test_cmd "cat /proc/123/cmdline" "block" "cat /proc/<pid>/cmdline"
+test_cmd "cat /proc/*/cmdline" "block" "cat /proc/*/cmdline glob"
+test_cmd "head -c 200 /proc/456/cmdline" "block" "head /proc/<pid>/cmdline"
+test_cmd "xxd /proc/1/cmdline" "block" "xxd /proc/<pid>/cmdline"
+test_cmd "strings /proc/999/cmdline" "block" "strings /proc/<pid>/cmdline"
+test_cmd "cat < /proc/999/cmdline" "block" "redirect read of /proc cmdline"
+test_cmd "for p in /proc/*/cmdline; do cat \$p; done" "block" "glob loop over /proc/*/cmdline"
+test_cmd "find /proc -maxdepth 2 -name cmdline -exec cat {} +" "block" "find /proc sweep for cmdline"
+test_cmd "cat /proc/\$(pidof bash)/cmdline" "block" "command-subst pid /proc cmdline"
+
+# proc-cmdline safe cases (ALLOW)
+test_cmd "cat /proc/123/status" "allow" "cat /proc/<pid>/status (not cmdline)"
+test_cmd "cat /proc/self/comm" "allow" "cat /proc/self/comm"
+test_cmd "find /proc -maxdepth 1 -name loadavg" "allow" "find /proc not-cmdline"
+test_cmd "NO_SECRETS_NEAR=1 cat /proc/123/cmdline" "allow" "proc cmdline with NO_SECRETS_NEAR escape"
+
+# ps-argv-env-dump (DENY)
+test_cmd "ps e" "block" "ps e (env)"
+test_cmd "ps ef" "block" "ps ef (env+forest)"
+test_cmd "ps eww" "block" "ps eww (env wide)"
+test_cmd "ps auxe" "block" "ps auxe (env)"
+test_cmd "ps -ef" "block" "ps -ef (full listing)"
+test_cmd "ps auxf" "block" "ps auxf (forest)"
+test_cmd "ps auxww" "block" "ps auxww (wide)"
+test_cmd "ps -A -o cmd" "block" "ps -A -o cmd (full argv)"
+test_cmd "ps -p 1234 -o cmd=" "block" "ps -p PID -o cmd= (full argv)"
+test_cmd "ps -eo args" "block" "ps -eo args (full argv)"
+test_cmd "ps -o command" "block" "ps -o command (full argv)"
+
+# ps safe cases (ALLOW)
+test_cmd "ps aux" "allow" "ps aux (truncated, allowed)"
+test_cmd "ps -p 1234" "allow" "ps -p PID (default cols)"
+test_cmd "ps -o pid,comm" "allow" "ps -o pid,comm (short name)"
+test_cmd "ps -ef --no-secrets-near" "allow" "ps -ef with --no-secrets-near escape"
+
+# pgrep-list-full (DENY)
+test_cmd "pgrep -af nginx" "block" "pgrep -af (full argv)"
+test_cmd "pgrep -f nginx -a" "block" "pgrep -f ... -a (full argv)"
+test_cmd "pgrep --list-full nginx" "block" "pgrep --list-full"
+
+# pgrep safe cases (ALLOW)
+test_cmd "pgrep -f nginx" "allow" "pgrep -f (PIDs only)"
+test_cmd "pgrep nginx" "allow" "pgrep bare (PIDs only)"
+test_cmd "pgrep -c nginx" "allow" "pgrep -c (count only)"
+test_cmd "NO_SECRETS_NEAR=1 pgrep -af nginx" "allow" "pgrep -af with NO_SECRETS_NEAR escape"
 
 echo "----------------------------------------"
 echo "Tests Passed: $TESTS_PASSED"
