@@ -187,10 +187,15 @@ test_cmd "cat < /proc/999/cmdline" "block" "redirect read of /proc cmdline"
 test_cmd "for p in /proc/*/cmdline; do cat \$p; done" "block" "glob loop over /proc/*/cmdline"
 test_cmd "find /proc -maxdepth 2 -name cmdline -exec cat {} +" "block" "find /proc sweep for cmdline"
 test_cmd "cat /proc/\$(pidof bash)/cmdline" "block" "command-subst pid /proc cmdline"
+test_cmd "cat /proc/1/task/1/cmdline" "block" "thread task path cmdline"
+test_cmd "cat /proc/self/task/2/cmdline" "block" "self task path cmdline"
+test_cmd "cat /proc/./1/cmdline" "block" "dot-segment /proc cmdline"
+test_cmd "cat /proc//1/cmdline" "block" "double-slash /proc cmdline"
 
 # proc-cmdline safe cases (ALLOW)
 test_cmd "cat /proc/123/status" "allow" "cat /proc/<pid>/status (not cmdline)"
 test_cmd "cat /proc/self/comm" "allow" "cat /proc/self/comm"
+test_cmd "cat /proc/cmdline" "allow" "kernel /proc/cmdline (boot args, no per-proc segment)"
 test_cmd "find /proc -maxdepth 1 -name loadavg" "allow" "find /proc not-cmdline"
 test_cmd "NO_SECRETS_NEAR=1 cat /proc/123/cmdline" "allow" "proc cmdline with NO_SECRETS_NEAR escape"
 
@@ -206,12 +211,24 @@ test_cmd "ps -A -o cmd" "block" "ps -A -o cmd (full argv)"
 test_cmd "ps -p 1234 -o cmd=" "block" "ps -p PID -o cmd= (full argv)"
 test_cmd "ps -eo args" "block" "ps -eo args (full argv)"
 test_cmd "ps -o command" "block" "ps -o command (full argv)"
+test_cmd "ps aux" "block" "ps aux (non-tty full argv)"
+test_cmd "ps au" "block" "ps au (BSD full argv)"
+test_cmd "ps ax" "block" "ps ax (BSD full argv)"
+test_cmd "ps -f" "block" "ps -f (full-format argv)"
+test_cmd "ps -F" "block" "ps -F (extra-full argv)"
+test_cmd "ps -fww" "block" "ps -fww (full wide argv)"
+test_cmd "ps --format=args" "block" "ps --format=args (long-opt argv)"
+test_cmd "ps --format command" "block" "ps --format command (long-opt argv)"
+test_cmd "ps -o CMD" "block" "ps -o CMD (case-fold argv)"
+test_cmd "ps -eo ARGS" "block" "ps -eo ARGS (case-fold argv)"
 
-# ps safe cases (ALLOW)
-test_cmd "ps aux" "allow" "ps aux (truncated, allowed)"
+# ps safe cases (ALLOW) — comm-column / process-selection forms
+test_cmd "ps -e" "allow" "ps -e (all procs, comm column)"
+test_cmd "ps -A" "allow" "ps -A (all procs, comm column)"
 test_cmd "ps -p 1234" "allow" "ps -p PID (default cols)"
 test_cmd "ps -o pid,comm" "allow" "ps -o pid,comm (short name)"
 test_cmd "ps -ef --no-secrets-near" "allow" "ps -ef with --no-secrets-near escape"
+test_cmd "NO_SECRETS_NEAR=1 ps aux" "allow" "ps aux with NO_SECRETS_NEAR escape"
 
 # pgrep-list-full (DENY)
 test_cmd "pgrep -af nginx" "block" "pgrep -af (full argv)"
@@ -223,6 +240,13 @@ test_cmd "pgrep -f nginx" "allow" "pgrep -f (PIDs only)"
 test_cmd "pgrep nginx" "allow" "pgrep bare (PIDs only)"
 test_cmd "pgrep -c nginx" "allow" "pgrep -c (count only)"
 test_cmd "NO_SECRETS_NEAR=1 pgrep -af nginx" "allow" "pgrep -af with NO_SECRETS_NEAR escape"
+
+# escape must be a token (env-assign at cmd start / bounded flag), NOT a bare substring
+# (panel R1 critical: `pgrep -af NO_SECRETS_NEAR` must still BLOCK)
+test_cmd "pgrep -af NO_SECRETS_NEAR" "block" "escape token as search arg still blocks"
+test_cmd "cat /proc/1/cmdline /tmp/NO_SECRETS_NEAR/x" "block" "escape token in decoy path still blocks"
+test_cmd "pgrep -af NO_SECRETS_NEAR=1" "block" "escape= in arg position still blocks"
+test_cmd "foo; NO_SECRETS_NEAR=1 pgrep -af nginx" "allow" "escape env-assign after ; allows"
 
 echo "----------------------------------------"
 echo "Tests Passed: $TESTS_PASSED"
