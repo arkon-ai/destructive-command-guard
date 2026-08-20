@@ -57,6 +57,9 @@ an exfiltration channel for any file it was pointed at. `code` is required by th
 tool's schema, so the executable text is present and scanned; the file's
 *contents* are data the sandbox reads, not code this adapter can verdict.
 
+Tracked as transformate WI-3059, which also records what a real fix would have to
+do: keep file contents out of the alerting path entirely.
+
 For non-shell languages (javascript / python / ruby / etc.), DCG's regex
 patterns still scan the raw source — substrings like `infisical secrets --plain`
 will match whether they live in `bash` or in a JS `execSync(...)` string. This
