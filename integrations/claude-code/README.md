@@ -13,7 +13,7 @@ the agent reaches for one of them.
 The adapter:
 
 1. Reads the Claude Code hook JSON from stdin.
-2. If the tool name CONTAINS one of `CTX_TOOL_SUFFIXES` (`context-mode__ctx_execute`,
+2. If the tool name CONTAINS one of `CTX_TOOL_TOKENS` (`context-mode__ctx_execute`,
    `…ctx_execute_file`, `…ctx_batch_execute`), extracts every code-bearing field
    and rewrites the payload as a synthetic
    `{tool_name: "Bash", tool_input: {command: <code>}}` shape.
@@ -34,11 +34,28 @@ really does deliver decorated names like `…__ctx_execute_v2`, and under `endsw
 one of them reached `allow()` with the scanner never invoked. That remedy was applied
 once and reverted; the suite now pins the decorated names as guarded.
 
-**Payload extraction is per-tool.** `ctx_execute` / `ctx_execute_file` carry a
-single `tool_input.code`; `ctx_batch_execute` carries `tool_input.commands[]` of
-`{label, command}` (older builds add a `processing` sibling) and **no** top-level
-`code`. All of them are joined one-per-line into the synthetic command so a
-single offending entry anywhere in a batch still matches.
+**Payload extraction is SHAPE-AGNOSTIC, not per-tool.** The known shapes are:
+`ctx_execute` / `ctx_execute_file` carry a single `tool_input.code`;
+`ctx_batch_execute` carries `tool_input.commands[]` of `{label, command}` (older
+builds add a `processing` sibling) and **no** top-level `code`. But the adapter
+does not key on any of that — it walks the whole `tool_input` and collects
+*every* string it finds, at any depth, then joins the non-blank ones one per line
+into the synthetic command. Keying on field names reproduced the transformate WI-2096
+drift one layer down: rename the field and a guarded call extracts nothing and sails
+through with the suite green.
+
+The observable consequence, so it is not mistaken for a bug: a dangerous-looking
+**label or path** can trigger a denial even when the executable code is benign.
+That over-matching is the deliberate trade — dcg scans text, so a needless scan
+costs nothing and a missed one is the incident.
+
+The matching residual worth knowing: the adapter verdicts on the payload's own
+text. For `ctx_execute_file` it does **not** read the file named by `path` — and
+deliberately so, because the extracted text flows into the synthetic command,
+into dcg, and into dcg-wrap's Discord alert path, which would turn the guard into
+an exfiltration channel for any file it was pointed at. `code` is required by the
+tool's schema, so the executable text is present and scanned; the file's
+*contents* are data the sandbox reads, not code this adapter can verdict.
 
 For non-shell languages (javascript / python / ruby / etc.), DCG's regex
 patterns still scan the raw source — substrings like `infisical secrets --plain`
@@ -47,7 +64,13 @@ is intentional: defends against the same emit vector in any wrapping language.
 
 ### Install
 
+**Prerequisite: `dcg-wrap` must already be installed and executable.** Since the
+fail-closed flip, a scanner that cannot be run DENIES — so installing this
+adapter on a host without `dcg-wrap` rejects every `ctx_execute`,
+`ctx_execute_file` and `ctx_batch_execute` call.
+
 ```
+test -x ~/.local/bin/dcg-wrap || echo "install dcg-wrap FIRST — ctx tools will be denied"
 cp dcg-ctx-wrap ~/.local/bin/dcg-ctx-wrap
 chmod +x ~/.local/bin/dcg-ctx-wrap
 ```
@@ -55,16 +78,24 @@ chmod +x ~/.local/bin/dcg-ctx-wrap
 ### Verify
 
 ```
-python3 test-dcg-ctx-wrap.py     # routing + payload extraction; exit 0 = pass
+python3 test-dcg-ctx-wrap.py         # adapter routing, extraction, decision contract
+node test-apply-wi2096-matcher.mjs   # applier gating, canaries, publish ordering
 ```
 
-Stubs `dcg-wrap`, so no network, no secrets, no real scan. It fails loudly if
-the tool-name keying or the batch extraction regresses to the WI-2096 shape.
+Both exit 0 on pass. They stub `dcg-wrap` and the sweep, so no network, no
+secrets, no real scan. They fail loudly if the tool-name keying, the batch
+extraction, or the fail-closed contract regresses to the transformate WI-2096 shape.
+
+**Run them on Linux.** Git Bash on Windows cannot exec the POSIX-shebang stubs,
+so every scanner verdict masks as a spurious DENY and the results are noise.
+
+A green suite is not a working install. The suites prove behaviour against
+stubs; only the applier's canary 3 proves that the real scanner is on the path.
 
 ### Wire into Claude Code (`~/.claude/settings.json`)
 
 Add alongside the existing `Bash` matcher. The matcher is a regex tested against
-the tool name — keep it **loose**, matching the suffix only, so a harness rename
+the tool name — keep it **loose** and unanchored, so a harness rename
 of the prefix keeps firing:
 
 ```json
@@ -78,15 +109,46 @@ of the prefix keeps firing:
 
 On a fleet host, don't hand-edit: `~/.claude/settings.json` is the canonical
 source the REPL-seat renderer fans out to every seat, so broken JSON propagates
-on the next sync. Use the gated applier, which backs up, patches, canaries
-against the coverage sweep, and auto-reverts if the sweep isn't green:
+on the next sync. Use the gated applier, which writes the change as a
+**candidate**, runs three canaries against it, and publishes only on green:
 
 ```
 node apply-wi2096-matcher.mjs --dry-run   # show the change, touch nothing
-node apply-wi2096-matcher.mjs             # backup → patch → canary → keep|revert
+node apply-wi2096-matcher.mjs             # candidate → canary ×3 → backup → publish
 ```
 
-Idempotent. Manual rollback: `cp ~/.claude/settings.json.bak-wi2096 ~/.claude/settings.json`.
+| canary | asserts |
+|---|---|
+| 1 | the matcher **on disk** matches every live ctx tool name (read back, not asserted against this script's own constants) |
+| 2 | the coverage sweep goes green against the candidate |
+| 3 | a known-dangerous fixture is denied **by the scanner** — not by the adapter |
+
+Canary 3 exists because the fail-closed flip made DENY ambiguous: a missing or
+broken `dcg-wrap` also denies, so "something said DENY" stopped distinguishing a
+live control from a dark one. Adapter-generated denials are recognisable — their
+reason begins `dcg-ctx-wrap: ` — and canary 3 rejects them.
+
+There is **no rollback path**, because nothing is published until the canaries
+pass: on red, `settings.json` was never modified. A backup is still taken at
+publish time. For manual rollback use the **exact timestamped path the applier
+prints** — the fixed `.bak-wi2096` name is gone, because a second run overwrote
+the only copy of the last known-good file and the documented rollback then
+restored the already-broken state:
+
+```
+cp <the backup: path printed by the applier> ~/.claude/settings.json
+```
+
+Idempotent, but **not a no-op**: a re-run re-verifies that the control still
+works and exits non-zero if it does not. "Already current" is a claim about
+matcher text, and the matcher text is not the control.
+
+| env | default | purpose |
+|---|---|---|
+| `HOOK_SETTINGS` | `~/.claude/settings.json` | canonical hook config to patch |
+| `HOOK_SWEEP` | `~/dev/warden-memory/scripts/audit-hook-matchers.mjs` | coverage sweep |
+| `CTX_WRAP` | `~/.local/bin/dcg-ctx-wrap` | wrapper the canaries exercise |
+| `HOOK_SWEEP_TIMEOUT_MS` | `120000` | ceiling on a hung sweep |
 
 ### Coverage sweep
 
@@ -94,7 +156,24 @@ Idempotent. Manual rollback: `cp ~/.claude/settings.json.bak-wi2096 ~/.claude/se
 adapter is actually reachable and actually denies: it feeds a synthetic,
 never-executed trigger to the wrapper under each **live** tool name and asserts
 `DENY`. A fail-open scores as a gap even when the static matcher looks right —
-that asymmetry is what surfaced WI-2096. Exit 0 = full coverage.
+that asymmetry is what surfaced transformate WI-2096. Exit 0 = full coverage.
+
+**That asymmetry no longer holds, and the sweep has not caught up.** Its
+criterion is `covered = (dyn && dyn.decision === "DENY")`. Before the fail-closed
+flip a missing `dcg-wrap` made the adapter ALLOW, so the sweep went red and the
+gap surfaced. Now a missing, unexecutable, hung or crashed `dcg-wrap` produces
+DENY, and the sweep scores that as **full coverage** — the check that exists to
+tell "guarded" from "dark" can no longer do it.
+
+Until the sweep is fixed in `warden-memory`, treat its green as necessary and not
+sufficient; the applier's canary 3 is what actually distinguishes the two. The
+sweep-side fix is one line, using the same discriminator:
+
+```js
+// An adapter self-denial (missing/hung/crashed dcg-wrap) is NOT coverage.
+const adapterFault = /^dcg-ctx-wrap:/.test(dyn?.reason || "");
+const covered = dyn && dyn.decision === "DENY" && !adapterFault;
+```
 
 ### Wire into Claude Agent SDK programmatic hooks
 
