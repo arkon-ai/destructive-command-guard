@@ -74,8 +74,8 @@ def seen_command(seen):
 
     `trigger in seen` passes if the trigger lands in ANY field, including one dcg-wrap
     never reads (`_dcg_source_tool`, a sibling key, a second copy beside an empty
-    `command`). That is the WI-2096 failure one layer down: suite green, command field
-    empty, channel open. So parse it and read the field that is actually scanned.
+    `command`). That is the transformate WI-2096 failure one layer down: suite green, the
+    command field empty, channel open. So parse it and read the field that is scanned.
     """
     if not seen:
         return ""

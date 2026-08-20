@@ -5,16 +5,22 @@
 // WHY A SCRIPT AND NOT A HAND EDIT: settings.json is the canonical source the
 // REPL-seat renderer fans out to every seat (ops_seat_settings_generated,
 // transformate WI-1818). A hot-patch that lands broken JSON breaks every seat on the
-// next 15-minute sync. This applies the change, CANARIES it against the
-// coverage sweep, and ROLLS BACK automatically if the sweep does not go green.
+// next 15-minute sync. So the change is CANARIED AS A CANDIDATE and only published if all
+// three canaries go green — there is no rollback path, because on red the canonical file was
+// never touched.
 //
 //   node apply-wi2096-matcher.mjs --dry-run   # print the diff, touch nothing
-//   node apply-wi2096-matcher.mjs             # backup → patch → canary → keep|revert
+//   node apply-wi2096-matcher.mjs             # write candidate → canary → backup → publish
 //
 // Manual rollback at any time: cp <printed backup path> ~/.claude/settings.json
-// Idempotent: a second run reports "already current" and exits 0.
+// Idempotent, but NOT a no-op: a second run re-verifies that the control still works and
+// exits non-zero if it does not. "Already current" is a claim about the matcher text, and
+// the matcher text is not the control.
 
-import { readFileSync, writeFileSync, copyFileSync, renameSync } from "node:fs";
+import {
+  readFileSync, writeFileSync, copyFileSync, renameSync, unlinkSync,
+  statSync, chmodSync, chownSync, constants,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -22,12 +28,18 @@ import path from "node:path";
 const HOME = homedir();
 const SETTINGS = process.env.HOOK_SETTINGS || path.join(HOME, ".claude/settings.json");
 const SWEEP = process.env.HOOK_SWEEP || path.join(HOME, "dev/warden-memory/scripts/audit-hook-matchers.mjs");
+const WRAPPER = process.env.CTX_WRAP || path.join(HOME, ".local/bin/dcg-ctx-wrap");
 const DRY = process.argv.includes("--dry-run");
 
-// Loose SUFFIX match: hits the legacy `mcp__context-mode__*` names, the live
+// The sweep spawns hooks, so it can hang. Unbounded, a hung sweep used to leave a patched
+// but unverified settings.json live while this process waited forever.
+const SWEEP_TIMEOUT_MS = Number(process.env.HOOK_SWEEP_TIMEOUT_MS || 120000);
+
+// Loose UNANCHORED match: hits the legacy `mcp__context-mode__*` names, the live
 // `mcp__plugin_context-mode_context-mode__*` names, and any future prefix.
 const LOOSE = "context-mode__ctx_(execute|execute_file|batch_execute)";
-const STALE = /context-mode__ctx_/;
+
+const CTX_NAMESPACE = /context-mode__ctx_/;
 
 // The live context-mode tool names this matcher has to cover. Used both to assert the
 // patched matcher actually matches something (below) and to document what LOOSE is for.
@@ -38,7 +50,41 @@ const LIVE_CTX_TOOLS = [
   "mcp__context-mode__ctx_execute",
 ];
 
-const cfg = JSON.parse(readFileSync(SETTINGS, "utf8"));
+// Is this entry one of OURS — a matcher that routes the context-mode EXEC surfaces?
+//
+// The test has to be SEMANTIC, not textual. A matcher is a regex, so the LOOSE string itself
+// reads `context-mode__ctx_(execute|execute_file|batch_execute)` — a literal `ctx_execute`
+// substring test does not match it, and narrowing the old `/context-mode__ctx_/` that way
+// silently stopped recognising every already-current entry. Asking "does this matcher
+// actually select an exec tool name?" is both the property we care about and immune to how
+// the matcher happens to be spelled.
+//
+// It matters because a bare namespace test also swept in ctx_search / ctx_index / ctx_purge —
+// which this fleet's context-mode plugin really does expose — and every match got its matcher
+// REWRITTEN to the exec triple, breaking an unrelated guard two ways at once: it stops
+// matching its own tools, and its hook command starts firing on exec calls it never handled.
+const isExecCtxEntry = (e) => {
+  const m = (e && e.matcher) || "";
+  if (!CTX_NAMESPACE.test(m)) return false;
+  try {
+    const re = new RegExp(m);
+    return LIVE_CTX_TOOLS.some((t) => re.test(t));
+  } catch {
+    // An unparseable matcher cannot be shown to belong to someone else's control, and it
+    // sits in the context-mode namespace. Claim it so it gets repaired rather than skipped.
+    return true;
+  }
+};
+
+// Uncaught, a missing file / permission error / malformed JSON threw a bare Node stack
+// trace before any of this script's structured messages could run.
+let cfg;
+try {
+  cfg = JSON.parse(readFileSync(SETTINGS, "utf8"));
+} catch (err) {
+  console.error(`cannot read or parse ${SETTINGS}: ${err.message}`);
+  process.exit(1);
+}
 const pre = cfg.hooks?.PreToolUse || [];
 
 // Two DIFFERENT states used to collapse into one "already current — exit 0":
@@ -55,7 +101,7 @@ const runs = (e) =>
   Array.isArray(e.hooks) &&
   e.hooks.some((h) => h && typeof h.command === "string" && h.command.trim() !== "");
 
-const ctxEntries = pre.filter((e) => STALE.test(e.matcher || ""));
+const ctxEntries = pre.filter(isExecCtxEntry);
 const hollow = ctxEntries.filter((e) => !runs(e));
 const targets = ctxEntries.filter((e) => e.matcher !== LOOSE);
 
@@ -86,7 +132,7 @@ if (hollow.length > 0) {
 //
 // Only ONE ctx entry needs to reach the wrapper: a host may legitimately carry a second entry
 // routing the same tools to another guard (TEAM-1 routes them to the bash dispatcher as well).
-const wrapperName = path.basename(process.env.CTX_WRAP || "dcg-ctx-wrap");
+const wrapperName = path.basename(WRAPPER);
 const routesToWrapper = (e) =>
   Array.isArray(e.hooks) &&
   e.hooks.some((h) => h && typeof h.command === "string" && h.command.includes(wrapperName));
@@ -112,8 +158,131 @@ if (ctxEntries.length === 0) {
   process.exit(1);
 }
 
+// Text only. It is handed to the scanner as DATA and never executed; it is here because it
+// is in dcg's default packs, so a working control must object to it.
+const DANGEROUS_FIXTURE = "git reset --hard origin/main";
+
+// ── The three canaries. Both the already-current and the patch path run all three. ──
+
+// 1. The matcher that will be LIVE must match the live tool names. This reads the file BACK
+//    rather than testing LOOSE against LIVE_CTX_TOOLS: both are constants in this file, so
+//    that form was a tautology which could only fail if someone edited this source, and it
+//    could not notice a skipped entry, a second still-stale entry, or a mangled write.
+const canaryMatcher = (settingsPath, fail) => {
+  let written;
+  try {
+    written = JSON.parse(readFileSync(settingsPath, "utf8")).hooks?.PreToolUse || [];
+  } catch (err) {
+    fail(`CANARY FAILED — cannot read back ${settingsPath} (${err.message})`);
+  }
+  const ctxWritten = written.filter(isExecCtxEntry);
+  const unmatched = LIVE_CTX_TOOLS.filter(
+    (t) => !ctxWritten.some((e) => {
+      try { return new RegExp(e.matcher).test(t); } catch { return false; }
+    })
+  );
+  if (!ctxWritten.length || unmatched.length) {
+    fail(
+      "CANARY FAILED — the matcher on disk does not match live context-mode tool names:\n  " +
+      (unmatched.join("\n  ") || "(no context-mode entry survived the write)")
+    );
+  }
+  console.log(`canary 1: matcher on disk matches all ${LIVE_CTX_TOOLS.length} known ctx tool names`);
+};
+
+// 2. The coverage sweep must go green against the file under test.
+const canarySweep = (settingsPath, fail) => {
+  const r = spawnSync(process.execPath, [SWEEP], {
+    encoding: "utf8",
+    timeout: SWEEP_TIMEOUT_MS,
+    killSignal: "SIGTERM",
+    // process.execPath, not a PATH lookup for "node": under a systemd unit, a cron entry or
+    // an nvm shell the lookup picks a different runtime or fails outright, and a correct
+    // patch then gets refused for an environment reason.
+    env: { ...process.env, HOOK_SETTINGS: settingsPath, CTX_WRAP: WRAPPER },
+  });
+  process.stdout.write(r.stdout || "");
+  // Diagnostics conventionally go to stderr. Swallowing it left the operator with
+  // "CANARY FAILED (sweep exit 3)" and nothing about why, on the one path where that
+  // information decides what to do next.
+  process.stderr.write(r.stderr || "");
+  if (r.error) {
+    const how = r.error.code === "ETIMEDOUT"
+      ? `timed out after ${SWEEP_TIMEOUT_MS}ms` : r.error.message;
+    fail(`CANARY FAILED — coverage sweep ${SWEEP} ${how}`);
+  }
+  if (r.status !== 0) {
+    const how = r.status === null ? `killed by ${r.signal}` : `exit ${r.status}`;
+    fail(`CANARY FAILED (sweep ${how})`);
+  }
+  console.log("canary 2: coverage sweep green");
+};
+
+// 3. Prove the SCANNER produced the denial, not the adapter.
+//
+//    Since the adapter went fail-closed, a missing, unexecutable, hung or crashed dcg-wrap
+//    DENIES — so "something said DENY" no longer separates a working control from a dark
+//    one, and the sweep's own criterion is exactly `covered = (decision === "DENY")`. The
+//    adapter cannot settle it from the inside either: a scanner that exits 0 having done
+//    nothing is indistinguishable on the wire from a clean scan. It IS separable here,
+//    because every adapter-generated denial's reason starts with the literal
+//    `dcg-ctx-wrap: `, while a real verdict is forwarded untouched carrying dcg's own text.
+const canaryScanner = (fail) => {
+  const r = spawnSync(WRAPPER, [], {
+    input: JSON.stringify({
+      tool_name: "mcp__plugin_context-mode_context-mode__ctx_execute",
+      tool_input: { code: DANGEROUS_FIXTURE, language: "shell" },
+    }),
+    encoding: "utf8",
+    timeout: 30000,
+  });
+  if (r.error) fail(`CANARY FAILED — cannot run the wrapper ${WRAPPER} (${r.error.message})`);
+  let out;
+  try {
+    out = JSON.parse(r.stdout || "");
+  } catch {
+    fail(`CANARY FAILED — ${WRAPPER} returned no decision for a known-dangerous fixture`);
+  }
+  const hso = (out && out.hookSpecificOutput) || {};
+  if (hso.permissionDecision !== "deny") {
+    fail(
+      "CANARY FAILED — a known-dangerous fixture was NOT denied.\n" +
+      "The ctx surface is not actually being scanned."
+    );
+  }
+  const reason = String(hso.permissionDecisionReason || "");
+  if (reason.startsWith("dcg-ctx-wrap:")) {
+    fail(
+      "CANARY FAILED — the DENY came from the ADAPTER, not the scanner:\n  " +
+      reason.slice(0, 200) + "\n" +
+      "That is the control being DARK while emitting the right word. Install/repair dcg-wrap."
+    );
+  }
+  console.log("canary 3: a known-dangerous fixture was denied BY THE SCANNER");
+};
+
+const verify = (settingsPath, fail) => {
+  canaryMatcher(settingsPath, fail);
+  canarySweep(settingsPath, fail);
+  canaryScanner(fail);
+};
+
 if (targets.length === 0) {
-  console.log(`already current — ${ctxEntries.length} context-mode matcher(s) present, all at LOOSE`);
+  // "Nothing to patch" is NOT "verified working". The matcher may name a wrapper that is
+  // not installed, or route somewhere that never reaches the scanner. This branch used to
+  // exit 0 before any canary ran, so on the ordinary steady-state host the remediation tool
+  // reported success having verified nothing executable at all — the same false-green class
+  // the routing check was added to remove.
+  console.log(
+    `matcher text already current — ${ctxEntries.length} context-mode matcher(s) at LOOSE; ` +
+    "verifying the control actually works"
+  );
+  if (DRY) process.exit(0);
+  verify(SETTINGS, (why) => {
+    console.error(`\n${why}`);
+    process.exit(1);
+  });
+  console.log("\nalready current — matchers at LOOSE and the control is live");
   process.exit(0);
 }
 for (const e of targets) {
@@ -122,72 +291,58 @@ for (const e of targets) {
 }
 if (DRY) process.exit(0);
 
-// The backup name carries a timestamp. A fixed `.bak-wi2096` was overwritten by the next run,
-// so a second invocation destroyed the only copy of the last known-good file — and the
-// documented manual rollback then restored the already-broken state.
-const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-const backup = `${SETTINGS}.bak-wi2096-${stamp}`;
-copyFileSync(SETTINGS, backup);
-
-// Write via a temp file in the SAME directory + rename, which is atomic on POSIX.
-// writeFileSync truncates in place: this file is the canonical source the REPL-seat renderer
-// fans out to every seat on a 15-minute cycle, so a crash or a kill mid-write publishes a
-// truncated settings.json fleet-wide — and an interruption after the write but before the
-// canary leaves an unverified change in force with nothing to signal it.
+// CANARY THE CANDIDATE, THEN PUBLISH — in that order.
+//
+// Renaming first made the change live, and fanned out to every seat on the 15-minute
+// renderer cycle, BEFORE anything had verified it. A Ctrl-C or a hung sweep inside that
+// window left an unverified matcher in force with nothing to signal it, and the automatic
+// rollback never ran. Worse, that rollback was itself a truncating in-place copyFileSync,
+// running on the failure path where an interruption is likeliest — the very write the
+// temp-and-rename exists to avoid.
+//
+// Verifying the candidate first deletes the whole rollback path: on red, settings.json was
+// never touched at all, which is strictly stronger than modified-then-restored.
 const tmpPath = `${SETTINGS}.tmp-wi2096-${process.pid}`;
 writeFileSync(tmpPath, JSON.stringify(cfg, null, 2) + "\n");
-renameSync(tmpPath, SETTINGS);
-console.log(`\npatched ${targets.length} matcher(s); backup: ${backup}`);
 
-const rollback = (why) => {
-  copyFileSync(backup, SETTINGS);
-  console.error(`\n${why} — rolled back from ${backup}`);
+// rename() replaces the inode, so without this the published file inherits the temp file's
+// umask-derived mode (0644 under a typical 022) and this process's ownership instead of the
+// original's. settings.json can carry an env block with tokens, so a 0600 file silently
+// becoming world-readable is a credential exposure; and a sudo run would flip ownership and
+// cost the renderer its write access on the next sync.
+const orig = statSync(SETTINGS);
+chmodSync(tmpPath, orig.mode & 0o7777);
+try {
+  chownSync(tmpPath, orig.uid, orig.gid);
+} catch {
+  // Non-root run: the file is already ours, so there is nothing to restore.
+}
+
+const abort = (why) => {
+  try {
+    unlinkSync(tmpPath);
+  } catch {
+    // Nothing to clean up.
+  }
+  console.error(`\n${why}\n${SETTINGS} was NOT modified.`);
   process.exit(1);
 };
 
-// ── Canary part 1: assert the matcher we just wrote MATCHES THE TOOLS IT IS FOR ──
-//
-// This exists because the coverage sweep cannot do it. For the three ctx surfaces the sweep
-// computes `covered = (dyn && dyn.decision === "DENY")` and discards its static hit
-// entirely; `dyn` comes from spawning CTX_WRAP, so the ctx portion of its verdict is
-// independent of the matcher in this file. A patch that mangled the matcher into something
-// matching nothing would still go green and be kept. So the one thing this script changes
-// gets checked here, directly, before the sweep is consulted at all.
-let re;
-try {
-  re = new RegExp(LOOSE);
-} catch (err) {
-  rollback(`CANARY FAILED — the patched matcher is not a valid regex (${err.message})`);
-}
-const unmatched = LIVE_CTX_TOOLS.filter((t) => !re.test(t));
-if (unmatched.length) {
-  rollback(
-    "CANARY FAILED — the patched matcher does not match live context-mode tool names:\n  " +
-    unmatched.join("\n  ")
-  );
-}
-console.log(`canary: patched matcher matches all ${LIVE_CTX_TOOLS.length} known ctx tool names`);
+verify(tmpPath, abort);
 
-// ── Canary part 2: the coverage sweep must go green against the patched file ──
-//
-// CTX_WRAP is passed explicitly. The sweep defaults it to ~/.local/bin/dcg-ctx-wrap and
-// derives the ctx surfaces' verdict by spawning it, so leaving it unset made the result
-// depend on whatever happened to be installed at that path rather than on this change.
-const sweep = spawnSync("node", [SWEEP], {
-  encoding: "utf8",
-  env: {
-    ...process.env,
-    HOOK_SETTINGS: SETTINGS,
-    CTX_WRAP: process.env.CTX_WRAP || path.join(HOME, ".local/bin/dcg-ctx-wrap"),
-  },
-});
-process.stdout.write(sweep.stdout || "");
-if (sweep.error) {
-  rollback(`CANARY FAILED — could not run the coverage sweep ${SWEEP} (${sweep.error.message})`);
+// Only now does anything become live, and the backup is taken against the file actually
+// being replaced. COPYFILE_EXCL: a millisecond-resolution stamp can still collide in a loop,
+// a parallel fan-out or a retry wrapper, and a silent overwrite destroys the last
+// known-good copy — precisely the bug the timestamp was added to fix.
+const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+const backup = `${SETTINGS}.bak-wi2096-${stamp}-${process.pid}`;
+try {
+  copyFileSync(SETTINGS, backup, constants.COPYFILE_EXCL);
+} catch (err) {
+  abort(`refusing to publish — could not take a backup at ${backup} (${err.message})`);
 }
-if (sweep.status !== 0) {
-  // status is null when the child was killed by a signal; say which happened.
-  const how = sweep.status === null ? `killed by ${sweep.signal}` : `exit ${sweep.status}`;
-  rollback(`CANARY FAILED (sweep ${how})`);
-}
-console.log("\ncanary green — change kept. Rollback: cp " + backup + " " + SETTINGS);
+renameSync(tmpPath, SETTINGS);
+console.log(
+  `\npatched ${targets.length} matcher(s) — all three canaries green BEFORE publish.` +
+  `\nRollback: cp ${backup} ${SETTINGS}`
+);
