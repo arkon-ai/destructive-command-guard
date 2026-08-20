@@ -97,13 +97,74 @@ const pre = cfg.hooks?.PreToolUse || [];
 // `hooks: []`, a missing hooks array, or a blank command is a matcher-shaped hole: it matches
 // the tool and then does nothing, and "already current" over one of those is the same false
 // green as reporting success when no matcher exists at all.
-const runs = (e) =>
-  Array.isArray(e.hooks) &&
-  e.hooks.some((h) => h && typeof h.command === "string" && h.command.trim() !== "");
+// `type` is required because Claude Code's hook schema documents it as REQUIRED — one of
+// command | http | mcp_tool | prompt | agent. The wiring snippet in this repo's README carries
+// it, and every PreToolUse entry in the live canonical settings.json carries it, while every
+// fixture in the suite omitted it — so the suite could not surface the gap. A tool whose sole
+// purpose is to refuse to green-tick a control it has not proven live must not accept
+// out-of-schema config as proof. Only a `command` hook can route to the wrapper anyway, so a
+// non-command hook is not a functioning ctx control for anything this script decides.
+const isCommandHook = (h) =>
+  h && h.type === "command" && typeof h.command === "string" && h.command.trim() !== "";
+
+const runs = (e) => Array.isArray(e.hooks) && e.hooks.some(isCommandHook);
+
+// ── What the hook command ACTUALLY execs ─────────────────────────────────────────────────
+//
+// The old test was `h.command.includes(path.basename(WRAPPER))` — a substring anywhere in the
+// command string — and canary 3 then spawned the CTX_WRAP constant rather than the command in
+// settings.json. Nothing tied the binary that got exercised to the binary the harness will
+// exec. Measured, four commands satisfied the old test while routing nowhere near the wrapper,
+// and every one published green at rc 0: `/opt/old/dcg-ctx-wrap` (absent),
+// `~/.local/bin/dcg-ctx-wrap.bak` (absent), `echo dcg-ctx-wrap` (a no-op that prints the name)
+// and `true # dcg-ctx-wrap` (a comment mentioning it). That is the same
+// validate-the-string-never-the-target false green the routing gate below exists to remove,
+// one layer further out, and it voided the README's central claim that canary 3 is what proves
+// the real scanner is on the path.
+//
+// So: take the FIRST argv token of the command, require its basename to EQUAL the wrapper's
+// (not contain it), and require an absolute path. A bare `dcg-ctx-wrap` is refused for the
+// same reason this script uses process.execPath instead of a PATH lookup for `node`: under a
+// systemd unit, a cron entry or an nvm shell the lookup resolves to a different inode or to
+// nothing at all, and Claude Code hooks inherit exactly that problem. The path this resolves
+// is the one the canaries run — that binding is the whole point.
+const argv0 = (command) => {
+  const m = String(command).trim().match(/^"([^"]+)"|^'([^']+)'|^(\S+)/);
+  const tok = m ? (m[1] || m[2] || m[3] || "") : "";
+  return tok.startsWith("~/") ? path.join(HOME, tok.slice(2)) : tok;
+};
+
+const wrapperName = path.basename(WRAPPER);
+const hookWrapperPath = (h) => {
+  if (!isCommandHook(h)) return "";
+  const bin = argv0(h.command);
+  if (path.basename(bin) !== wrapperName) return "";
+  return path.isAbsolute(bin) ? bin : "";
+};
+const entryWrapperPath = (e) =>
+  (Array.isArray(e.hooks) ? e.hooks : []).map(hookWrapperPath).find(Boolean) || "";
+const routesToWrapper = (e) => entryWrapperPath(e) !== "";
 
 const ctxEntries = pre.filter(isExecCtxEntry);
 const hollow = ctxEntries.filter((e) => !runs(e));
-const targets = ctxEntries.filter((e) => e.matcher !== LOOSE);
+
+// ONLY our own entry gets rewritten. The old `filter((e) => e.matcher !== LOOSE)` selected
+// EVERY entry whose matcher happens to select an exec tool name and overwrote each one's
+// matcher with LOOSE — while the routing gate below proves only that AT LEAST ONE entry
+// reaches the wrapper. The rest are other people's controls. Measured both directions, with
+// this script's own entry present and correct:
+//   over-firing — a narrower `..._ctx_execute_file` entry owned by `/usr/local/bin/
+//   file-policy-hook` was widened to the exec triple, so that hook began firing on
+//   ctx_execute and ctx_batch_execute and no longer uniquely selected its own tool;
+//   going DARK, the sharper half — a mixed `context-mode__ctx_(execute|search)` matcher owned
+//   by another guard was rewritten to the exec triple, after which it no longer matched
+//   ctx_search AT ALL. That guard's coverage vanished, published under "all three canaries
+//   green" at rc 0.
+// A tool whose entire purpose is to keep a control live must not silently remove a different
+// control's coverage and report success. The shape is real on this fleet: TEAM-1 routes the
+// same tools to the bash dispatcher as a second entry. A pure `ctx_search` entry already
+// survived untouched — that is the case the suite pins, and precisely why the mixed one slipped.
+const targets = ctxEntries.filter((e) => e.matcher !== LOOSE && routesToWrapper(e));
 
 if (ctxEntries.length > 0 && hollow.length === ctxEntries.length) {
   console.error(
@@ -132,16 +193,21 @@ if (hollow.length > 0) {
 //
 // Only ONE ctx entry needs to reach the wrapper: a host may legitimately carry a second entry
 // routing the same tools to another guard (TEAM-1 routes them to the bash dispatcher as well).
-const wrapperName = path.basename(WRAPPER);
-const routesToWrapper = (e) =>
-  Array.isArray(e.hooks) &&
-  e.hooks.some((h) => h && typeof h.command === "string" && h.command.includes(wrapperName));
+// This is the binary the LIVE hook execs — resolved FROM settings.json, not from CTX_WRAP.
+// Everything downstream that claims to have exercised the scanner runs THIS path, so a host
+// whose hook points somewhere other than the installed wrapper can no longer be green-ticked
+// by testing the installed wrapper instead.
+const LIVE_WRAPPER = ctxEntries.map(entryWrapperPath).find(Boolean) || "";
 
-if (ctxEntries.length > 0 && !ctxEntries.some(routesToWrapper)) {
+if (ctxEntries.length > 0 && !LIVE_WRAPPER) {
   console.error(
-    `context-mode matcher(s) exist in ${SETTINGS} but NONE routes to '${wrapperName}'.\n` +
+    `context-mode matcher(s) exist in ${SETTINGS} but NONE execs '${wrapperName}'.\n` +
     "The matcher string is not the control — the hook command is. Rewriting the matcher would\n" +
     "leave the ctx surfaces going somewhere else entirely, so this stops instead.\n" +
+    "The first argv token of the command must BE the wrapper — an absolute path whose basename\n" +
+    `is exactly '${wrapperName}'. A command that merely mentions the name (a .bak copy, an\n` +
+    "`echo`, a trailing comment) routes nowhere, and a bare PATH lookup resolves differently\n" +
+    "under systemd, cron and nvm than it does in your shell.\n" +
     "Point one context-mode entry's hook command at the wrapper, then re-run."
   );
   process.exit(1);
@@ -199,7 +265,9 @@ const canarySweep = (settingsPath, fail) => {
     // process.execPath, not a PATH lookup for "node": under a systemd unit, a cron entry or
     // an nvm shell the lookup picks a different runtime or fails outright, and a correct
     // patch then gets refused for an environment reason.
-    env: { ...process.env, HOOK_SETTINGS: settingsPath, CTX_WRAP: WRAPPER },
+    // LIVE_WRAPPER, not WRAPPER: the sweep must exercise the binary the hook in this very
+    // settings file execs, not the one CTX_WRAP happens to name.
+    env: { ...process.env, HOOK_SETTINGS: settingsPath, CTX_WRAP: LIVE_WRAPPER },
   });
   process.stdout.write(r.stdout || "");
   // Diagnostics conventionally go to stderr. Swallowing it left the operator with
@@ -227,8 +295,14 @@ const canarySweep = (settingsPath, fail) => {
 //    nothing is indistinguishable on the wire from a clean scan. It IS separable here,
 //    because every adapter-generated denial's reason starts with the literal
 //    `dcg-ctx-wrap: `, while a real verdict is forwarded untouched carrying dcg's own text.
+//
+//    It runs LIVE_WRAPPER — the binary resolved from the hook command in settings.json — and
+//    NOT the CTX_WRAP constant. Spawning the constant is what let four different non-routing
+//    commands publish green: the canary proved a binary worked while the harness was wired to
+//    something else entirely. A hook pointing at an absent path now fails HERE, loudly, with
+//    the canonical file untouched, instead of being reported as a verified control.
 const canaryScanner = (fail) => {
-  const r = spawnSync(WRAPPER, [], {
+  const r = spawnSync(LIVE_WRAPPER, [], {
     input: JSON.stringify({
       tool_name: "mcp__plugin_context-mode_context-mode__ctx_execute",
       tool_input: { code: DANGEROUS_FIXTURE, language: "shell" },
@@ -236,12 +310,18 @@ const canaryScanner = (fail) => {
     encoding: "utf8",
     timeout: 30000,
   });
-  if (r.error) fail(`CANARY FAILED — cannot run the wrapper ${WRAPPER} (${r.error.message})`);
+  if (r.error) {
+    fail(
+      `CANARY FAILED — cannot run '${LIVE_WRAPPER}' (${r.error.message}).\n` +
+      "That path is the hook command's own first argv token, read out of the settings file —\n" +
+      "so the control this file describes does not exist on this host."
+    );
+  }
   let out;
   try {
     out = JSON.parse(r.stdout || "");
   } catch {
-    fail(`CANARY FAILED — ${WRAPPER} returned no decision for a known-dangerous fixture`);
+    fail(`CANARY FAILED — ${LIVE_WRAPPER} returned no decision for a known-dangerous fixture`);
   }
   const hso = (out && out.hookSpecificOutput) || {};
   if (hso.permissionDecision !== "deny") {

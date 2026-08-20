@@ -273,12 +273,25 @@ def main():
     # IDENTIFICATION, and it is fail-closed too — see the module docstring. A call we
     # cannot identify is allowed only while the raw bytes make no claim on the guarded
     # surface; `unidentified()` is what enforces that, and it never falls through.
+    # Read stdin as BYTES and decode with surrogateescape, so DECODING cannot raise at all.
+    # The str-level read fail-opened two measured ways, both with the scanner never invoked
+    # on a call the settings matcher had already selected as guarded: under a strict codec
+    # (`PYTHONIOENCODING=ascii`) a single 0xC3 byte in the payload raised UnicodeDecodeError,
+    # and a large payload under a memory cap raised MemoryError. Both landed in a bare
+    # `except Exception: allow()`. The bytes were there and made a claim; the adapter threw
+    # them away and allowed.
+    #
+    # A FAILED read is not an EMPTY one, and collapsing those two is what made this fail open.
+    # An empty stdin returns b"" *successfully* and still means "no call to attribute" — that
+    # path is unchanged. An exception means a call arrived whose content we destroyed, and on
+    # this surface that is refused rather than guessed at.
+    _stdin_bytes = getattr(sys.stdin, "buffer", None)
     try:
-        raw = sys.stdin.read()
-    except Exception:
-        # No bytes at all. There is no call here to attribute, guarded or otherwise, and
-        # no evidence to weigh either way.
-        allow()
+        raw = (_stdin_bytes.read().decode("utf-8", "surrogateescape")
+               if _stdin_bytes is not None else sys.stdin.read())
+    except Exception as exc:
+        deny("could not read the hook payload from stdin (%s) — refusing a call whose "
+             "content cannot be examined" % type(exc).__name__)
 
     try:
         inp = json.loads(raw)
@@ -292,8 +305,22 @@ def main():
     # `toolName` is consulted only when `tool_name` is ABSENT. A present-but-wrong-typed
     # tool_name is a corrupt claim about the call, not an absence of one, so it must not be
     # possible to park a guarded name in `tool_name` and a benign one in `toolName`.
-    tool = inp.get("tool_name")
-    if tool is None:
+    #
+    # KEY MEMBERSHIP, not `.get()`. `.get("tool_name")` returns None for an ABSENT key and for
+    # an explicit JSON `null` alike, so `{"tool_name": null, "toolName": "Bash"}` fell straight
+    # through to the alias and identified as Bash — measured `{"continue": true}`, scanner
+    # never invoked. It still allowed with a guarded token planted in the payload text, because
+    # the raw-bytes tie-breaker below is deliberately skipped once identification "succeeds".
+    # A present-but-null tool_name is a corrupt claim about the call, which is precisely what
+    # the paragraph above says must not be possible: the suite pinned the LIST-typed case and
+    # passed, so the invariant read as covered while `null` walked through it.
+    #
+    # `tool_input` / `toolInput` below keeps `.get()` deliberately: the same null-vs-absent
+    # shape there was measured NOT to leak — the alias resolves to the only payload present
+    # and it IS scanned — so it is left exactly as it stands.
+    if "tool_name" in inp:
+        tool = inp["tool_name"]
+    else:
         tool = inp.get("toolName")
     if not isinstance(tool, str) or not tool:
         unidentified(raw, "tool_name is %s, not a usable tool name" % type(tool).__name__)

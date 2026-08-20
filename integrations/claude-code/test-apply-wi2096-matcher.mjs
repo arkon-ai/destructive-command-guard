@@ -13,7 +13,7 @@
 // Run: node integrations/claude-code/test-apply-wi2096-matcher.mjs   (exit 0 = pass)
 
 import {
-  mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync, existsSync, statSync,
+  mkdtempSync, writeFileSync, readFileSync, copyFileSync, chmodSync, rmSync, existsSync, statSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -78,13 +78,23 @@ function run(settingsPath, sweepPath, extraArgs = [], wrapperPath = SCANNER) {
   return { status: r.status, out: (r.stdout || "") + (r.stderr || "") };
 }
 
-const hook = [{ command: "~/.local/bin/dcg-ctx-wrap" }];
-const staleEntry = () => ({ matcher: "mcp__context-mode__ctx_execute", hooks: hook });
-const looseEntry = () => ({ matcher: LOOSE, hooks: hook });
-const bashEntry = () => ({ matcher: "Bash", hooks: [{ command: "dcg-wrap" }] });
+// Every fixture now carries `type: "command"`, which the hook schema documents as REQUIRED and
+// which every PreToolUse entry in the live canonical settings.json carries. EVERY fixture here
+// used to omit it, which is exactly why the suite could not see that the applier accepted
+// out-of-schema config as proof of a live control.
+//
+// The hook command is the STUB'S OWN ABSOLUTE PATH, not a literal `~/.local/bin/dcg-ctx-wrap`.
+// The applier execs the binary the hook command names rather than the CTX_WRAP constant, so a
+// fixture naming a path that does not exist is no longer a working control — which is the
+// property these tests are here to hold.
+const hookFor = (bin) => [{ type: "command", command: bin }];
+const staleEntry = (bin = SCANNER) =>
+  ({ matcher: "mcp__context-mode__ctx_execute", hooks: hookFor(bin) });
+const looseEntry = (bin = SCANNER) => ({ matcher: LOOSE, hooks: hookFor(bin) });
+const bashEntry = () => ({ matcher: "Bash", hooks: [{ type: "command", command: "dcg-wrap" }] });
 const searchEntry = () => ({
   matcher: "mcp__plugin_context-mode_context-mode__ctx_search",
-  hooks: [{ command: "node audit-search.js" }],
+  hooks: [{ type: "command", command: "node audit-search.js" }],
 });
 
 // 1. THE REGRESSION THIS FILE EXISTS FOR: no context-mode matcher anywhere. The control is
@@ -105,7 +115,12 @@ const searchEntry = () => ({
 for (const [label, hooks] of [
   ["empty hooks array", []],
   ["missing hooks key", undefined],
-  ["blank command", [{ command: "   " }]],
+  ["blank command", [{ type: "command", command: "   " }]],
+  // The schema documents `type` as REQUIRED. An entry missing it, or carrying a type that
+  // cannot exec a binary, is not a control this script may green-tick — and it cannot route
+  // to the wrapper either. Every fixture in this file used to omit `type`, so nothing pinned it.
+  ["hook with no `type`", [{ command: SCANNER }]],
+  ["hook with a non-command `type`", [{ type: "http", command: SCANNER }]],
 ]) {
   const entry = { matcher: LOOSE };
   if (hooks !== undefined) entry.hooks = hooks;
@@ -120,12 +135,12 @@ for (const [label, hooks] of [
 //      something other than the ctx wrapper. That reported "already current" while dcg was
 //      nowhere on the path. A matcher string is not a control; the hook command is.
 {
-  const s = settings([bashEntry(), { matcher: LOOSE, hooks: [{ command: "node ~/.claude/hooks/warden-bash-dispatcher.js" }] }]);
+  const s = settings([bashEntry(), { matcher: LOOSE, hooks: [{ type: "command", command: "node ~/.claude/hooks/warden-bash-dispatcher.js" }] }]);
   const r = run(s, sweep(0));
   check("matcher routed away from the wrapper does not exit 0", r.status !== 0);
   check("matcher routed away from the wrapper is not called already-current",
     !/^already current/m.test(r.out));
-  check("matcher routed away from the wrapper says so", /NONE routes to/.test(r.out));
+  check("matcher routed away from the wrapper says so", /NONE execs/.test(r.out));
 }
 // ...and one that DOES route to the wrapper is accepted.
 {
@@ -174,8 +189,9 @@ for (const [label, hooks] of [
 //      coverage sweep can no longer see: since the adapter went fail-closed, a missing or
 //      broken dcg-wrap DENIES, so "something said DENY" is not evidence of a live control.
 {
-  const s = settings([bashEntry(), looseEntry()]);
-  const r = run(s, sweep(0), [], wrapper("adapter"));
+  const dark = wrapper("adapter");
+  const s = settings([bashEntry(), looseEntry(dark)]);
+  const r = run(s, sweep(0), [], dark);
   check("already-current + adapter-sourced DENY exits non-zero", r.status !== 0);
   check("already-current + adapter-sourced DENY says the control is dark",
     /came from the ADAPTER/.test(r.out));
@@ -183,8 +199,9 @@ for (const [label, hooks] of [
 
 // 2d. A wrapper that does not deny a known-dangerous fixture at all is not a control either.
 {
-  const s = settings([bashEntry(), looseEntry()]);
-  const r = run(s, sweep(0), [], wrapper("allow"));
+  const permissive = wrapper("allow");
+  const s = settings([bashEntry(), looseEntry(permissive)]);
+  const r = run(s, sweep(0), [], permissive);
   check("a fixture that is not denied fails the canary", r.status !== 0);
   check("a fixture that is not denied says the surface is unscanned",
     /was NOT denied/.test(r.out));
@@ -217,6 +234,93 @@ for (const [label, hooks] of [
     !!search && search.matcher === "mcp__plugin_context-mode_context-mode__ctx_search");
   check("a ctx_search hook command is left untouched",
     !!search && search.hooks[0].command === "node audit-search.js");
+}
+
+// 3c. THE CANARY MUST BIND TO THE BINARY THE HOOK ACTUALLY EXECS. Every command below
+//     satisfied the old `command.includes("dcg-ctx-wrap")` routing test and published GREEN at
+//     rc 0, because canary 3 spawned the CTX_WRAP constant instead of the hook command — a
+//     working stub "proved" a control the harness would never reach. The .bak case is the
+//     sharpest: the file is present AND executable, and only the NAME is wrong.
+{
+  const bak = path.join(path.dirname(SCANNER), "dcg-ctx-wrap.bak");
+  copyFileSync(SCANNER, bak);
+  chmodSync(bak, 0o755);
+  for (const [label, command] of [
+    ["a .bak copy that really runs", bak],
+    ["an echo that prints the name", "echo dcg-ctx-wrap"],
+    ["a comment mentioning the name", "true # dcg-ctx-wrap"],
+    ["a bare PATH lookup", "dcg-ctx-wrap"],
+  ]) {
+    const s = settings([bashEntry(), { matcher: LOOSE, hooks: [{ type: "command", command }] }]);
+    const before = readFileSync(s, "utf8");
+    const r = run(s, sweep(0));
+    check(`${label} is not accepted as routing to the wrapper`, r.status !== 0);
+    check(`${label} is not called already-current`, !/^already current/m.test(r.out));
+    check(`${label} leaves the settings file byte-identical`, readFileSync(s, "utf8") === before);
+  }
+}
+
+// 3d. An absolute path with the RIGHT basename that does not exist passes the routing gate by
+//     name and must then die at the canary — proving canary 3 execs the settings path rather
+//     than the installed one. This published green before, with the live command still absent.
+{
+  const s = settings([bashEntry(), staleEntry("/opt/old/dcg-ctx-wrap")]);
+  const before = readFileSync(s, "utf8");
+  const r = run(s, sweep(0));
+  check("a hook naming an absent wrapper fails", r.status !== 0);
+  check("a hook naming an absent wrapper names the path it could not run",
+    /\/opt\/old\/dcg-ctx-wrap/.test(r.out));
+  check("a hook naming an absent wrapper publishes nothing",
+    readFileSync(s, "utf8") === before);
+}
+
+// 3e. ANOTHER GUARD'S MATCHER IS NOT OURS TO REWRITE — the direction where a guard goes DARK.
+//     The rewrite set used to be every exec-selecting ctx entry, so a MIXED matcher belonging
+//     to a different hook was overwritten with the exec triple and stopped matching ctx_search
+//     altogether, published under "all three canaries green". Test 3b pins the PURE ctx_search
+//     case, which is exactly why the mixed one slipped through.
+{
+  const FOREIGN = "/usr/local/bin/other-guard";
+  const mixed = {
+    matcher: "context-mode__ctx_(execute|search)",
+    hooks: [{ type: "command", command: FOREIGN }],
+  };
+  const s = settings([bashEntry(), mixed, staleEntry()]);
+  const r = run(s, sweep(0));
+  check("mixed foreign matcher: run still succeeds", r.status === 0);
+  const after = JSON.parse(readFileSync(s, "utf8"));
+  const foreign = after.hooks.PreToolUse.find(
+    (e) => (e.hooks || []).some((h) => h.command === FOREIGN));
+  check("a foreign guard's mixed matcher is left untouched",
+    !!foreign && foreign.matcher === "context-mode__ctx_(execute|search)");
+  check("a foreign guard still matches its own ctx_search after our publish",
+    !!foreign && new RegExp(foreign.matcher)
+      .test("mcp__plugin_context-mode_context-mode__ctx_search"));
+  check("our own stale entry was still rewritten to LOOSE",
+    after.hooks.PreToolUse.some(
+      (e) => e.matcher === LOOSE && (e.hooks || []).some((h) => h.command === SCANNER)));
+}
+
+// 3f. ...and the over-firing direction: a NARROWER foreign exec entry must not be widened onto
+//     tool names its hook never handled. Widened, `/usr/local/bin/file-policy-hook` would start
+//     receiving ctx_batch_execute payloads, which carry no tool_input.command at all.
+{
+  const FOREIGN = "/usr/local/bin/file-policy-hook";
+  const narrower = {
+    matcher: "mcp__plugin_context-mode_context-mode__ctx_execute_file",
+    hooks: [{ type: "command", command: FOREIGN }],
+  };
+  const s = settings([bashEntry(), narrower, staleEntry()]);
+  const r = run(s, sweep(0));
+  check("narrower foreign matcher: run still succeeds", r.status === 0);
+  const after = JSON.parse(readFileSync(s, "utf8"));
+  const foreign = after.hooks.PreToolUse.find(
+    (e) => (e.hooks || []).some((h) => h.command === FOREIGN));
+  check("a narrower foreign matcher is not widened to the exec triple",
+    !!foreign && foreign.matcher === "mcp__plugin_context-mode_context-mode__ctx_execute_file");
+  check("a narrower foreign matcher does not start selecting ctx_batch_execute",
+    !!foreign && !new RegExp(foreign.matcher)
+      .test("mcp__plugin_context-mode_context-mode__ctx_batch_execute"));
 }
 
 // 4. Stale matcher, canary RED -> the canonical file was NEVER MODIFIED.

@@ -69,6 +69,29 @@ def run_raw(raw, tmp):
         return {}, seen
 
 
+def run_raw_bytes(raw_bytes, tmp, extra_env=None):
+    """Invoke the wrapper with EXACT stdin BYTES, plus an optional env overlay.
+
+    `run` and `run_raw` both use text=True, so neither can express a payload that is not
+    decodable under the child's stdin codec — which is precisely the input that used to walk
+    straight past identification into `except Exception: allow()`.
+    """
+    record = os.path.join(tmp, "record.json")
+    if os.path.exists(record):
+        os.remove(record)
+    env = dict(os.environ, DCG_WRAP_BIN=os.path.join(tmp, "stub"), STUB_RECORD=record)
+    env.update(extra_env or {})
+    proc = subprocess.run([sys.executable, WRAP], input=raw_bytes,
+                          capture_output=True, env=env, timeout=60)
+    seen = open(record).read() if os.path.exists(record) else None
+    if os.path.exists(record):
+        os.remove(record)
+    try:
+        return json.loads(proc.stdout.decode("utf-8", "replace")), seen
+    except ValueError:
+        return {}, seen
+
+
 def seen_command(seen):
     """The command dcg actually received — NOT a substring of the raw stdin blob.
 
@@ -470,6 +493,70 @@ def main():
         check("a deny that exited 3 is re-emitted on an exit the host honours",
               denied(out) and rc in (0, 2))
         check("a deny that exited 3 does not leak that status", rc != 3)
+
+        # ── A FAILED stdin read is not an EMPTY one ────────────────────────────────────
+        #
+        # `sys.stdin.read()` sat inside a bare `except Exception: allow()`. Under a strict
+        # stdin codec a single non-ASCII byte raised UnicodeDecodeError and the adapter
+        # allowed a call the settings matcher had already selected as guarded, scanner never
+        # invoked; a large payload under a memory cap did the same via MemoryError. The read
+        # now happens on the BYTE stream with surrogateescape, so decoding cannot raise and
+        # the bytes still reach identification. ensure_ascii=False is load-bearing here — the
+        # default would escape the very byte under test out of existence.
+        guarded_raw = json.dumps({
+            "tool_name": PLUGIN + "ctx_execute",
+            "tool_input": {"code": "git reset --hard origin/main # café",
+                           "language": "shell"},
+        }, ensure_ascii=False).encode("utf-8")
+        check("the non-ASCII probe really carries the byte it is testing",
+              b"\xc3" in guarded_raw)
+        out, seen = run_raw_bytes(guarded_raw, tmp,
+                                  {"PYTHONUTF8": "0", "PYTHONIOENCODING": "ascii"})
+        check("a guarded call with a non-ASCII byte under a strict stdin codec is not allowed",
+              out.get("continue") is not True)
+        check("...and that call is either scanned or denied, never silently passed",
+              seen is not None or denied(out))
+
+        # No over-refusal: a genuinely EMPTY stdin still means "no call to attribute".
+        # An empty read SUCCEEDS and returns b"" — only a read that RAISES is refused.
+        out, _ = run_raw_bytes(b"", tmp)
+        check("empty stdin still allows (the legitimate cannot-attribute path survives)",
+              out.get("continue") is True)
+
+        # ── `tool_name: null` must not launder a guarded call through `toolName` ───────
+        #
+        # `.get("tool_name")` returns None for an ABSENT key and for an explicit JSON null
+        # alike, so a present-but-null tool_name fell through to the alias and identified as
+        # Bash. With a guarded token sitting in the payload text it STILL allowed, because
+        # the raw-bytes tie-breaker is deliberately skipped once identification "succeeds".
+        # The suite pinned the LIST-typed case and passed, so the invariant read as covered
+        # while null walked through it.
+        out, _ = run_raw(json.dumps({
+            "tool_name": None,
+            "toolName": "Bash",
+            "tool_input": {"command": PLUGIN + "ctx_execute git reset --hard origin/main"},
+        }), tmp)
+        check("tool_name:null carrying a guarded token in the payload is DENIED", denied(out))
+        check("tool_name:null carrying a guarded token is not quietly allowed",
+              out.get("continue") is not True)
+
+        # Control: the camelCase alias must still work when tool_name is GENUINELY absent,
+        # or this fix would have closed the hole by breaking the feature.
+        out, seen = run_raw(json.dumps({
+            "toolName": PLUGIN + "ctx_execute",
+            "tool_input": {"code": "echo hello", "language": "shell"},
+        }), tmp)
+        check("the camelCase alias still resolves when tool_name is truly absent",
+              seen is not None)
+
+        # Control: a null tool_name naming nothing guarded anywhere stays ALLOWED. The
+        # cannot-attribute path is legitimate and must not become an over-refusal.
+        out, _ = run_raw(json.dumps({
+            "tool_name": None, "toolName": "Bash",
+            "tool_input": {"command": "ls -la"},
+        }), tmp)
+        check("a null tool_name naming nothing guarded is still allowed",
+              out.get("continue") is True)
 
     if failures:
         for f in failures:
