@@ -8,17 +8,21 @@ emission channel and let `infisical secrets --plain` through on 2026-05-15.
 
 This adapter:
 1. Reads Claude Code hook JSON from stdin.
-2. If tool_name is a context-mode exec tool (SUFFIX match — see CTX_TOOL_SUFFIXES),
-   extracts every code-bearing field and rewrites the payload as a synthetic Bash
-   call so dcg's existing pattern packs run against the code text verbatim.
+2. If tool_name CONTAINS one of CTX_TOOL_TOKENS, extracts every code-bearing field
+   and rewrites the payload as a synthetic Bash call so dcg's existing pattern
+   packs run against the code text verbatim.
 3. Pipes the rewritten payload to dcg-wrap, which runs dcg + Discord alerting.
 4. Emits dcg-wrap's decision back to Claude Code unchanged.
 
-Tool-name matching is a SUFFIX match, not exact membership (transformate WI-2096):
-the harness renamed the tools from `mcp__context-mode__ctx_execute` to
-`mcp__plugin_context-mode_context-mode__ctx_execute`, and the exact-membership
-set silently fell through to fail_open() — a live guardrail bypass for months.
-A suffix match survives the next prefix change instead of failing open.
+Tool-name matching is an UNANCHORED SUBSTRING match, not exact membership and not
+endswith (transformate WI-2096): the harness renamed the tools from
+`mcp__context-mode__ctx_execute` to `mcp__plugin_context-mode_context-mode__ctx_execute`,
+and the exact-membership set silently fell through to fail_open() — a live guardrail
+bypass for months. A substring match survives the next prefix change instead of failing
+open, and unlike endswith it also covers the decorated names the unanchored settings
+matcher really does route here. The constant used to be named for suffixes; that name
+asserted a right-anchoring the code deliberately does not have, and that reading has
+already caused one reintroduction of the bypass, so it is now CTX_TOOL_TOKENS.
 
 For non-shell languages (javascript/python/etc), dcg's regex patterns scan
 the raw source — substrings like `infisical secrets --plain` will match
@@ -38,6 +42,9 @@ never allowed through on the strength of an adapter or scanner failure.**
     * tool_name is a string naming something other than a context-mode exec tool.
     * the payload carried strings and every one of them is blank — there is
       genuinely no code text to scan.
+    * THE SCANNER RAN AND SAID NOTHING: exit 0 with empty stdout. That is how dcg
+      spells "allow" — it emits an envelope only when it objects. Measured, not
+      assumed; reading it as "no decision" denied every benign guarded call.
 
   unidentifiable, but the raw bytes name a guarded tool  -> DENY
     * stdin does not parse at all.
@@ -49,7 +56,8 @@ never allowed through on the strength of an adapter or scanner failure.**
     * the payload carries no string fields at all: an unrecognized shape, which
       is exactly what a schema rename looks like from in here.
     * dcg-wrap cannot be invoked, times out, or dies.
-    * dcg-wrap returns no parseable decision, at any exit status.
+    * dcg-wrap exits NON-ZERO having printed nothing — a crash, not a clean scan.
+    * dcg-wrap prints something that is not a recognisable decision, at any exit.
     * any unexpected exception after the tool was identified as guarded.
 
 This REPLACES the previous blanket fail-open. That guarantee read "the adapter
@@ -117,11 +125,11 @@ DCG_WRAP = os.environ.get(
     "DCG_WRAP_BIN",
     os.path.join(os.path.expanduser("~"), ".local/bin/dcg-wrap"),
 )
-# Suffix match: covers the legacy `mcp__context-mode__*` names AND the live
+# Substring match: covers the legacy `mcp__context-mode__*` names AND the live
 # plugin-prefixed `mcp__plugin_context-mode_context-mode__*` names, and any
 # future prefix. ctx_execute is a prefix of ctx_execute_file, so both are hit
 # by the first entry — listed separately for grep-ability.
-CTX_TOOL_SUFFIXES = (
+CTX_TOOL_TOKENS = (
     "context-mode__ctx_execute",
     "context-mode__ctx_execute_file",
     "context-mode__ctx_batch_execute",
@@ -168,7 +176,11 @@ def is_hook_decision(obj):
         return True
     hso = obj.get("hookSpecificOutput")
     if isinstance(hso, dict):
-        if hso.get("permissionDecision") in ("allow", "deny", "ask"):
+        # hookEventName is required, not decorative: the host keys on it, so an envelope
+        # without it may be ignored — and an ignored DENY is an allow. Safe to demand,
+        # measured: the real dcg emits hookEventName "PreToolUse" on every deny envelope.
+        if (hso.get("hookEventName") == "PreToolUse"
+                and hso.get("permissionDecision") in ("allow", "deny", "ask")):
             return True
     return False
 
@@ -185,7 +197,7 @@ def raw_carries_guarded_token(raw):
     """
     if not isinstance(raw, str) or not raw:
         return False
-    if any(s in raw for s in CTX_TOOL_SUFFIXES):
+    if any(s in raw for s in CTX_TOOL_TOKENS):
         return True
     # A hand-written document could \u-escape the token to hide it from the literal scan.
     # Decoding is a linear regex pass with no recursion, which also makes it safe to run on
@@ -195,7 +207,7 @@ def raw_carries_guarded_token(raw):
             decoded = _U_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), raw)
         except Exception:
             return False
-        return any(s in decoded for s in CTX_TOOL_SUFFIXES)
+        return any(s in decoded for s in CTX_TOOL_TOKENS)
     return False
 
 
@@ -224,10 +236,8 @@ def is_ctx_tool(tool):
     #
     # The cost of substring matching is OVER-matching: a name that merely contains a guarded
     # token gets scanned. That is the intended trade — dcg scans text, so a needless scan
-    # costs nothing, while a missed one is the incident this file exists to prevent. Read the
-    # "suffix" language in the docstring above as "not exact membership", which is the
-    # property that matters; it is not a claim that the match is right-anchored.
-    return any(s in tool for s in CTX_TOOL_SUFFIXES)
+    # costs nothing, while a missed one is the incident this file exists to prevent.
+    return any(s in tool for s in CTX_TOOL_TOKENS)
 
 
 def collect_strings(value, depth=0):
@@ -349,27 +359,51 @@ def main():
         # path from the ctx tools into dcg, so allowing here reopens the channel.
         deny("scanner %s could not be run (%s: %s)" % (DCG_WRAP, type(exc).__name__, exc))
 
-    # A decision must actually have been produced. subprocess.run does not raise
-    # on a non-zero child exit, so without this a dcg-wrap crash was forwarded as
-    # whatever it left on stdout — often nothing — and read as "no objection".
+    # HOW THE REAL SCANNER SPEAKS. Measured against dcg on TEAM-1, not inferred from the
+    # test stub:
+    #     allow -> exit 0 and NOTHING on stdout. Silence IS the allow.
+    #     deny  -> a full hookSpecificOutput envelope, also exit 0. Never exit 2.
+    # So "produced no parseable decision" cannot mean DENY on its own. It did, and that
+    # denied every BENIGN guarded call: a total outage of all three ctx tools on any host
+    # running the real dcg. The suite stayed green throughout because the stub always
+    # prints a decision, which is a thing dcg only does when it objects.
+    stdout = proc.stdout or ""
     decision = None
-    if proc.stdout and proc.stdout.strip():
+    if stdout.strip():
         try:
-            decision = json.loads(proc.stdout)
+            decision = json.loads(stdout)
         except ValueError:
             decision = None
+
+    if decision is None and not stdout.strip():
+        # Silence. Separate "scanned it and objected to nothing" from "never ran, or died
+        # mid-scan": the first exits 0, the second does not. A binary that cannot be
+        # executed at all never reaches here — subprocess raises and the handler above
+        # denies. RESIDUAL, stated because it cannot be closed from in here: a scanner that
+        # exits 0 having done nothing (a stub, a `true`, a shell wrapper whose exec failed
+        # silently) is indistinguishable on the wire from a clean scan. Catching that is
+        # install-time work — apply-wi2096-matcher.mjs canaries a known-dangerous fixture
+        # and requires the DENY to have come from the scanner rather than from this file.
+        if proc.returncode == 0:
+            allow()
+        deny("scanner exited %s with no output — a clean scan and a crash are not the "
+             "same thing" % proc.returncode)
+
     if not is_hook_decision(decision):
         sys.stderr.write(proc.stderr or "")
         deny(
             "scanner returned no recognisable decision (exit %s, %d bytes on stdout)"
-            % (proc.returncode, len(proc.stdout or ""))
+            % (proc.returncode, len(stdout))
         )
 
-    # A parseable decision passes through untouched, exit status included: dcg-wrap
-    # signals a block with exit 2 and rewriting that would mask its DENY.
-    sys.stdout.write(proc.stdout)
-    sys.stderr.write(proc.stderr)
-    sys.exit(proc.returncode)
+    # A recognised decision passes through untouched, but the exit status is NORMALISED.
+    # The host reads 2 as a blocking error and every OTHER non-zero as a non-blocking one,
+    # after which the tool proceeds — so forwarding a deny that happened to exit 3 would
+    # print the denial and run the call anyway. dcg itself denies with exit 0, so this is
+    # defence against a future scanner, not a description of the current one.
+    sys.stdout.write(stdout)
+    sys.stderr.write(proc.stderr or "")
+    sys.exit(2 if proc.returncode == 2 else 0)
 
 
 if __name__ == "__main__":

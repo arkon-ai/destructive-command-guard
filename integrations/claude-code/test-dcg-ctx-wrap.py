@@ -24,7 +24,8 @@ STUB = """#!/usr/bin/env python3
 import json, os, sys
 payload = sys.stdin.read()
 open(os.environ["STUB_RECORD"], "w").write(payload)
-print(json.dumps({"hookSpecificOutput": {"permissionDecision": "deny"}}))
+print(json.dumps({"hookSpecificOutput": {
+    "hookEventName": "PreToolUse", "permissionDecision": "deny"}}))
 """
 
 PLUGIN = "mcp__plugin_context-mode_context-mode__"
@@ -68,6 +69,26 @@ def run_raw(raw, tmp):
         return {}, seen
 
 
+def seen_command(seen):
+    """The command dcg actually received — NOT a substring of the raw stdin blob.
+
+    `trigger in seen` passes if the trigger lands in ANY field, including one dcg-wrap
+    never reads (`_dcg_source_tool`, a sibling key, a second copy beside an empty
+    `command`). That is the WI-2096 failure one layer down: suite green, command field
+    empty, channel open. So parse it and read the field that is actually scanned.
+    """
+    if not seen:
+        return ""
+    try:
+        payload = json.loads(seen)
+    except ValueError:
+        return ""
+    if payload.get("tool_name") != "Bash":
+        return ""
+    ti = payload.get("tool_input")
+    return ti.get("command", "") if isinstance(ti, dict) else ""
+
+
 def denied(out):
     return out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
 
@@ -91,8 +112,8 @@ def main():
             out, seen = run(PLUGIN + tool, {"code": "cat /tmp/probe.env", "language": "shell"}, tmp)
             check(f"{tool}: plugin-prefixed name is guarded",
                   out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
-            check(f"{tool}: code text reached dcg",
-                  seen is not None and "cat /tmp/probe.env" in seen)
+            check(f"{tool}: code reached dcg as tool_input.command",
+                  "cat /tmp/probe.env" in seen_command(seen))
 
         # 2. ctx_batch_execute carries commands[].command, not `code` — every
         #    command must be scanned, including one buried mid-array.
@@ -102,8 +123,9 @@ def main():
         ]}
         out, seen = run(PLUGIN + "ctx_batch_execute", batch, tmp)
         check("batch: guarded", out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
-        check("batch: non-first command reached dcg", seen and "cat /tmp/probe.env" in seen)
-        check("batch: first command reached dcg too", seen and "echo hello" in seen)
+        check("batch: non-first command reached dcg",
+              "cat /tmp/probe.env" in seen_command(seen))
+        check("batch: first command reached dcg too", "echo hello" in seen_command(seen))
 
         # 3. The legacy names still work — a stale caller must not go unguarded.
         out, _ = run(LEGACY + "ctx_execute", {"code": "cat /tmp/probe.env"}, tmp)
@@ -137,7 +159,7 @@ def main():
             check(f"{variant}: a decorated guarded name is still guarded",
                   out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
             check(f"{variant}: its code reached dcg",
-                  seen is not None and "cat /tmp/probe.env" in seen)
+                  "cat /tmp/probe.env" in seen_command(seen))
 
         # 5c. Depth overflow must DENY, not silently scan the shallow part. The shallow value
         #     here is benign; the dangerous one is buried below the extraction ceiling.
@@ -299,7 +321,7 @@ def main():
         #    key must still be scanned, not silently extracted to nothing.
         out, seen = run(PLUGIN + "ctx_execute", {"script": "cat /tmp/probe.env"}, tmp)
         check("renamed code field is still scanned",
-              seen is not None and "cat /tmp/probe.env" in seen)
+              "cat /tmp/probe.env" in seen_command(seen))
         check("renamed code field is guarded",
               out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
 
@@ -360,7 +382,8 @@ def main():
         with open(deny2, "w") as fh:
             fh.write("#!/usr/bin/env python3\n"
                      "import json,sys\n"
-                     "print(json.dumps({'hookSpecificOutput':{'permissionDecision':'deny'}}))\n"
+                     "print(json.dumps({'hookSpecificOutput':{'hookEventName':'PreToolUse',"
+                     "'permissionDecision':'deny'}}))\n"
                      "sys.exit(2)\n")
         os.chmod(deny2, 0o755)
         proc = subprocess.run(
@@ -374,6 +397,79 @@ def main():
         check("exit-2 deny keeps its decision",
               json.loads(proc.stdout).get(
                   "hookSpecificOutput", {}).get("permissionDecision") == "deny")
+
+
+        # 12. HOW THE REAL SCANNER SPEAKS — pinned against dcg's measured behaviour, not
+        #     against the stub's. dcg emits an envelope ONLY when it objects: a benign
+        #     command returns exit 0 and ZERO bytes. Reading that as "no decision" denied
+        #     every benign guarded call, i.e. took all three ctx tools offline on any host
+        #     with the real scanner — and this suite stayed green through it, because every
+        #     stub above always prints something. That is a test oracle that never modelled
+        #     the thing it stands in for.
+        def with_scanner(body, payload=None, mode=0o755):
+            """Run a guarded call against a scanner stub with the given body."""
+            binp = os.path.join(tmp, "shaped")
+            with open(binp, "w") as fh:
+                fh.write("#!/usr/bin/env python3\n" + body + "\n")
+            os.chmod(binp, mode)
+            proc = subprocess.run(
+                [sys.executable, WRAP],
+                input=json.dumps(payload or {"tool_name": PLUGIN + "ctx_execute",
+                                             "tool_input": {"code": "echo hello"}}),
+                capture_output=True, text=True,
+                env=dict(os.environ, DCG_WRAP_BIN=binp), timeout=60)
+            try:
+                return json.loads(proc.stdout), proc.returncode
+            except ValueError:
+                return {}, proc.returncode
+
+        out, _ = with_scanner("import sys; sys.exit(0)")
+        check("a scanner that exits 0 saying NOTHING is an ALLOW (this is dcg's allow)",
+              out.get("continue") is True)
+
+        out, _ = with_scanner("import sys; sys.exit(3)")
+        check("a scanner that exits NON-ZERO saying nothing is a DENY, not an allow",
+              denied(out))
+
+        # sol: the host keys on hookEventName, so an envelope without it may be ignored —
+        # and an ignored decision is no decision. The real dcg always sends it.
+        #
+        # Asserting only `denied(out)` here would NOT discriminate: a forwarded malformed
+        # deny and an adapter-generated deny both read as "deny". The question is WHOSE
+        # envelope reaches the host, so assert the adapter replaced it with a well-formed
+        # one — and use an ALLOW envelope for the sharp case, where forwarding versus
+        # replacing changes the verdict itself rather than only its provenance.
+        def adapter_sourced(o):
+            hso = o.get("hookSpecificOutput", {})
+            return (hso.get("hookEventName") == "PreToolUse"
+                    and str(hso.get("permissionDecisionReason", "")).startswith("dcg-ctx-wrap:"))
+
+        for label, envelope in (
+            ("missing hookEventName", "{'permissionDecision':'deny'}"),
+            ("a different hook event", "{'hookEventName':'Other','permissionDecision':'deny'}"),
+        ):
+            out, _ = with_scanner(
+                "import json; print(json.dumps({'hookSpecificOutput':" + envelope + "}))")
+            check(f"a decision envelope with {label} is replaced, not forwarded",
+                  denied(out) and adapter_sourced(out))
+
+        # The sharp one: a malformed ALLOW. Forwarding it lets the call run on an envelope
+        # the host may not honour; replacing it refuses.
+        out, _ = with_scanner(
+            "import json; print(json.dumps({'hookSpecificOutput':"
+            "{'permissionDecision':'allow'}}))")
+        check("a malformed ALLOW envelope is refused, not passed through",
+              denied(out) and adapter_sourced(out))
+
+        # opus: the host reads 2 as blocking and every OTHER non-zero as NON-blocking,
+        # after which the tool proceeds — so a deny forwarded with exit 3 is a deny the
+        # host discards. Normalise, never pass an arbitrary child status through.
+        out, rc = with_scanner(
+            "import json,sys; print(json.dumps({'hookSpecificOutput':"
+            "{'hookEventName':'PreToolUse','permissionDecision':'deny'}})); sys.exit(3)")
+        check("a deny that exited 3 is re-emitted on an exit the host honours",
+              denied(out) and rc in (0, 2))
+        check("a deny that exited 3 does not leak that status", rc != 3)
 
     if failures:
         for f in failures:
