@@ -109,8 +109,34 @@ def deny(reason):
     sys.exit(0)
 
 
+class ShapeTooDeep(Exception):
+    """The payload nests deeper than we are willing to walk."""
+
+
+def is_hook_decision(obj):
+    """Is this actually a Claude Code hook decision, rather than merely valid JSON?
+
+    "Parses as a JSON object" is not the same as "carries a verdict". `dcg-wrap` emitting a
+    diagnostic envelope — `{"error": {...}}`, or a bare `{}` — used to be forwarded verbatim,
+    and because it contains no denial the host reads it as no objection. That is the fail-open
+    this adapter exists to close, arriving as well-formed JSON.
+    """
+    if not isinstance(obj, dict):
+        return False
+    if isinstance(obj.get("continue"), bool):
+        return True
+    hso = obj.get("hookSpecificOutput")
+    if isinstance(hso, dict):
+        if hso.get("permissionDecision") in ("allow", "deny", "ask"):
+            return True
+    return False
+
+
 def is_ctx_tool(tool):
-    return any(s in tool for s in CTX_TOOL_SUFFIXES)
+    # A real SUFFIX match, as the docstring has always claimed. Substring membership also
+    # classified names like `context-mode__ctx_execute_status` as guarded exec tools, which
+    # then get refused for not matching an exec-tool schema they were never meant to have.
+    return tool.endswith(CTX_TOOL_SUFFIXES)
 
 
 def collect_strings(value, depth=0):
@@ -125,7 +151,11 @@ def collect_strings(value, depth=0):
     scanning each piece: any single offending fragment still matches.
     """
     if depth > MAX_DEPTH:
-        return []
+        # NOT `return []`. Silently yielding nothing below the ceiling means a payload with a
+        # benign shallow label and dangerous code nested deeper gets scanned as the benign
+        # fragment alone, and the guarded call proceeds — which is precisely the "every string
+        # is scanned" claim failing quietly. Raise, so the guarded path denies.
+        raise ShapeTooDeep("payload nests deeper than %d levels" % MAX_DEPTH)
     if isinstance(value, str):
         return [value]
     out = []
@@ -159,17 +189,23 @@ def main():
     if ti is None:
         ti = inp.get("toolInput")
     if ti is None:
-        ti = {}
+        # A guarded call with NO payload at all is a truncated or malformed invocation, not a
+        # deliberate no-op. Defaulting it to {} made those two indistinguishable and then let
+        # the empty case through.
+        deny("guarded tool %s carried no tool_input at all" % tool)
     if not isinstance(ti, dict):
         deny("guarded tool %s carried a non-object tool_input (%s)" % (tool, type(ti).__name__))
+    if not ti:
+        deny("guarded tool %s carried an empty tool_input" % tool)
 
-    strings = collect_strings(ti)
+    try:
+        strings = collect_strings(ti)
+    except ShapeTooDeep as exc:
+        deny("guarded tool %s: %s — refusing rather than scanning part of it" % (tool, exc))
     if not strings:
-        # An empty object is a call that runs nothing. A NON-empty payload with
-        # no strings anywhere is a shape this adapter does not understand, which
-        # is what a field rename looks like from in here — refuse it.
-        if not ti:
-            allow()
+        # Strings are the only thing this adapter can hand to the scanner. A payload with none
+        # anywhere is a shape it does not understand, which is exactly what a field rename
+        # looks like from in here.
         deny(
             "guarded tool %s carried no string fields — unrecognized payload shape, "
             "refusing rather than scanning nothing" % tool
@@ -212,10 +248,10 @@ def main():
             decision = json.loads(proc.stdout)
         except ValueError:
             decision = None
-    if not isinstance(decision, dict):
+    if not is_hook_decision(decision):
         sys.stderr.write(proc.stderr or "")
         deny(
-            "scanner returned no parseable decision (exit %s, %d bytes on stdout)"
+            "scanner returned no recognisable decision (exit %s, %d bytes on stdout)"
             % (proc.returncode, len(proc.stdout or ""))
         )
 

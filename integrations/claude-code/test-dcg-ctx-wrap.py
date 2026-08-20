@@ -94,8 +94,72 @@ def main():
         check("unrelated tool passes through", out.get("continue") is True and seen is None)
         out, seen = run(PLUGIN + "ctx_execute", {"code": "   "}, tmp)
         check("blank code passes through", out.get("continue") is True and seen is None)
+        # An EMPTY payload on a guarded tool is a truncated or malformed invocation, not a
+        # deliberate no-op, and the README decision table denies it. It used to be allowed.
         out, seen = run(PLUGIN + "ctx_execute", {}, tmp)
-        check("empty tool_input passes through", out.get("continue") is True and seen is None)
+        check("empty tool_input is denied",
+              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+        check("empty tool_input never reached dcg", seen is None)
+
+        # 5b. Suffix matching is a SUFFIX match. A name that merely CONTAINS a guarded token
+        #     but carries trailing characters is a different tool and must pass through.
+        out, seen = run(PLUGIN + "ctx_execute_status", {"code": "cat /tmp/probe.env"}, tmp)
+        check("a guarded token with trailing characters is NOT treated as guarded",
+              out.get("continue") is True and seen is None)
+
+        # 5c. Depth overflow must DENY, not silently scan the shallow part. The shallow value
+        #     here is benign; the dangerous one is buried below the extraction ceiling.
+        deep = {"label": "benign"}
+        node = deep
+        for _ in range(20):
+            node["next"] = {}
+            node = node["next"]
+        node["code"] = "cat /tmp/probe.env"
+        out, seen = run(PLUGIN + "ctx_execute", deep, tmp)
+        check("a payload nested past the extraction ceiling is denied",
+              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+        check("an over-deep payload is never scanned in part", seen is None)
+
+        # 5d. Valid JSON is not a decision. A diagnostic envelope carries no verdict, so
+        #     forwarding it reads to the host as no objection.
+        for label, body in (
+            ("an error envelope", "print(json.dumps({'error': {'msg': 'boom'}}))"),
+            ("a bare empty object", "print(json.dumps({}))"),
+            ("an unrelated object", "print(json.dumps({'ok': True}))"),
+            ("a JSON array", "print(json.dumps([1, 2, 3]))"),
+        ):
+            envelope = os.path.join(tmp, "envelope")
+            with open(envelope, "w") as fh:
+                fh.write("#!/usr/bin/env python3\nimport json\n" + body + "\n")
+            os.chmod(envelope, 0o755)
+            proc = subprocess.run(
+                [sys.executable, WRAP],
+                input=json.dumps({"tool_name": PLUGIN + "ctx_execute",
+                                  "tool_input": {"code": "cat /tmp/probe.env"}}),
+                capture_output=True, text=True,
+                env=dict(os.environ, DCG_WRAP_BIN=envelope), timeout=20,
+            )
+            try:
+                out = json.loads(proc.stdout)
+            except ValueError:
+                out = {}
+            check(f"scanner returning {label} DENIES",
+                  out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+
+        # 5e. A genuine `{"continue": true}` allow from the scanner still passes through.
+        allower = os.path.join(tmp, "allower")
+        with open(allower, "w") as fh:
+            fh.write("#!/usr/bin/env python3\nimport json\nprint(json.dumps({'continue': True}))\n")
+        os.chmod(allower, 0o755)
+        proc = subprocess.run(
+            [sys.executable, WRAP],
+            input=json.dumps({"tool_name": PLUGIN + "ctx_execute",
+                              "tool_input": {"code": "echo hello"}}),
+            capture_output=True, text=True,
+            env=dict(os.environ, DCG_WRAP_BIN=allower), timeout=20,
+        )
+        check("a genuine continue:true allow is passed through",
+              json.loads(proc.stdout).get("continue") is True)
 
         # ── Fail-CLOSED paths. Without these the suite stays green through exactly the
         # regressions the fail-open contract used to permit. ──
