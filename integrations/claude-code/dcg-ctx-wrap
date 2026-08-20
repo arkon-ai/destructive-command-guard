@@ -31,12 +31,18 @@ The rule is: **once a call is identified as a guarded context-mode tool, it is
 never allowed through on the strength of an adapter or scanner failure.**
 
   not our surface          -> ALLOW
-    * stdin is not parseable JSON. We cannot identify the tool, so we cannot
-      attribute the call to the guarded set. The harness writes this stdin;
-      malformed input means the harness is broken, not that a caller evaded us.
-    * tool_name is not a context-mode exec tool.
+    * stdin is not parseable JSON AND its raw bytes name no guarded tool. We
+      cannot identify the call and nothing claims we should. The harness writes
+      this stdin; malformed input means the harness is broken, not that a caller
+      evaded us.
+    * tool_name is a string naming something other than a context-mode exec tool.
     * the payload carried strings and every one of them is blank — there is
       genuinely no code text to scan.
+
+  unidentifiable, but the raw bytes name a guarded tool  -> DENY
+    * stdin does not parse at all.
+    * the top-level document is not a JSON object.
+    * tool_name is missing, empty, or not a string.
 
   guarded, but we cannot render a verdict  -> DENY
     * tool_input is not an object.
@@ -55,6 +61,40 @@ the scanner silently reopened precisely the channel that leaked on 2026-05-15.
 Measured, not theorised: `DCG_WRAP_BIN=/nonexistent` previously emitted
 `{"continue": true}` and exit 0.
 
+IDENTIFICATION IS PART OF THAT CONTRACT.
+
+Every fail-closed rule above begins "once a call is IDENTIFIED as guarded". So an
+attacker never had to beat them — only to stop them applying. Two routes did
+exactly that, and both returned `{"continue": true}` with the scanner NEVER
+invoked, through the one path this contract blesses as ALLOW:
+
+  * `json.loads()` RECURSES. Nesting any field deep enough raises RecursionError,
+    which is an Exception, which the parse guard caught and turned into allow().
+    MAX_DEPTH does not help — it applies inside collect_strings, AFTER the parse.
+    Measured against this file's parent commit, a guarded ctx_execute carrying a
+    deep sibling field, scanner never run:
+        python 3.11.15 -> allowed from depth ~1100
+        python 3.12.3  -> allowed from depth ~10000   (TEAM-1's interpreter)
+        python 3.14.3  -> allowed from depth ~20000
+    The interpreter sets the price, not whether the door is open.
+  * a NON-STRING `tool_name` reached the same allow() via the old
+    `not isinstance(tool, str)` arm — on every interpreter, at any payload size,
+    and reachable without any adversary at all.
+
+The close: an identification failure is "not our surface" only if nothing in the
+raw stdin claims otherwise. The harness serialises tool_name with a standard JSON
+encoder, which leaves ASCII literal, so a guarded token is present VERBATIM in the
+bytes even when the document as a whole will not parse. If it is there, refuse.
+This is consulted ONLY on identification failure; it never overrides a successful
+identification, so a Bash call whose command text merely mentions a ctx tool name
+is still allowed by the normal path.
+
+Deliberately NOT done: scanning the raw text for nesting depth so the parse is
+never attempted at all. That would additionally close a parser CRASH, since a dead
+hook emits no denial — but no crash is reachable: json.loads raised RecursionError
+cleanly at 2e5, 1e6 and 5e6 levels on 3.12.3. Buying an undemonstrable case with a
+hand-rolled string-aware bracket scanner inside the control is a bad trade.
+
 The field-name keying is gone for the same reason the tool-name keying went in
 transformate WI-2096. Keying on `code` / `commands[].command` had identical drift
 semantics one layer down: rename the field and a guarded tool yields "no code"
@@ -69,6 +109,7 @@ shape-drift extraction under transformate WI-2096.
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -132,6 +173,45 @@ def is_hook_decision(obj):
     return False
 
 
+_U_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def raw_carries_guarded_token(raw):
+    """Do the RAW stdin bytes name a guarded context-mode tool?
+
+    Consulted ONLY when identification failed — never as an override of a successful one.
+    A Bash call whose command text merely mentions a ctx tool name parses fine, identifies
+    as Bash and is allowed by the normal path; this function never sees it.
+    """
+    if not isinstance(raw, str) or not raw:
+        return False
+    if any(s in raw for s in CTX_TOOL_SUFFIXES):
+        return True
+    # A hand-written document could \u-escape the token to hide it from the literal scan.
+    # Decoding is a linear regex pass with no recursion, which also makes it safe to run on
+    # the path where a RecursionError has just unwound.
+    if "\\u" in raw:
+        try:
+            decoded = _U_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), raw)
+        except Exception:
+            return False
+        return any(s in decoded for s in CTX_TOOL_SUFFIXES)
+    return False
+
+
+def unidentified(raw, why):
+    """Terminal decision for a call this adapter could not identify.
+
+    Identification failure is the cheapest way past a fail-closed contract, because every
+    rule in that contract is conditioned on the call having been identified first. So an
+    unidentifiable call is "not our surface" only while nothing in the bytes says otherwise.
+    """
+    if raw_carries_guarded_token(raw):
+        deny("%s, and stdin names a guarded context-mode tool — refusing a call that "
+             "cannot be identified" % why)
+    allow()
+
+
 def is_ctx_tool(tool):
     # SUBSTRING membership, deliberately — NOT `tool.endswith(...)`.
     #
@@ -180,18 +260,37 @@ def collect_strings(value, depth=0):
 
 
 def main():
-    # Before the tool is identified we cannot attribute the call, so a failure
-    # here is ALLOW. Everything after the is_ctx_tool() gate is DENY-on-failure.
+    # IDENTIFICATION, and it is fail-closed too — see the module docstring. A call we
+    # cannot identify is allowed only while the raw bytes make no claim on the guarded
+    # surface; `unidentified()` is what enforces that, and it never falls through.
     try:
         raw = sys.stdin.read()
-        inp = json.loads(raw)
     except Exception:
-        allow()
-    if not isinstance(inp, dict):
+        # No bytes at all. There is no call here to attribute, guarded or otherwise, and
+        # no evidence to weigh either way.
         allow()
 
-    tool = inp.get("tool_name") or inp.get("toolName") or ""
-    if not isinstance(tool, str) or not is_ctx_tool(tool):
+    try:
+        inp = json.loads(raw)
+    except Exception as exc:
+        # Catches RecursionError from a deeply nested payload, which was the cheapest
+        # route past this adapter, as well as ordinary malformed input.
+        unidentified(raw, "stdin did not parse as JSON (%s)" % type(exc).__name__)
+    if not isinstance(inp, dict):
+        unidentified(raw, "stdin parsed to %s, not a hook object" % type(inp).__name__)
+
+    # `toolName` is consulted only when `tool_name` is ABSENT. A present-but-wrong-typed
+    # tool_name is a corrupt claim about the call, not an absence of one, so it must not be
+    # possible to park a guarded name in `tool_name` and a benign one in `toolName`.
+    tool = inp.get("tool_name")
+    if tool is None:
+        tool = inp.get("toolName")
+    if not isinstance(tool, str) or not tool:
+        unidentified(raw, "tool_name is %s, not a usable tool name" % type(tool).__name__)
+    if not is_ctx_tool(tool):
+        # Identification SUCCEEDED and the answer is "not ours". The raw-bytes check is
+        # deliberately NOT applied here: it is a tie-breaker for unidentifiable input, not
+        # a second opinion about a call we read correctly.
         allow()
 
     # ---- from here the call is GUARDED: no path out of this function allows it

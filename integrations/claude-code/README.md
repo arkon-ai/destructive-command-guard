@@ -13,7 +13,7 @@ the agent reaches for one of them.
 The adapter:
 
 1. Reads the Claude Code hook JSON from stdin.
-2. If the tool name ends in one of `CTX_TOOL_SUFFIXES` (`context-mode__ctx_execute`,
+2. If the tool name CONTAINS one of `CTX_TOOL_SUFFIXES` (`context-mode__ctx_execute`,
    `…ctx_execute_file`, `…ctx_batch_execute`), extracts every code-bearing field
    and rewrites the payload as a synthetic
    `{tool_name: "Bash", tool_input: {command: <code>}}` shape.
@@ -21,12 +21,18 @@ The adapter:
    Discord alert path).
 4. Emits `dcg-wrap`'s decision back to Claude Code unchanged.
 
-**Matching is by SUFFIX, never exact name** (transformate WI-2096). The harness renamed
+**Matching is by SUBSTRING, never exact name** (transformate WI-2096). The harness renamed
 these tools from `mcp__context-mode__ctx_execute` to
 `mcp__plugin_context-mode_context-mode__ctx_execute`; the old exact-membership
 set stopped matching and fell straight through to `fail_open()`, leaving the
-primary code-execution channel unscanned. A suffix match survives the next
+primary code-execution channel unscanned. A substring match survives the next
 prefix change instead of failing open.
+
+It is deliberately not right-anchored, and `str.endswith` is **forbidden** here: the
+`settings.json` matcher that routes calls to this adapter is unanchored, so the harness
+really does deliver decorated names like `…__ctx_execute_v2`, and under `endswith` every
+one of them reached `allow()` with the scanner never invoked. That remedy was applied
+once and reverted; the suite now pins the decorated names as guarded.
 
 **Payload extraction is per-tool.** `ctx_execute` / `ctx_execute_file` carry a
 single `tool_input.code`; `ctx_batch_execute` carries `tool_input.commands[]` of
@@ -102,13 +108,19 @@ spawns the binary, pipes the hook JSON on stdin, parses stdout JSON).
 **Once a call is identified as a guarded context-mode tool, it is never allowed
 through because something failed.**
 
+**And identification is part of that**, because every rule below is conditioned on the
+call having been identified first — so defeating identification was a way past the
+contract without ever engaging it. See "Identification fails closed too".
+
 | situation | decision |
 |---|---|
-| stdin is not parseable JSON | ALLOW — the tool cannot be identified, so the call cannot be attributed to the guarded set. The harness writes this stdin; malformed input means the harness is broken. |
-| `tool_name` is not a context-mode exec tool | ALLOW — not this adapter's surface. |
+| stdin is not parseable JSON, and its raw bytes name no guarded tool | ALLOW — the call cannot be identified and nothing claims it should be. The harness writes this stdin; malformed input means the harness is broken. |
+| stdin cannot be identified (unparseable, not an object, or `tool_name` missing/empty/not a string) **but its raw bytes name a guarded tool** | DENY |
+| `tool_name` is a string naming something other than a context-mode exec tool | ALLOW — not this adapter's surface. |
 | payload carried strings and all of them are blank | ALLOW — there is genuinely no code text to scan. |
 | `tool_input` is not an object | DENY |
 | payload carries no string fields at all | DENY — an unrecognized shape, which is what a schema rename looks like from inside the adapter. |
+| payload nests deeper than `MAX_DEPTH` | DENY — scanning only the shallow part would report a verdict on a fraction of the payload. |
 | `dcg-wrap` cannot be invoked, times out, or dies | DENY |
 | `dcg-wrap` returns no parseable decision, at any exit status | DENY |
 | any unexpected exception after the tool was identified as guarded | DENY |
@@ -124,6 +136,32 @@ the ctx tools into dcg — the `Bash` matcher does not fire for them. So an
 operational failure of the scanner silently reopened exactly the channel that
 leaked on 2026-05-15. Measured, not argued: `DCG_WRAP_BIN=/nonexistent` used to
 emit `{"continue": true}` and exit 0.
+
+### Identification fails closed too
+
+Every rule in that table starts "once the call is identified as guarded". So an attacker
+never had to beat the contract — only to stop it applying. Two routes did exactly that,
+each returning `{"continue": true}` with the scanner **never invoked**:
+
+- **`json.loads` recurses.** Nesting any field deep enough raises `RecursionError`, which
+  is an `Exception`, which the parse guard caught and turned into an allow. `MAX_DEPTH`
+  does not help — it applies during extraction, *after* the parse. The depth needed is a
+  C-stack limit that has moved across releases, measured on the parent commit at ~1100
+  (3.11.15), ~10000 (3.12.3) and ~20000 (3.14.3). The interpreter sets the price, not
+  whether the door is open.
+- **A non-string `tool_name`** reached the same allow through the type check — on every
+  interpreter, at any payload size, and reachable without any adversary at all.
+
+The close: an identification failure counts as "not our surface" only while nothing in the
+raw stdin says otherwise. The harness serialises `tool_name` with a standard JSON encoder,
+so a guarded token is present verbatim in the bytes even when the document will not parse;
+`\uXXXX`-escaped spellings are decoded before the check. If a guarded token is there, the
+call is refused.
+
+This is a tie-breaker for unidentifiable input, **not** a second opinion about a call that
+was read correctly: it is consulted only after identification has already failed. A `Bash`
+call whose command text merely mentions a ctx tool name parses fine, identifies as `Bash`,
+and is allowed by the normal path. The suite pins that case.
 
 Extraction is also shape-agnostic rather than field-keyed: it walks the whole
 `tool_input` and scans every string it finds. Keying on `code` and

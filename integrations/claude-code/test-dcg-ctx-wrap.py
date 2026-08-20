@@ -46,6 +46,32 @@ def run(tool_name, tool_input, tmp):
     return json.loads(proc.stdout), seen
 
 
+def run_raw(raw, tmp):
+    """Invoke the wrapper with EXACT stdin bytes; return (decision, payload_seen_or_None).
+
+    The identification probes need documents `run()` cannot express: malformed JSON, and
+    payloads nested past the parser's ceiling — which json.dumps cannot build either,
+    because the encoder recurses on the same structure the decoder does.
+    """
+    record = os.path.join(tmp, "record.json")
+    if os.path.exists(record):
+        os.remove(record)
+    env = dict(os.environ, DCG_WRAP_BIN=os.path.join(tmp, "stub"), STUB_RECORD=record)
+    proc = subprocess.run([sys.executable, WRAP], input=raw, capture_output=True,
+                          text=True, env=env, timeout=180)
+    seen = open(record).read() if os.path.exists(record) else None
+    if os.path.exists(record):
+        os.remove(record)
+    try:
+        return json.loads(proc.stdout), seen
+    except ValueError:
+        return {}, seen
+
+
+def denied(out):
+    return out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+
+
 def main():
     failures = []
 
@@ -166,6 +192,104 @@ def main():
         )
         check("a genuine continue:true allow is passed through",
               json.loads(proc.stdout).get("continue") is True)
+
+        # 5f. IDENTIFICATION IS PART OF THE FAIL-CLOSED CONTRACT.
+        #     Every rule below is conditioned on the call having been IDENTIFIED as
+        #     guarded first, so an attacker never had to beat the contract — only to stop
+        #     it applying. Each case here returned continue:true with the scanner NEVER
+        #     invoked, reopening the 2026-05-15 channel through the one path the contract
+        #     blesses as ALLOW. `seen is None` is load-bearing in every one: it is what
+        #     distinguishes "refused" from "scanned and happened to deny".
+        def guarded_deep(n):
+            """A guarded ctx_execute call with a sibling field nested n levels deep."""
+            return ('{"tool_name": "' + PLUGIN + 'ctx_execute", "tool_input": '
+                    '{"code": "cat /tmp/probe.env", "pad": ' + "[" * n + "]" * n + "}}")
+
+        # json.loads RECURSES, so deep nesting ANYWHERE raises RecursionError — an
+        # Exception, which the parse guard caught and turned into allow(). MAX_DEPTH does
+        # not help; it applies inside collect_strings, AFTER the parse.
+        #
+        # READ THIS BEFORE TRUSTING A GREEN RUN: the depth at which the parser gives up is
+        # INTERPRETER-DEPENDENT — measured on the parent commit at ~1100 (3.11.15), ~10000
+        # (3.12.3, TEAM-1's) and ~20000 (3.14.3). So on a newer interpreter the 1200/2000
+        # cases pass on the OLD code too, via the depth ceiling, and only the last one is a
+        # negative control everywhere. Do not read 1200/2000 passing as proof the recursion
+        # hole is shut; 200000 is the case that proves it on any interpreter.
+        for depth in (1200, 2000, 200000):
+            out, seen = run_raw(guarded_deep(depth), tmp)
+            check(f"depth {depth}: a guarded call the parser cannot read is denied",
+                  denied(out))
+            check(f"depth {depth}: it never reached dcg", seen is None)
+
+        # SELF-CHECK ON THAT CONTROL. It only exercises the identification arm while its
+        # depth actually defeats this interpreter's parser — so assert the mechanism, not
+        # just the outcome, or the day a CPython parses 200000 levels this quietly stops
+        # being a control and the suite stays green over the hole.
+        #
+        # It cannot be made interpreter-independent by lowering sys.setrecursionlimit: the
+        # json C scanner's ceiling is a C-STACK limit that setrecursionlimit does not
+        # govern. Measured on 3.12.3 — with the limit at 150 a 400-level document still
+        # parsed fine. If this check fails, RAISE THE DEPTH; do not delete the control.
+        out, _ = run_raw(guarded_deep(200000), tmp)
+        check("the deep control still reaches the PARSE-failure arm on this interpreter",
+              "did not parse" in out.get(
+                  "hookSpecificOutput", {}).get("permissionDecisionReason", ""))
+
+        # A NON-STRING tool_name took the same exit, on every interpreter and at any
+        # payload size — no adversarial construction needed at all.
+        for label, name in (("list", [PLUGIN + "ctx_execute"]),
+                            ("dict", {"n": PLUGIN + "ctx_execute"}),
+                            ("int", 12345)):
+            out, seen = run_raw(json.dumps(
+                {"tool_name": name, "tool_input": {"code": "cat /tmp/probe.env"}}), tmp)
+            if label == "int":
+                # Nothing in these bytes names a guarded tool, so this one is genuinely
+                # unattributable and MUST still allow — the pin that the refusal keys on
+                # evidence, not merely on tool_name being the wrong type.
+                check("non-string tool_name with no guarded token in stdin still allows",
+                      out.get("continue") is True and seen is None)
+            else:
+                check(f"tool_name as a {label} is denied, not allowed", denied(out))
+                check(f"tool_name as a {label} never reached dcg", seen is None)
+
+        # `toolName` is a fallback for an ABSENT tool_name only. If a corrupt-typed
+        # tool_name could be overridden by a benign `toolName`, a guarded call would park
+        # the real name in one field and a decoy in the other.
+        out, seen = run_raw(json.dumps({"tool_name": [PLUGIN + "ctx_execute"],
+                                        "toolName": "Read",
+                                        "tool_input": {"code": "cat /tmp/probe.env"}}), tmp)
+        check("a benign toolName cannot launder a corrupt-typed tool_name", denied(out))
+
+        # Truncated JSON that still names a guarded tool.
+        out, seen = run_raw('{"tool_name": "' + PLUGIN + 'ctx_execute", "tool_input": '
+                            '{"code": "cat /tmp/probe.env"', tmp)
+        check("unparseable stdin naming a guarded tool is denied", denied(out))
+
+        # The token \u-escaped so it is not literally in the bytes, in a document deep
+        # enough that the parse never resolves the escape.
+        out, seen = run_raw('{"tool_name": "' + PLUGIN + 'ctx_ex\\u0065cute", "tool_input": '
+                            '{"pad": ' + "[" * 200000 + "]" * 200000 + "}}", tmp)
+        check("a \\u-escaped guarded token in unparseable stdin is denied", denied(out))
+
+        # ---- and the ALLOW side, which the refusal above must not swallow ----
+        # These are why the check reads the RAW BYTES rather than simply denying whatever
+        # it cannot parse: genuine "cannot attribute" input must still pass.
+        out, seen = run_raw('{"tool_name": "Read", "tool_input": {"file_path": "/etc/hosts"',
+                            tmp)
+        check("unparseable stdin naming NO guarded tool still allows",
+              out.get("continue") is True and seen is None)
+        out, seen = run_raw('{"tool_name": "Read", "tool_input": {"pad": '
+                            + "[" * 200000 + "]" * 200000 + "}}", tmp)
+        check("an over-deep NON-ctx payload still allows",
+              out.get("continue") is True and seen is None)
+        # The decisive false-positive pin: identification SUCCEEDS here (it is Bash), so
+        # the raw-bytes check must never be consulted. If it were an override rather than a
+        # tie-breaker, every Bash call discussing these tools would be blocked.
+        out, seen = run_raw(json.dumps(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "echo " + PLUGIN + "ctx_execute"}}), tmp)
+        check("a Bash call whose TEXT names a ctx tool is still allowed",
+              out.get("continue") is True and seen is None)
 
         # ── Fail-CLOSED paths. Without these the suite stays green through exactly the
         # regressions the fail-open contract used to permit. ──
