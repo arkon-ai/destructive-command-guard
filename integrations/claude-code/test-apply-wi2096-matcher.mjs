@@ -80,6 +80,24 @@ for (const [label, hooks] of [
   check(`hollow matcher (${label}) says it runs nothing`, /runs NOTHING/.test(r.out));
 }
 
+// 1b2. THE LAPTOP'S ACTUAL STATE: matcher at LOOSE, hooks present and runnable, but routed to
+//      something other than the ctx wrapper. That reported "already current" while dcg was
+//      nowhere on the path. A matcher string is not a control; the hook command is.
+{
+  const s = settings([bashEntry(), { matcher: LOOSE, hooks: [{ command: "node ~/.claude/hooks/warden-bash-dispatcher.js" }] }]);
+  const r = run(s, sweep(0));
+  check("matcher routed away from the wrapper does not exit 0", r.status !== 0);
+  check("matcher routed away from the wrapper is not called already-current",
+    !/^already current/m.test(r.out));
+  check("matcher routed away from the wrapper says so", /NONE routes to/.test(r.out));
+}
+// ...and one that DOES route to the wrapper is accepted.
+{
+  const s = settings([bashEntry(), looseEntry()]);
+  const r = run(s, sweep(0));
+  check("matcher routed to the wrapper is accepted", r.status === 0);
+}
+
 // 1c. A run must not destroy the previous run's backup. A fixed backup name meant the second
 //     invocation overwrote the only copy of the last known-good file, so the documented manual
 //     rollback restored the already-broken state.

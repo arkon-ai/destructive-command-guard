@@ -75,6 +75,32 @@ if (hollow.length > 0) {
   );
 }
 
+// A matcher string is not a control. It has to ROUTE somewhere, and specifically to the ctx
+// wrapper this script exists to keep on the path.
+//
+// Found by an independent merge-authority probe, and it is not hypothetical: on the laptop
+// seat the ctx matcher sits at LOOSE-equivalent and routes to `warden-bash-dispatcher.js`
+// while `dcg-ctx-wrap` is absent from the machine entirely — so this tool reported the control
+// "already current" with dcg nowhere on the path. Validating the string and never the target
+// is the same false-green shape as the two states F4 collapsed.
+//
+// Only ONE ctx entry needs to reach the wrapper: a host may legitimately carry a second entry
+// routing the same tools to another guard (TEAM-1 routes them to the bash dispatcher as well).
+const wrapperName = path.basename(process.env.CTX_WRAP || "dcg-ctx-wrap");
+const routesToWrapper = (e) =>
+  Array.isArray(e.hooks) &&
+  e.hooks.some((h) => h && typeof h.command === "string" && h.command.includes(wrapperName));
+
+if (ctxEntries.length > 0 && !ctxEntries.some(routesToWrapper)) {
+  console.error(
+    `context-mode matcher(s) exist in ${SETTINGS} but NONE routes to '${wrapperName}'.\n` +
+    "The matcher string is not the control — the hook command is. Rewriting the matcher would\n" +
+    "leave the ctx surfaces going somewhere else entirely, so this stops instead.\n" +
+    "Point one context-mode entry's hook command at the wrapper, then re-run."
+  );
+  process.exit(1);
+}
+
 if (ctxEntries.length === 0) {
   console.error(
     `NO context-mode PreToolUse matcher exists in ${SETTINGS}.\n` +
