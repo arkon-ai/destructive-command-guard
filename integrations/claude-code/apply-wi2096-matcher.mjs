@@ -14,7 +14,7 @@
 // Manual rollback at any time: cp <printed backup path> ~/.claude/settings.json
 // Idempotent: a second run reports "already current" and exits 0.
 
-import { readFileSync, writeFileSync, copyFileSync } from "node:fs";
+import { readFileSync, writeFileSync, copyFileSync, renameSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -47,8 +47,33 @@ const pre = cfg.hooks?.PreToolUse || [];
 // (b) is precisely the "control gone dark" condition this script exists to remediate, and
 // reporting success on it means the remediation tool green-ticks the vulnerability it was
 // written to close. Separate the two before deciding anything.
+// An entry is only a FUNCTIONING control if it actually runs something. A matcher with
+// `hooks: []`, a missing hooks array, or a blank command is a matcher-shaped hole: it matches
+// the tool and then does nothing, and "already current" over one of those is the same false
+// green as reporting success when no matcher exists at all.
+const runs = (e) =>
+  Array.isArray(e.hooks) &&
+  e.hooks.some((h) => h && typeof h.command === "string" && h.command.trim() !== "");
+
 const ctxEntries = pre.filter((e) => STALE.test(e.matcher || ""));
+const hollow = ctxEntries.filter((e) => !runs(e));
 const targets = ctxEntries.filter((e) => e.matcher !== LOOSE);
+
+if (ctxEntries.length > 0 && hollow.length === ctxEntries.length) {
+  console.error(
+    `every context-mode matcher in ${SETTINGS} is present but runs NOTHING ` +
+    `(${hollow.length} entr${hollow.length === 1 ? "y" : "ies"} with no usable hook command).\n` +
+    "That is the control being absent wearing a matcher, not a stale matcher to rewrite.\n" +
+    "Rewriting the matcher string would leave it just as inert, so this stops instead."
+  );
+  process.exit(1);
+}
+if (hollow.length > 0) {
+  console.warn(
+    `NOTE ${hollow.length} context-mode matcher(s) carry no usable hook command and will be ` +
+    "rewritten but remain inert; fix their hooks separately."
+  );
+}
 
 if (ctxEntries.length === 0) {
   console.error(
@@ -71,9 +96,21 @@ for (const e of targets) {
 }
 if (DRY) process.exit(0);
 
-const backup = `${SETTINGS}.bak-wi2096`;
+// The backup name carries a timestamp. A fixed `.bak-wi2096` was overwritten by the next run,
+// so a second invocation destroyed the only copy of the last known-good file — and the
+// documented manual rollback then restored the already-broken state.
+const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+const backup = `${SETTINGS}.bak-wi2096-${stamp}`;
 copyFileSync(SETTINGS, backup);
-writeFileSync(SETTINGS, JSON.stringify(cfg, null, 2) + "\n");
+
+// Write via a temp file in the SAME directory + rename, which is atomic on POSIX.
+// writeFileSync truncates in place: this file is the canonical source the REPL-seat renderer
+// fans out to every seat on a 15-minute cycle, so a crash or a kill mid-write publishes a
+// truncated settings.json fleet-wide — and an interruption after the write but before the
+// canary leaves an unverified change in force with nothing to signal it.
+const tmpPath = `${SETTINGS}.tmp-wi2096-${process.pid}`;
+writeFileSync(tmpPath, JSON.stringify(cfg, null, 2) + "\n");
+renameSync(tmpPath, SETTINGS);
 console.log(`\npatched ${targets.length} matcher(s); backup: ${backup}`);
 
 const rollback = (why) => {

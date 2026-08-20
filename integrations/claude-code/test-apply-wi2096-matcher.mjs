@@ -11,7 +11,7 @@
 //
 // Run: node integrations/claude-code/test-apply-wi2096-matcher.mjs   (exit 0 = pass)
 
-import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -61,6 +61,40 @@ const bashEntry = () => ({ matcher: "Bash", hooks: [{ command: "dcg-wrap" }] });
   // explaining that this state is NOT that. Only the success line starts with them.
   check("absent control is not reported as already-current", !/^already current/m.test(r.out));
   check("absent control says the matcher is missing", /NO context-mode PreToolUse matcher/.test(r.out));
+}
+
+// 1b. A matcher-shaped hole: the entry exists and is already LOOSE, but runs NOTHING. That
+//     used to report "already current" and exit 0, skipping both canaries — the same false
+//     green as an absent control, just wearing a matcher.
+for (const [label, hooks] of [
+  ["empty hooks array", []],
+  ["missing hooks key", undefined],
+  ["blank command", [{ command: "   " }]],
+]) {
+  const entry = { matcher: LOOSE };
+  if (hooks !== undefined) entry.hooks = hooks;
+  const s = settings([bashEntry(), entry]);
+  const r = run(s, sweep(0));
+  check(`hollow matcher (${label}) does not exit 0`, r.status !== 0);
+  check(`hollow matcher (${label}) is not called already-current`, !/^already current/m.test(r.out));
+  check(`hollow matcher (${label}) says it runs nothing`, /runs NOTHING/.test(r.out));
+}
+
+// 1c. A run must not destroy the previous run's backup. A fixed backup name meant the second
+//     invocation overwrote the only copy of the last known-good file, so the documented manual
+//     rollback restored the already-broken state.
+{
+  const s = settings([bashEntry(), staleEntry()]);
+  const r1 = run(s, sweep(0));
+  const m1 = /backup: (\S+)/.exec(r1.out);
+  check("first run names a backup", !!m1);
+  // Make it stale again so a second run also writes.
+  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] } }, null, 2) + "\n");
+  const r2 = run(s, sweep(0));
+  const m2 = /backup: (\S+)/.exec(r2.out);
+  check("second run names a backup", !!m2);
+  check("the two runs use DIFFERENT backup paths", !!m1 && !!m2 && m1[1] !== m2[1]);
+  check("the first run's backup still exists", !!m1 && existsSync(m1[1]));
 }
 
 // 2. Genuinely current: matcher present and already LOOSE.

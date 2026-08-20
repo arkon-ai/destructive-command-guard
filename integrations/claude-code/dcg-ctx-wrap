@@ -133,10 +133,21 @@ def is_hook_decision(obj):
 
 
 def is_ctx_tool(tool):
-    # A real SUFFIX match, as the docstring has always claimed. Substring membership also
-    # classified names like `context-mode__ctx_execute_status` as guarded exec tools, which
-    # then get refused for not matching an exec-tool schema they were never meant to have.
-    return tool.endswith(CTX_TOOL_SUFFIXES)
+    # SUBSTRING membership, deliberately — NOT `tool.endswith(...)`.
+    #
+    # `endswith` was applied once and reverted, because it is a fail-open of exactly the
+    # WI-2096 shape. The settings.json matcher that routes calls here is UNANCHORED, so the
+    # harness sends names like `…__ctx_execute_v2` to this adapter — and under `endswith`
+    # they fall straight through to `allow()` with the scanner never invoked, while the host
+    # still believes the surface is guarded. Measured on all three of `…__ctx_execute_v2`,
+    # `…__ctx_execute2` and `…__ctx_batch_execute_v2`.
+    #
+    # The cost of substring matching is OVER-matching: a name that merely contains a guarded
+    # token gets scanned. That is the intended trade — dcg scans text, so a needless scan
+    # costs nothing, while a missed one is the incident this file exists to prevent. Read the
+    # "suffix" language in the docstring above as "not exact membership", which is the
+    # property that matters; it is not a claim that the match is right-anchored.
+    return any(s in tool for s in CTX_TOOL_SUFFIXES)
 
 
 def collect_strings(value, depth=0):

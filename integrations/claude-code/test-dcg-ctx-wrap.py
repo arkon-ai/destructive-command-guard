@@ -101,11 +101,17 @@ def main():
               out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
         check("empty tool_input never reached dcg", seen is None)
 
-        # 5b. Suffix matching is a SUFFIX match. A name that merely CONTAINS a guarded token
-        #     but carries trailing characters is a different tool and must pass through.
-        out, seen = run(PLUGIN + "ctx_execute_status", {"code": "cat /tmp/probe.env"}, tmp)
-        check("a guarded token with trailing characters is NOT treated as guarded",
-              out.get("continue") is True and seen is None)
+        # 5b. A name carrying a guarded token plus TRAILING characters must still be guarded.
+        #     This pins the reverted `endswith` remedy as forbidden: the settings matcher is
+        #     unanchored, so the harness really does route these here, and right-anchoring the
+        #     check let them through with the scanner never invoked while the host believed the
+        #     surface was covered — the WI-2096 fail-open, reintroduced by its own "fix".
+        for variant in ("ctx_execute_v2", "ctx_execute2", "ctx_batch_execute_v2"):
+            out, seen = run(PLUGIN + variant, {"code": "cat /tmp/probe.env"}, tmp)
+            check(f"{variant}: a decorated guarded name is still guarded",
+                  out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+            check(f"{variant}: its code reached dcg",
+                  seen is not None and "cat /tmp/probe.env" in seen)
 
         # 5c. Depth overflow must DENY, not silently scan the shallow part. The shallow value
         #     here is benign; the dangerous one is buried below the extraction ceiling.
