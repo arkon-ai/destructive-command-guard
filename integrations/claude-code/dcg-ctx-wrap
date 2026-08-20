@@ -25,11 +25,46 @@ the raw source — substrings like `infisical secrets --plain` will match
 whether they appear in `bash` or in a JS `execSync(...)` string. This is
 intentional: defends against the same leak vector in any wrapping language.
 
-If anything in the adapter path errors, we FAIL OPEN with continue:true. The
-adapter must never block real work because of its own bugs; dcg-wrap remains
-the load-bearing safety layer.
+DECISION CONTRACT — which way this adapter fails, and why it changed.
 
-Tracked under: transformate WI-117 SEC-V1 Phase 1.
+The rule is: **once a call is identified as a guarded context-mode tool, it is
+never allowed through on the strength of an adapter or scanner failure.**
+
+  not our surface          -> ALLOW
+    * stdin is not parseable JSON. We cannot identify the tool, so we cannot
+      attribute the call to the guarded set. The harness writes this stdin;
+      malformed input means the harness is broken, not that a caller evaded us.
+    * tool_name is not a context-mode exec tool.
+    * the payload carried strings and every one of them is blank — there is
+      genuinely no code text to scan.
+
+  guarded, but we cannot render a verdict  -> DENY
+    * tool_input is not an object.
+    * the payload carries no string fields at all: an unrecognized shape, which
+      is exactly what a schema rename looks like from in here.
+    * dcg-wrap cannot be invoked, times out, or dies.
+    * dcg-wrap returns no parseable decision, at any exit status.
+    * any unexpected exception after the tool was identified as guarded.
+
+This REPLACES the previous blanket fail-open. That guarantee read "the adapter
+must never block real work because of its own bugs", which is a good principle
+applied to the wrong set: a missing scanner binary is not the adapter's bug, and
+once `is_ctx_tool()` is true this adapter is the ONLY path from the ctx tools
+into dcg — the Bash matcher does not fire for them. So an operational failure of
+the scanner silently reopened precisely the channel that leaked on 2026-05-15.
+Measured, not theorised: `DCG_WRAP_BIN=/nonexistent` previously emitted
+`{"continue": true}` and exit 0.
+
+The field-name keying is gone for the same reason the tool-name keying went in
+transformate WI-2096. Keying on `code` / `commands[].command` had identical drift
+semantics one layer down: rename the field and a guarded tool yields "no code"
+and sails through, with the suite green. Extraction now walks the whole
+tool_input and scans EVERY string it finds, so a renamed field is still read.
+Over-matching is deliberate and is not a defect: dcg scans text, and a path or a
+label that happens to be scanned costs nothing.
+
+Tracked under: transformate WI-117 SEC-V1 Phase 1; fail-closed contract and
+shape-drift extraction under transformate WI-2096.
 """
 
 import json
@@ -51,15 +86,26 @@ CTX_TOOL_SUFFIXES = (
     "context-mode__ctx_batch_execute",
 )
 
-# Fields carrying executable text, per tool. ctx_execute/_execute_file use a
-# single `code`; ctx_batch_execute carries a list of {label, command} objects
-# (older builds also emit a `processing` sibling) and NO top-level code.
-BATCH_CODE_KEYS = ("command", "processing")
+# Guard against a pathologically nested payload turning extraction into a hang.
+# Real ctx payloads are 2-3 levels deep (tool_input -> commands[] -> {command}).
+MAX_DEPTH = 12
 
 
-def fail_open():
+def allow():
     """Emit a continue:true decision so Claude Code proceeds."""
     print(json.dumps({"continue": True}))
+    sys.exit(0)
+
+
+def deny(reason):
+    """Emit a deny decision. Used whenever a GUARDED call cannot be verdicted."""
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "dcg-ctx-wrap: " + reason,
+        }
+    }))
     sys.exit(0)
 
 
@@ -67,53 +113,80 @@ def is_ctx_tool(tool):
     return any(s in tool for s in CTX_TOOL_SUFFIXES)
 
 
-def extract_code(ti):
-    """Concatenate every executable string in the tool input, one per line.
+def collect_strings(value, depth=0):
+    """Every string anywhere in the tool input, in document order.
 
-    dcg scans text, so joining the batch's commands into one document is
-    equivalent to scanning each: any single offending command still matches.
+    Deliberately shape-agnostic: it does NOT key on field names. Keying on
+    `code` / `commands[].command` reproduced the WI-2096 drift one layer down —
+    rename the field and a guarded call extracts nothing and fails open. Walking
+    the structure means a renamed field is still scanned.
+
+    dcg scans text, so joining everything into one document is equivalent to
+    scanning each piece: any single offending fragment still matches.
     """
-    parts = []
-    code = ti.get("code")
-    if isinstance(code, str):
-        parts.append(code)
-    for entry in ti.get("commands") or []:
-        if isinstance(entry, str):
-            parts.append(entry)
-        elif isinstance(entry, dict):
-            for key in BATCH_CODE_KEYS:
-                value = entry.get(key)
-                if isinstance(value, str):
-                    parts.append(value)
-    return "\n".join(p for p in parts if p.strip())
+    if depth > MAX_DEPTH:
+        return []
+    if isinstance(value, str):
+        return [value]
+    out = []
+    if isinstance(value, dict):
+        for item in value.values():
+            out.extend(collect_strings(item, depth + 1))
+    elif isinstance(value, list):
+        for item in value:
+            out.extend(collect_strings(item, depth + 1))
+    return out
 
 
 def main():
+    # Before the tool is identified we cannot attribute the call, so a failure
+    # here is ALLOW. Everything after the is_ctx_tool() gate is DENY-on-failure.
     try:
         raw = sys.stdin.read()
         inp = json.loads(raw)
     except Exception:
-        fail_open()
+        allow()
+    if not isinstance(inp, dict):
+        allow()
 
     tool = inp.get("tool_name") or inp.get("toolName") or ""
-    if not is_ctx_tool(tool):
-        fail_open()
+    if not isinstance(tool, str) or not is_ctx_tool(tool):
+        allow()
 
-    ti = inp.get("tool_input") or inp.get("toolInput") or {}
+    # ---- from here the call is GUARDED: no path out of this function allows it
+    # through because something failed. ----
+    ti = inp.get("tool_input")
+    if ti is None:
+        ti = inp.get("toolInput")
+    if ti is None:
+        ti = {}
     if not isinstance(ti, dict):
-        fail_open()
+        deny("guarded tool %s carried a non-object tool_input (%s)" % (tool, type(ti).__name__))
 
-    code = extract_code(ti)
+    strings = collect_strings(ti)
+    if not strings:
+        # An empty object is a call that runs nothing. A NON-empty payload with
+        # no strings anywhere is a shape this adapter does not understand, which
+        # is what a field rename looks like from in here — refuse it.
+        if not ti:
+            allow()
+        deny(
+            "guarded tool %s carried no string fields — unrecognized payload shape, "
+            "refusing rather than scanning nothing" % tool
+        )
+
+    code = "\n".join(s for s in strings if s.strip())
     if not code:
-        fail_open()
+        # Strings were present and every one was blank: genuinely nothing to scan.
+        allow()
 
-    language = ti.get("language") or ""
+    language = ti.get("language")
     synthetic = {
         "tool_name": "Bash",
         "tool_input": {
             "command": code,
             "_dcg_source_tool": tool,
-            "_dcg_source_language": language,
+            "_dcg_source_language": language if isinstance(language, str) else "",
         },
     }
 
@@ -125,13 +198,50 @@ def main():
             text=True,
             timeout=8,
         )
-    except Exception:
-        fail_open()
+    except Exception as exc:
+        # Missing binary, timeout, permission error. This adapter is the ONLY
+        # path from the ctx tools into dcg, so allowing here reopens the channel.
+        deny("scanner %s could not be run (%s: %s)" % (DCG_WRAP, type(exc).__name__, exc))
 
+    # A decision must actually have been produced. subprocess.run does not raise
+    # on a non-zero child exit, so without this a dcg-wrap crash was forwarded as
+    # whatever it left on stdout — often nothing — and read as "no objection".
+    decision = None
+    if proc.stdout and proc.stdout.strip():
+        try:
+            decision = json.loads(proc.stdout)
+        except ValueError:
+            decision = None
+    if not isinstance(decision, dict):
+        sys.stderr.write(proc.stderr or "")
+        deny(
+            "scanner returned no parseable decision (exit %s, %d bytes on stdout)"
+            % (proc.returncode, len(proc.stdout or ""))
+        )
+
+    # A parseable decision passes through untouched, exit status included: dcg-wrap
+    # signals a block with exit 2 and rewriting that would mask its DENY.
     sys.stdout.write(proc.stdout)
     sys.stderr.write(proc.stderr)
     sys.exit(proc.returncode)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        # Reached only if something above raised outside its own handler. We do
+        # not know whether the call was guarded, but the only calls that get this
+        # far have already passed the is_ctx_tool() gate, so refuse.
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason":
+                    "dcg-ctx-wrap: unhandled %s — refusing a guarded call it could not verdict"
+                    % type(exc).__name__,
+            }
+        }))
+        sys.exit(0)

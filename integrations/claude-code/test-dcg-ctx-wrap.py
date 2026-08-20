@@ -93,7 +93,93 @@ def main():
         out, seen = run("Read", {"file_path": "/etc/hosts"}, tmp)
         check("unrelated tool passes through", out.get("continue") is True and seen is None)
         out, seen = run(PLUGIN + "ctx_execute", {"code": "   "}, tmp)
-        check("empty code passes through", out.get("continue") is True and seen is None)
+        check("blank code passes through", out.get("continue") is True and seen is None)
+        out, seen = run(PLUGIN + "ctx_execute", {}, tmp)
+        check("empty tool_input passes through", out.get("continue") is True and seen is None)
+
+        # ── Fail-CLOSED paths. Without these the suite stays green through exactly the
+        # regressions the fail-open contract used to permit. ──
+
+        # 6. SHAPE DRIFT. The harness renamed the tools once already (WI-2096); the next
+        #    rename may be of the FIELD. A guarded call whose code sits under an unknown
+        #    key must still be scanned, not silently extracted to nothing.
+        out, seen = run(PLUGIN + "ctx_execute", {"script": "cat /tmp/probe.env"}, tmp)
+        check("renamed code field is still scanned",
+              seen is not None and "cat /tmp/probe.env" in seen)
+        check("renamed code field is guarded",
+              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+
+        # 7. A guarded payload with NO strings anywhere is a shape we do not understand.
+        out, seen = run(PLUGIN + "ctx_execute", {"timeout": 30}, tmp)
+        check("guarded call with no string fields is denied",
+              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+        check("guarded call with no string fields never reached dcg", seen is None)
+
+        # 8. A guarded call with a non-object tool_input is denied.
+        out, _ = run(PLUGIN + "ctx_execute", ["cat /tmp/probe.env"], tmp)
+        check("guarded call with non-object tool_input is denied",
+              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+
+        # 9. SCANNER UNAVAILABLE. This is the one that mattered most: dcg-ctx-wrap is the
+        #    only path from the ctx tools into dcg, so allowing here reopens the 2026-05-15
+        #    channel. Probed live in adjudication: this used to emit continue:true, exit 0.
+        env = dict(os.environ, DCG_WRAP_BIN=os.path.join(tmp, "does-not-exist"))
+        proc = subprocess.run(
+            [sys.executable, WRAP],
+            input=json.dumps({"tool_name": PLUGIN + "ctx_execute",
+                              "tool_input": {"code": "cat /tmp/probe.env"}}),
+            capture_output=True, text=True, env=env, timeout=20,
+        )
+        out = json.loads(proc.stdout)
+        check("missing scanner binary DENIES (does not fail open)",
+              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+
+        # 10. SCANNER PRODUCES NO DECISION. subprocess.run does not raise on a non-zero
+        #     child exit, so a crash used to be forwarded as whatever was on stdout.
+        for label, body, mode in (
+            ("crashes with empty stdout", "import sys; sys.exit(3)", 0o755),
+            ("exits 0 with unparseable stdout", "print('not json')", 0o755),
+            ("exits non-zero with unparseable stdout",
+             "import sys; print('boom'); sys.exit(1)", 0o755),
+        ):
+            broken = os.path.join(tmp, "broken")
+            with open(broken, "w") as fh:
+                fh.write("#!/usr/bin/env python3\n" + body + "\n")
+            os.chmod(broken, mode)
+            proc = subprocess.run(
+                [sys.executable, WRAP],
+                input=json.dumps({"tool_name": PLUGIN + "ctx_execute",
+                                  "tool_input": {"code": "cat /tmp/probe.env"}}),
+                capture_output=True, text=True,
+                env=dict(os.environ, DCG_WRAP_BIN=broken), timeout=20,
+            )
+            try:
+                out = json.loads(proc.stdout)
+            except ValueError:
+                out = {}
+            check(f"scanner that {label} DENIES",
+                  out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+
+        # 11. A parseable decision passes through with its exit status intact — dcg-wrap
+        #     signals a block with exit 2 and rewriting that would mask its DENY.
+        deny2 = os.path.join(tmp, "deny2")
+        with open(deny2, "w") as fh:
+            fh.write("#!/usr/bin/env python3\n"
+                     "import json,sys\n"
+                     "print(json.dumps({'hookSpecificOutput':{'permissionDecision':'deny'}}))\n"
+                     "sys.exit(2)\n")
+        os.chmod(deny2, 0o755)
+        proc = subprocess.run(
+            [sys.executable, WRAP],
+            input=json.dumps({"tool_name": PLUGIN + "ctx_execute",
+                              "tool_input": {"code": "cat /tmp/probe.env"}}),
+            capture_output=True, text=True,
+            env=dict(os.environ, DCG_WRAP_BIN=deny2), timeout=20,
+        )
+        check("exit-2 deny is passed through unchanged", proc.returncode == 2)
+        check("exit-2 deny keeps its decision",
+              json.loads(proc.stdout).get(
+                  "hookSpecificOutput", {}).get("permissionDecision") == "deny")
 
     if failures:
         for f in failures:

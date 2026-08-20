@@ -97,12 +97,39 @@ processes register hooks via `options.hooks` and must spawn `dcg-ctx-wrap`
 themselves — see `codesmith-bridge.mjs` for an example pattern (`dcgHook(bin, input)`
 spawns the binary, pipes the hook JSON on stdin, parses stdout JSON).
 
-### Fail-open guarantee
+### Decision contract — which way the adapter fails
 
-Any error in the adapter path (unparseable stdin, missing `dcg-wrap` binary,
-subprocess crash) returns `{"continue": true}` so the host call proceeds.
-The adapter must never block real work because of its own bugs — `dcg-wrap`
-itself remains the load-bearing safety layer.
+**Once a call is identified as a guarded context-mode tool, it is never allowed
+through because something failed.**
+
+| situation | decision |
+|---|---|
+| stdin is not parseable JSON | ALLOW — the tool cannot be identified, so the call cannot be attributed to the guarded set. The harness writes this stdin; malformed input means the harness is broken. |
+| `tool_name` is not a context-mode exec tool | ALLOW — not this adapter's surface. |
+| payload carried strings and all of them are blank | ALLOW — there is genuinely no code text to scan. |
+| `tool_input` is not an object | DENY |
+| payload carries no string fields at all | DENY — an unrecognized shape, which is what a schema rename looks like from inside the adapter. |
+| `dcg-wrap` cannot be invoked, times out, or dies | DENY |
+| `dcg-wrap` returns no parseable decision, at any exit status | DENY |
+| any unexpected exception after the tool was identified as guarded | DENY |
+
+A parseable decision from `dcg-wrap` is passed through untouched, exit status
+included — it signals a block with exit 2, and rewriting that would mask its DENY.
+
+**This replaces the previous blanket fail-open guarantee**, which read "the adapter
+must never block real work because of its own bugs". That is a sound principle
+applied to the wrong set. A missing scanner binary is not the adapter's own bug,
+and once the tool is identified as guarded this adapter is the *only* path from
+the ctx tools into dcg — the `Bash` matcher does not fire for them. So an
+operational failure of the scanner silently reopened exactly the channel that
+leaked on 2026-05-15. Measured, not argued: `DCG_WRAP_BIN=/nonexistent` used to
+emit `{"continue": true}` and exit 0.
+
+Extraction is also shape-agnostic rather than field-keyed: it walks the whole
+`tool_input` and scans every string it finds. Keying on `code` and
+`commands[].command` had the same drift semantics one layer down as the
+tool-name keying fixed in transformate WI-2096 — rename the field and a guarded
+call extracts nothing and sails through, with the test suite still green.
 
 ### Incident provenance
 
