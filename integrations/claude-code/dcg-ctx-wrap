@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+dcg-ctx-wrap — Claude Code PreToolUse adapter for context-mode ctx_execute.
+
+context-mode's ctx_execute tool runs arbitrary shell/python/js/etc code in a
+sandbox. The DCG hook is wired only for Bash, so ctx_execute became a wide-open
+emission channel and let `infisical secrets --plain` through on 2026-05-15.
+
+This adapter:
+1. Reads Claude Code hook JSON from stdin.
+2. If tool_name is a context-mode exec tool (SUFFIX match — see CTX_TOOL_SUFFIXES),
+   extracts every code-bearing field and rewrites the payload as a synthetic Bash
+   call so dcg's existing pattern packs run against the code text verbatim.
+3. Pipes the rewritten payload to dcg-wrap, which runs dcg + Discord alerting.
+4. Emits dcg-wrap's decision back to Claude Code unchanged.
+
+Tool-name matching is a SUFFIX match, not exact membership (transformate WI-2096):
+the harness renamed the tools from `mcp__context-mode__ctx_execute` to
+`mcp__plugin_context-mode_context-mode__ctx_execute`, and the exact-membership
+set silently fell through to fail_open() — a live guardrail bypass for months.
+A suffix match survives the next prefix change instead of failing open.
+
+For non-shell languages (javascript/python/etc), dcg's regex patterns scan
+the raw source — substrings like `infisical secrets --plain` will match
+whether they appear in `bash` or in a JS `execSync(...)` string. This is
+intentional: defends against the same leak vector in any wrapping language.
+
+If anything in the adapter path errors, we FAIL OPEN with continue:true. The
+adapter must never block real work because of its own bugs; dcg-wrap remains
+the load-bearing safety layer.
+
+Tracked under: transformate WI-117 SEC-V1 Phase 1.
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+DCG_WRAP = os.environ.get(
+    "DCG_WRAP_BIN",
+    os.path.join(os.path.expanduser("~"), ".local/bin/dcg-wrap"),
+)
+# Suffix match: covers the legacy `mcp__context-mode__*` names AND the live
+# plugin-prefixed `mcp__plugin_context-mode_context-mode__*` names, and any
+# future prefix. ctx_execute is a prefix of ctx_execute_file, so both are hit
+# by the first entry — listed separately for grep-ability.
+CTX_TOOL_SUFFIXES = (
+    "context-mode__ctx_execute",
+    "context-mode__ctx_execute_file",
+    "context-mode__ctx_batch_execute",
+)
+
+# Fields carrying executable text, per tool. ctx_execute/_execute_file use a
+# single `code`; ctx_batch_execute carries a list of {label, command} objects
+# (older builds also emit a `processing` sibling) and NO top-level code.
+BATCH_CODE_KEYS = ("command", "processing")
+
+
+def fail_open():
+    """Emit a continue:true decision so Claude Code proceeds."""
+    print(json.dumps({"continue": True}))
+    sys.exit(0)
+
+
+def is_ctx_tool(tool):
+    return any(s in tool for s in CTX_TOOL_SUFFIXES)
+
+
+def extract_code(ti):
+    """Concatenate every executable string in the tool input, one per line.
+
+    dcg scans text, so joining the batch's commands into one document is
+    equivalent to scanning each: any single offending command still matches.
+    """
+    parts = []
+    code = ti.get("code")
+    if isinstance(code, str):
+        parts.append(code)
+    for entry in ti.get("commands") or []:
+        if isinstance(entry, str):
+            parts.append(entry)
+        elif isinstance(entry, dict):
+            for key in BATCH_CODE_KEYS:
+                value = entry.get(key)
+                if isinstance(value, str):
+                    parts.append(value)
+    return "\n".join(p for p in parts if p.strip())
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+        inp = json.loads(raw)
+    except Exception:
+        fail_open()
+
+    tool = inp.get("tool_name") or inp.get("toolName") or ""
+    if not is_ctx_tool(tool):
+        fail_open()
+
+    ti = inp.get("tool_input") or inp.get("toolInput") or {}
+    if not isinstance(ti, dict):
+        fail_open()
+
+    code = extract_code(ti)
+    if not code:
+        fail_open()
+
+    language = ti.get("language") or ""
+    synthetic = {
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": code,
+            "_dcg_source_tool": tool,
+            "_dcg_source_language": language,
+        },
+    }
+
+    try:
+        proc = subprocess.run(
+            [DCG_WRAP],
+            input=json.dumps(synthetic),
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        fail_open()
+
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    sys.exit(proc.returncode)
+
+
+if __name__ == "__main__":
+    main()
