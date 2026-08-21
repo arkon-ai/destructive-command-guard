@@ -22,6 +22,7 @@ import {
   statSync, chmodSync, chownSync, constants,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -79,8 +80,10 @@ const isExecCtxEntry = (e) => {
 // Uncaught, a missing file / permission error / malformed JSON threw a bare Node stack
 // trace before any of this script's structured messages could run.
 let cfg;
+let srcBytes;
 try {
-  cfg = JSON.parse(readFileSync(SETTINGS, "utf8"));
+  srcBytes = readFileSync(SETTINGS, "utf8");
+  cfg = JSON.parse(srcBytes);
 } catch (err) {
   console.error(`cannot read or parse ${SETTINGS}: ${err.message}`);
   process.exit(1);
@@ -537,6 +540,32 @@ try {
 } catch (err) {
   abort(`refusing to publish — could not take a backup at ${backup} (${err.message})`);
 }
+// ABORT IF THE SOURCE MOVED UNDER US. The candidate was built from the bytes read at the top
+// of this run, and the canaries can take minutes; anything written to settings.json in that
+// window is destroyed by the rename below, silently. Measured in an earlier round: an operator
+// `env` block AND A SECOND `Bash` GUARD ENTRY vanished that way. That is not a lost edit, it is
+// one security control quietly deleting another, and this turns it into a loud refusal.
+//
+// Deliberately placed AFTER the backup and immediately BEFORE the rename, so the window it
+// closes is the real one — checking earlier would leave exactly the gap it exists to close,
+// which is the "checked a different object" shape this whole file has been repairing.
+// A guard, not a reconciliation: it never merges, it only refuses.
+const sha256 = (s) => createHash("sha256").update(s).digest("hex");
+let nowBytes;
+try {
+  nowBytes = readFileSync(SETTINGS, "utf8");
+} catch (err) {
+  abort(`refusing to publish — ${SETTINGS} could not be re-read before the rename (${err.message})`);
+}
+if (sha256(nowBytes) !== sha256(srcBytes)) {
+  abort(
+    `refusing to publish — ${SETTINGS} CHANGED while the canaries ran.\n` +
+    "The candidate was built from the earlier bytes, so publishing it would silently discard\n" +
+    "whatever was written in between — which has previously included another guard's entry.\n" +
+    `A backup of the current file is at ${backup}. Re-run to pick up the new contents.`
+  );
+}
+
 renameSync(tmpPath, SETTINGS);
 tmpLive = false;  // published, not orphaned — the exit hook must not chase the old path
 console.log(

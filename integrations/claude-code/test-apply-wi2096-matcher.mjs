@@ -431,6 +431,33 @@ if (process.platform !== "win32") {
   check("unrunnable sweep left the file untouched", readFileSync(s, "utf8") === before);
 }
 
+// 5a2. A WRITE THAT LANDS DURING THE CANARY WINDOW MUST NOT BE SILENTLY DISCARDED.
+//      The candidate is built from the bytes read at startup and the canaries can take minutes.
+//      Anything written to settings.json in between used to be destroyed by the rename without
+//      a word — and the measured case was not a cosmetic edit: an operator `env` block AND A
+//      SECOND `Bash` GUARD ENTRY disappeared. One control silently deleting another.
+//      The sweep stub is the timing hook: it runs as a child DURING the canary window, after
+//      the candidate exists and before the rename.
+{
+  const dir = mkdtempSync(path.join(tmp, "moved-"));
+  const s = path.join(dir, "settings.json");
+  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] } }, null, 2) + "\n");
+  const writer = path.join(tmp, `sweep-writer-${Math.random().toString(36).slice(2)}.mjs`);
+  writeFileSync(writer,
+    'import { readFileSync, writeFileSync } from "node:fs";\n' +
+    `const real = ${JSON.stringify(s)};\n` +
+    'const cfg = JSON.parse(readFileSync(real, "utf8"));\n' +
+    'cfg.hooks.PreToolUse.push({ matcher: "OtherGuard", hooks: [{ type: "command", command: "/usr/local/bin/second-guard" }] });\n' +
+    'writeFileSync(real, JSON.stringify(cfg, null, 2) + "\\n");\n' +
+    'console.log("writer sweep");\nprocess.exit(0);\n');
+  const r = run(s, writer);
+  const after = JSON.parse(readFileSync(s, "utf8"));
+  const survived = after.hooks.PreToolUse.some((e) => e.matcher === "OtherGuard");
+  check("a second guard written during the canaries is NOT silently discarded", survived);
+  check("a mid-run change to settings.json refuses to publish", r.status !== 0);
+  check("a mid-run change says the file changed", /CHANGED while the canaries ran/.test(r.out));
+}
+
 // 5b. The published file must keep the original's permissions. rename() replaces the inode,
 //     so without an explicit chmod the temp file's umask-derived mode (0644 under a typical
 //     022) is what goes live — and settings.json can carry an env block with tokens, so a
@@ -474,6 +501,50 @@ if (process.platform !== "win32") {
   }
   check("LOOSE does not match an unrelated tool", !re.test("Bash"));
   check("LOOSE does not match a non-exec ctx tool", !re.test("mcp__plugin_context-mode_context-mode__ctx_search"));
+}
+
+// 7b. THE FOUNDING DEFECT HAS NO CONTROL WITHOUT THIS, and that is the whole point of it.
+//
+//     Test 7 above checks THIS FILE'S OWN COPY of LOOSE, so narrowing the applier's constant
+//     leaves it green. Canary 1 draws its acceptance set from LIVE_CTX_TOOLS, whose four names
+//     all end exactly at `ctx_execute` / `ctx_batch_execute`. So right-anchoring LOOSE keeps
+//     every one of those nine assertions true — measured — while `…__ctx_execute_v2` goes
+//     FALSE. That re-opens the original transformate WI-2096 bypass: if the MATCHER stops
+//     selecting a name, the wrapper is never invoked at all, and the wrapper suite's own
+//     decorated-name coverage cannot save it. This is not hypothetical on this artifact — the
+//     previous round's one regression was a re-applied `endswith` narrowing of exactly this
+//     kind.
+//
+//     So this reads the matcher the applier ACTUALLY PUBLISHED — its real constant, not a
+//     duplicate — and tests it against DECORATED names, which is the axis nothing else covers.
+//     Test-only: it changes no production behaviour and can only detect a future change to it.
+{
+  const s = settings([bashEntry(), staleEntry()]);
+  const r = run(s, sweep(0));
+  check("published-matcher control: the run succeeded", r.status === 0);
+  const after = JSON.parse(readFileSync(s, "utf8"));
+  const ours = after.hooks.PreToolUse.find(
+    (e) => (e.hooks || []).some((h) => h.command === SCANNER));
+  const published = (ours && ours.matcher) || "";
+  check("the applier published a matcher to test", published !== "");
+  const pre = new RegExp(published);
+  for (const t of [
+    // Undecorated — these stay true even under the narrowing, and are here so a failure
+    // distinguishes "narrowed" from "broken outright".
+    "mcp__plugin_context-mode_context-mode__ctx_execute",
+    "mcp__context-mode__ctx_execute",
+    // DECORATED — the axis the narrowing kills and nothing else pins. The wrapper suite
+    // guards these names, which is worthless if the matcher never routes them here.
+    "mcp__plugin_context-mode_context-mode__ctx_execute_v2",
+    "mcp__plugin_context-mode_context-mode__ctx_execute2",
+    "mcp__plugin_context-mode_context-mode__ctx_batch_execute_v2",
+    "mcp__someFuturePrefix__context-mode__ctx_batch_execute",
+  ]) {
+    check(`the PUBLISHED matcher selects ${t}`, pre.test(t));
+  }
+  check("the PUBLISHED matcher still refuses Bash", !pre.test("Bash"));
+  check("the PUBLISHED matcher still refuses ctx_search",
+    !pre.test("mcp__plugin_context-mode_context-mode__ctx_search"));
 }
 
 rmSync(tmp, { recursive: true, force: true });
