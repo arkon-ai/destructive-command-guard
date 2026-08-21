@@ -511,6 +511,22 @@ const canarySweep = (settingsPath, fail) => {
   console.log("canary 2: coverage sweep green");
 };
 
+// R16 applies to a REFUSAL as much as to a success line: it is an operator-facing claim, and
+// one that does not say how to fix it is a mystery outage. This canary DELIBERATELY runs on a
+// launcher-shaped environment rather than the operator's, so the commonest TRUE refusal here is
+// "the interpreter is on your PATH but not on the harness's" — the command works when you type
+// it and fails here, which looks like a bug in this tool unless the message says otherwise.
+// The remedy is one line of config, and it is the SAME block the harness reads, so naming it
+// keeps the canary and the hook the same object rather than sending the operator somewhere else.
+const ENV_REMEDY =
+  "\n\nIf that command works when you run it by hand, that difference IS the finding, not a bug\n" +
+  "in this check. The canaries run on a launcher-shaped environment —\n" +
+  `  PATH=${PATH_FLOOR}\n` +
+  "— because that is what a desktop entry, a systemd unit or cron actually hands a hook, and\n" +
+  "your shell's PATH is not available there. If the hook genuinely needs more than that, declare\n" +
+  'it in the "env" block of the settings file (for example "PATH"), which the harness delivers to\n' +
+  "every hook it spawns and which these canaries honour — so both end up reading the same thing.";
+
 // 3. Prove the SCANNER produced the denial, not the adapter.
 //
 //    Since the adapter went fail-closed, a missing, unexecutable, hung or crashed dcg-wrap
@@ -553,7 +569,7 @@ const canaryScanner = (settingsPath, fail) => {
     fail(
       `CANARY FAILED — cannot run the hook command (${r.error.message}):\n  ${LIVE_COMMAND}\n` +
       "That is the command string read out of the settings file, run the way the harness runs\n" +
-      "it — so the control this file describes does not work on this host."
+      "it — so the control this file describes does not work on this host." + ENV_REMEDY
     );
   }
   // A denial the host would discard is not a denial. The host treats 2 as blocking and every
@@ -565,7 +581,7 @@ const canaryScanner = (settingsPath, fail) => {
     fail(
       `CANARY FAILED — the hook command exited ${r.status === null ? `on ${r.signal}` : r.status},\n` +
       "which the host reads as NON-blocking: the tool would proceed despite the denial.\n" +
-      "Only 0 and 2 are honoured."
+      `Only 0 and 2 are honoured.\n  ${LIVE_COMMAND}` + ENV_REMEDY
     );
   }
   let out;
@@ -575,7 +591,8 @@ const canaryScanner = (settingsPath, fail) => {
     fail(
       "CANARY FAILED — no decision ARRIVED for a known-dangerous fixture. The hook command\n" +
       `produced ${r.stdout ? "unparseable output" : "NOTHING ON STDOUT"}:\n  ${LIVE_COMMAND}\n` +
-      "The wrapper may well be denying; what matters is that the harness never receives it."
+      "The wrapper may well be denying; what matters is that the harness never receives it." +
+      ENV_REMEDY
     );
   }
   const hso = (out && out.hookSpecificOutput) || {};

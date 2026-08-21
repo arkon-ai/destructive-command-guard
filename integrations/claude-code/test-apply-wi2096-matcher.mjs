@@ -951,6 +951,15 @@ if (process.platform !== "win32") {
   check("T4d: it fails as a command the harness could not run, not as a false green",
     /CANARY FAILED/.test(outD));
   check("T4d: and settings.json was left untouched", /was NOT modified/.test(outD));
+
+  // R16 ON THE REFUSAL. The false-refusal direction is chosen deliberately, so a refusal that
+  // does not say how to fix it is a mystery outage for an operator who has not read our notes:
+  // the command works when they type it and fails here, which reads as a bug in this tool.
+  check("T4d: the refusal explains that the canary uses a launcher-shaped environment",
+    /launcher-shaped environment/.test(outD));
+  check("T4d: the refusal names the supported remedy — the settings env block",
+    /"env" block of the settings file/.test(outD));
+  check("T4d: the refusal shows the PATH it actually ran with", /PATH=/.test(outD));
 }
 
 rmSync(tmp, { recursive: true, force: true });
