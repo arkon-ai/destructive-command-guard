@@ -224,7 +224,9 @@ contract without ever engaging it. See "Identification fails closed too".
 | payload carries no string fields at all | DENY — an unrecognized shape, which is what a schema rename looks like from inside the adapter. |
 | payload nests deeper than `MAX_DEPTH` | DENY — scanning only the shallow part would report a verdict on a fraction of the payload. |
 | `dcg-wrap` cannot be invoked, times out, or dies | DENY |
-| `dcg-wrap` returns no parseable decision, at any exit status | DENY |
+| `dcg-wrap` exits 0 and says NOTHING | ALLOW — silence IS dcg's allow. **This is the one remaining fail-open in this control:** a stub, a `true`, or a wrapper whose exec failed silently is indistinguishable on the wire from a clean scan. It is closed at install time instead — `apply-wi2096-matcher.mjs` canary 3 sends a known-dangerous fixture and requires the DENY to have come from the scanner rather than from this adapter. |
+| `dcg-wrap` exits NON-ZERO and says nothing | DENY — a clean scan and a crash are not the same thing. |
+| `dcg-wrap` writes output that is not a recognisable decision, at any exit status | DENY |
 | any unexpected exception after the tool was identified as guarded | DENY |
 
 A parseable decision from `dcg-wrap` is passed through untouched, exit status

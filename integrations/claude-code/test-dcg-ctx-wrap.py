@@ -44,7 +44,7 @@ def run(tool_name, tool_input, tmp):
     seen = open(record).read() if os.path.exists(record) else None
     if os.path.exists(record):
         os.remove(record)
-    return json.loads(proc.stdout), seen
+    return _with_exit(json.loads(proc.stdout), proc.returncode), seen
 
 
 def run_raw(raw, tmp):
@@ -64,9 +64,9 @@ def run_raw(raw, tmp):
     if os.path.exists(record):
         os.remove(record)
     try:
-        return json.loads(proc.stdout), seen
+        return _with_exit(json.loads(proc.stdout), proc.returncode), seen
     except ValueError:
-        return {}, seen
+        return _with_exit({}, proc.returncode), seen
 
 
 def run_raw_bytes(raw_bytes, tmp, extra_env=None):
@@ -87,9 +87,10 @@ def run_raw_bytes(raw_bytes, tmp, extra_env=None):
     if os.path.exists(record):
         os.remove(record)
     try:
-        return json.loads(proc.stdout.decode("utf-8", "replace")), seen
+        return _with_exit(json.loads(proc.stdout.decode("utf-8", "replace")),
+                          proc.returncode), seen
     except ValueError:
-        return {}, seen
+        return _with_exit({}, proc.returncode), seen
 
 
 def seen_command(seen):
@@ -112,8 +113,38 @@ def seen_command(seen):
     return ti.get("command", "") if isinstance(ti, dict) else ""
 
 
+def _with_exit(out, code):
+    """Carry the process EXIT STATUS on the parsed decision.
+
+    The host acts on the status as well as the document: it honours 2 as a blocking error,
+    and treats every OTHER non-zero as non-blocking and runs the guarded call anyway. Every
+    assertion in this file used to read the document alone, so two one-line mutations of the
+    adapter left the suite at 0 FAILs: deny() exiting 3 (the denial is printed and the call
+    proceeds, reopening the 2026-05-15 channel) and allow() exiting 2 (every BENIGN guarded
+    call is blocked and all three ctx tools go offline, which test 12's own header records
+    as having already happened once). Carried on a private key so no call site has to thread
+    an extra tuple element.
+    """
+    if isinstance(out, dict):
+        out["__exit"] = code
+    return out
+
+
+# The adapter exits 0 for both allow() and deny(), and normalises a pass-through to 2 only
+# when the scanner itself exited 2. {0, 2} is the whole legal set, and it is the same set
+# the applier's canary 3 refuses to certify outside of.
+HOST_HONOURED_EXITS = (0, 2)
+
+
 def denied(out):
-    return out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+    # A denial the host DISCARDS is not a denial.
+    return (out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+            and out.get("__exit") in HOST_HONOURED_EXITS)
+
+
+def allowed(out):
+    # Not symmetric decoration: an allow delivered on exit 2 blocks the call it just allowed.
+    return out.get("continue") is True and out.get("__exit") == 0
 
 
 def main():
@@ -162,9 +193,9 @@ def main():
 
         # 5. Unrelated tools and empty payloads pass through untouched.
         out, seen = run("Read", {"file_path": "/etc/hosts"}, tmp)
-        check("unrelated tool passes through", out.get("continue") is True and seen is None)
+        check("unrelated tool passes through", allowed(out) and seen is None)
         out, seen = run(PLUGIN + "ctx_execute", {"code": "   "}, tmp)
-        check("blank code passes through", out.get("continue") is True and seen is None)
+        check("blank code passes through", allowed(out) and seen is None)
         # An EMPTY payload on a guarded tool is a truncated or malformed invocation, not a
         # deliberate no-op, and the README decision table denies it. It used to be allowed.
         out, seen = run(PLUGIN + "ctx_execute", {}, tmp)
@@ -292,7 +323,7 @@ def main():
                 # unattributable and MUST still allow — the pin that the refusal keys on
                 # evidence, not merely on tool_name being the wrong type.
                 check("non-string tool_name with no guarded token in stdin still allows",
-                      out.get("continue") is True and seen is None)
+                      allowed(out) and seen is None)
             else:
                 check(f"tool_name as a {label} is denied, not allowed", denied(out))
                 check(f"tool_name as a {label} never reached dcg", seen is None)
@@ -322,11 +353,11 @@ def main():
         out, seen = run_raw('{"tool_name": "Read", "tool_input": {"file_path": "/etc/hosts"',
                             tmp)
         check("unparseable stdin naming NO guarded tool still allows",
-              out.get("continue") is True and seen is None)
+              allowed(out) and seen is None)
         out, seen = run_raw('{"tool_name": "Read", "tool_input": {"pad": '
                             + "[" * 200000 + "]" * 200000 + "}}", tmp)
         check("an over-deep NON-ctx payload still allows",
-              out.get("continue") is True and seen is None)
+              allowed(out) and seen is None)
         # The decisive false-positive pin: identification SUCCEEDS here (it is Bash), so
         # the raw-bytes check must never be consulted. If it were an override rather than a
         # tie-breaker, every Bash call discussing these tools would be blocked.
@@ -334,7 +365,7 @@ def main():
             {"tool_name": "Bash",
              "tool_input": {"command": "echo " + PLUGIN + "ctx_execute"}}), tmp)
         check("a Bash call whose TEXT names a ctx tool is still allowed",
-              out.get("continue") is True and seen is None)
+              allowed(out) and seen is None)
 
         # ── Fail-CLOSED paths. Without these the suite stays green through exactly the
         # regressions the fail-open contract used to permit. ──
@@ -442,13 +473,13 @@ def main():
                 capture_output=True, text=True,
                 env=dict(os.environ, DCG_WRAP_BIN=binp), timeout=60)
             try:
-                return json.loads(proc.stdout), proc.returncode
+                return _with_exit(json.loads(proc.stdout), proc.returncode), proc.returncode
             except ValueError:
-                return {}, proc.returncode
+                return _with_exit({}, proc.returncode), proc.returncode
 
         out, _ = with_scanner("import sys; sys.exit(0)")
         check("a scanner that exits 0 saying NOTHING is an ALLOW (this is dcg's allow)",
-              out.get("continue") is True)
+              allowed(out))
 
         out, _ = with_scanner("import sys; sys.exit(3)")
         check("a scanner that exits NON-ZERO saying nothing is a DENY, not an allow",
@@ -521,7 +552,7 @@ def main():
         # An empty read SUCCEEDS and returns b"" — only a read that RAISES is refused.
         out, _ = run_raw_bytes(b"", tmp)
         check("empty stdin still allows (the legitimate cannot-attribute path survives)",
-              out.get("continue") is True)
+              allowed(out))
 
         # ── `tool_name: null` must not launder a guarded call through `toolName` ───────
         #
@@ -556,7 +587,7 @@ def main():
             "tool_input": {"command": "ls -la"},
         }), tmp)
         check("a null tool_name naming nothing guarded is still allowed",
-              out.get("continue") is True)
+              allowed(out))
 
         # ── T4 (R7) is DEFERRED, and this pins WHY, so the next seat does not "fix" it ──
         #

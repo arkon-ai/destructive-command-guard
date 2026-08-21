@@ -30,7 +30,24 @@ const HOME = homedir();
 const SETTINGS = process.env.HOOK_SETTINGS || path.join(HOME, ".claude/settings.json");
 const SWEEP = process.env.HOOK_SWEEP || path.join(HOME, "dev/warden-memory/scripts/audit-hook-matchers.mjs");
 const WRAPPER = process.env.CTX_WRAP || path.join(HOME, ".local/bin/dcg-ctx-wrap");
-const DRY = process.argv.includes("--dry-run");
+const ARGV = process.argv.slice(2);
+const DRY = ARGV.includes("--dry-run");
+{
+  // Boundary validation on the highest-consequence path in the tool, and it runs before
+  // anything is read or written. `--dry-rnu` and `--dry-run=true` both missed
+  // `includes("--dry-run")`, printed the same rewrite plan a preview prints, and then
+  // PUBLISHED the canonical settings file at rc=0 (S-2). A single-character typo in the
+  // documented preview flag must not silently become a publish.
+  const unknown = ARGV.filter((a) => a !== "--dry-run");
+  if (unknown.length) {
+    console.error(
+      `REFUSING TO CERTIFY — unknown argument(s): ${unknown.join(" ")}.
+` +
+      "--dry-run is the only accepted argument, exact spelling, no =value. " +
+      SETTINGS + " was NOT modified.");
+    process.exit(1);
+  }
+}
 
 // The sweep spawns hooks, so it can hang. Unbounded, a hung sweep used to leave a patched
 // but unverified settings.json live while this process waited forever.
@@ -173,7 +190,13 @@ const runs = (e) => Array.isArray(e.hooks) && e.hooks.some(isCommandHook);
 // overlay is two inodes for one command. So `~/` is accepted only when HOME (or USERPROFILE)
 // is a key in this document's env block — the same establishment rule as PATH — and identity
 // uses that declared value. Otherwise the token is refused: use an absolute path.
-const SHELL_LITERAL = /^[A-Za-z0-9_@%+=:,.\/-]+$/;
+// `%` is NOT in this class. canaryScanner spawns with `shell: true`, which on win32 is
+// `cmd.exe /d /s /c`, and cmd.exe expands `%NAME%` at delivery. G-2 measured
+// `C:/%PWNVAR%/dcg-ctx-wrap` passing the basename and absolute-path gates as a literal
+// token and then executing an injected command. That is the same "metacharacter in an
+// interior path segment" shape this whitelist was introduced to close for `$()`, `|`
+// and redirects — reproduced for the other shell this same canary uses.
+const SHELL_LITERAL = /^[A-Za-z0-9_@+=:,.\/-]+$/;
 const declaredHome = () => {
   const block = cfg && cfg.env;
   if (!block || typeof block !== "object" || Array.isArray(block)) return "";
@@ -520,6 +543,35 @@ const refuseSubstituted = (keys) =>
   "them and call the result the same object. Remove them from the env block, then re-run.\n" +
   SETTINGS + " was NOT modified.";
 
+// PATH and PYTHONPATH are delimiter-separated lists; PYTHONHOME and PYTHONSTARTUP are single
+// values. An EMPTY whole value stays legal — that is what the contract means by "empty string
+// counts", it declares nothing and still dominates ambient. An empty or relative COMPONENT
+// inside a non-empty value does not: it resolves against the CURRENT DIRECTORY, and the canary
+// runs in the operator's cwd while the harness runs PreToolUse from the session directory. The
+// two then agree as strings and resolve to different files, which is exactly the divergence
+// these four names exist to close. G-3 measured `PATH=/usr/bin:/bin:` — one trailing empty
+// component — publishing green.
+const LIST_PINS = new Set(["PATH", "PYTHONPATH"]);
+const pinComponents = (k, v) => (LIST_PINS.has(k) ? v.split(path.delimiter) : [v]);
+const relativePins = (declared) =>
+  HOOK_ENV_PINS.filter((k) => {
+    const v = String(declared[k] ?? "");
+    if (v === "") return false;
+    return pinComponents(k, v).some((c) => c === "" || !path.isAbsolute(c));
+  });
+
+const refuseRelativePins = (keys, declared) =>
+  `REFUSING TO CERTIFY — ${SETTINGS} env block declares an empty or relative component in ${keys.join(", ")}.
+Every component of these four names must be an absolute path. A relative component resolves
+against the current directory: this canary runs in the operator's cwd and the harness runs
+PreToolUse from the session directory, so the two agree as strings and then read different
+files — the divergence these pins exist to close. A trailing or doubled delimiter is an empty
+component and means the current directory too. An empty VALUE is still legal and still
+dominates ambient.
+Declared:
+${pinLines(declared, [])}
+${SETTINGS} was NOT modified.`;
+
 const refuseIfEnvUnusable = (settingsPath, fail) => {
   const declared = configEnv(settingsPath, fail);
   declaredEnv = declared;
@@ -527,6 +579,8 @@ const refuseIfEnvUnusable = (settingsPath, fail) => {
   if (missing.length) fail(refuseUnestablished(settingsPath, missing));
   const substituted = substitutedKeys(declared);
   if (substituted.length) fail(refuseSubstituted(substituted));
+  const relative = relativePins(declared);
+  if (relative.length) fail(refuseRelativePins(relative, declared));
   return declared;
 };
 

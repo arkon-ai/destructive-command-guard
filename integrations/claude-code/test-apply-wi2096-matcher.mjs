@@ -58,6 +58,15 @@ function wrapper(kind) {
     ignored: 'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
       'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));' +
       'process.exit(3);',
+    // Records what canary 3 actually DELIVERS, then answers exactly as `scanner` does. The
+    // record path is baked in at WRITE time, not passed in the environment: canaryEnv keeps
+    // only CANARY_ENV_KEEP, so a stub cannot be told anything through env at all.
+    recording: 'const fs=require("node:fs");let b="";process.stdin.setEncoding("utf8");' +
+      'process.stdin.on("data",(d)=>{b+=d;});' +
+      'process.stdin.on("end",()=>{fs.writeFileSync(' + JSON.stringify(p + ".stdin") + ',b);' +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));' +
+      '});',
     // Exits clean and says NOTHING. The delivery half of the predicate is about what ARRIVES,
     // so a silent command must fail even though its exit status is perfect.
     silent: 'process.exit(0);',
@@ -1344,7 +1353,120 @@ if (process.platform !== "win32") {
   }
 }
 
+
+// ── M2 (G-2) — `%` IS LIVE ON THE SHELL CANARY 3 ACTUALLY USES ────────────────────────────
+//
+// Same class as T1, other shell. `canaryScanner` spawns with `shell: true`, which on win32 is
+// `cmd.exe /d /s /c`, and cmd.exe expands `%NAME%` at delivery. G-2 measured
+// `C:/%PWNVAR%/dcg-ctx-wrap` clearing the basename and absolute-path gates as a literal token
+// and then executing an injected command, because `%` sat in the SHELL_LITERAL whitelist.
+// The refusal is platform-independent — the whitelist no longer admits `%` anywhere — so this
+// control holds on the Linux this suite runs on, where the expansion itself cannot happen.
+{
+  const base = mkdtempSync(path.join(tmp, "m2-"));
+  const realDir = path.join(base, "w");
+  mkdirSync(realDir, { recursive: true });
+  const realBin = path.join(realDir, "dcg-ctx-wrap");
+  copyFileSync(SCANNER, realBin);
+  chmodSync(realBin, 0o755);
+
+  const evil = base + "/%PWNVAR%/w/dcg-ctx-wrap";
+  const s = settings([staleEntry(evil)]);
+  const before = readFileSync(s, "utf8");
+  const r = run(s, sweep(0), [], realBin);
+
+  check("M2: a `%` in a path SEGMENT is refused", r.status !== 0);
+  check("M2: settings were not published over a refused command",
+    readFileSync(s, "utf8") === before);
+  // Name WHICH refusal fired, for the same reason T1 does: an rc!=0 from an unrelated gate
+  // would satisfy the two assertions above while testing nothing.
+  check("M2: refused as an unroutable command, not by some unrelated gate",
+    /NONE execs/.test(r.out));
+}
+
+// ── M3 (G-3) — EVERY PIN COMPONENT MUST BE ABSOLUTE ───────────────────────────────────────
+//
+// The certificate's load-bearing claim is that the four declared names make canary and hook
+// the SAME object. An empty or cwd-relative component makes them agree as STRINGS while
+// resolving against two different directories — the canary runs in the operator's cwd, the
+// harness runs PreToolUse from the session directory. G-3 measured `PATH=/usr/bin:/bin:`,
+// a single trailing empty component, publishing green at rc=0.
+{
+  const cases = [
+    ["PATH", "/usr/bin:/bin:", "trailing empty component"],
+    ["PATH", "/usr/bin::/bin", "doubled delimiter"],
+    ["PATH", "relbin:/usr/bin", "relative component"],
+    ["PYTHONPATH", "lib", "relative value"],
+    ["PYTHONHOME", "py", "relative value"],
+    ["PYTHONSTARTUP", "start.py", "relative value"],
+  ];
+  for (const [key, value, why] of cases) {
+    const s = settings([staleEntry()], { [key]: value });
+    const before = readFileSync(s, "utf8");
+    const r = run(s, sweep(0));
+    check(`M3: ${key} with a ${why} is refused`, r.status !== 0);
+    // Anchored to the refusal line, not to r.out: the pin values are echoed further down in
+    // the `Declared:` block, so a bare substring test would pass off that echo.
+    check(`M3: ${key} with a ${why} names the offending pin in the refusal`,
+      new RegExp(`REFUSING TO CERTIFY[^\n]*relative component in[^\n]*${key}`).test(r.out));
+    check(`M3: ${key} with a ${why} does not publish`,
+      readFileSync(s, "utf8") === before);
+  }
+  // The EMPTY value stays legal: it declares nothing, and that is what the contract means by
+  // "empty string counts — it dominates ambient". Absolute components still publish.
+  const ok = settings([staleEntry()], { PYTHONPATH: "", PYTHONHOME: "", PYTHONSTARTUP: "" });
+  check("M3: an empty pin VALUE is still accepted", run(ok, sweep(0)).status === 0);
+}
+
+// ── M4 (G-5) — CANARY 3 MUST ACTUALLY DELIVER THE DANGEROUS FIXTURE ───────────────────────
+//
+// Every canary-3 stub printed a canned deny on startup and never read stdin, so the suite
+// could not see the DELIVERY half of its own load-bearing canary — it was a decision-parser
+// test wearing a control's name. G-5 mutation-tested the applier: sending `{}` instead of the
+// fixture, and sending a benign fixture, each left the suite at rc=0 / 0 FAILs. This stub
+// records what arrived and the assertions read it, so either mutation now turns the suite red.
+{
+  const w = wrapper("recording");
+  const rec = w + ".stdin";
+  const s = settings([staleEntry(w)]);
+  run(s, sweep(0), [], w);
+
+  check("M4: canary 3 reached the recording wrapper", existsSync(rec));
+  const got = existsSync(rec) ? readFileSync(rec, "utf8") : "";
+  check("M4: canary 3 delivered a payload at all", got.trim() !== "");
+  check("M4: the delivered payload carries the DANGEROUS fixture",
+    got.includes("git reset --hard origin/main"));
+  check("M4: the payload is a tool call, not a bare string",
+    got.includes('"tool_name"') && got.includes('"tool_input"'));
+}
+
+// ── M6 (S-2) — AN UNKNOWN ARGUMENT MUST NOT PUBLISH ───────────────────────────────────────
+//
+// `process.argv.includes("--dry-run")` meant `--dry-rnu` and `--dry-run=true` both fell
+// through to the publishing path, printed the rewrite plan a preview prints, and rewrote the
+// canonical settings file at rc=0. On the file this script's own header calls the source the
+// REPL-seat renderer fans out from, a one-character typo in the documented preview flag became
+// a publish. Boundary validation on the highest-consequence path in the tool.
+{
+  for (const arg of ["--dry-rnu", "--dry-run=true", "-n", "extra"]) {
+    const s = settings([staleEntry()]);
+    const before = readFileSync(s, "utf8");
+    const r = run(s, sweep(0), [arg]);
+    check(`M6: ${arg} is refused`, r.status !== 0);
+    check(`M6: ${arg} is named in the refusal`,
+      r.out.includes(`unknown argument(s): ${arg}`));
+    check(`M6: ${arg} does not publish`, readFileSync(s, "utf8") === before);
+  }
+  // The documented flag itself still previews and still touches nothing.
+  const s = settings([staleEntry()]);
+  const before = readFileSync(s, "utf8");
+  run(s, sweep(0), ["--dry-run"]);
+  check("M6: --dry-run still previews without publishing",
+    readFileSync(s, "utf8") === before);
+}
+
 rmSync(tmp, { recursive: true, force: true });
+
 
 if (failures.length) {
   for (const f of failures) console.log(`FAIL: ${f}`);
