@@ -911,6 +911,46 @@ if (process.platform !== "win32") {
   check("T4c: the settings env block can still set PATH and beats the floor",
     !/CONFIG PATH DID NOT WIN/.test(outC));
   check("T4c: that run is green", rC.status === 0);
+
+  // (d) THE ADJUDICATED MAJOR ITSELF, as a regression test rather than a property test.
+  //
+  //     `dcg-ctx-wrap` is `#!/usr/bin/env python3`, so the wrapper is INTERPRETER-SELECTED and
+  //     canary 3 runs it through a shell. The benign shape needs no adversary: an operator's
+  //     shell routinely carries an interpreter (venv/pyenv/conda/nvm) that a desktop entry, a
+  //     systemd unit or cron does not. On the previous tree this published GREEN while the same
+  //     command on a launcher-shaped PATH exited 127 with EMPTY STDOUT — the host receives no
+  //     decision and the guarded call proceeds.
+  //
+  //     The interpreter is named something no host ships in /usr/bin ON PURPOSE, so this
+  //     measures PATH INHERITANCE rather than whether this particular box happens to have
+  //     python3 sitting where the floor can reach it.
+  const opBin = mkdtempSync(path.join(tmp, "t4-opbin-"));
+  const interp = path.join(opBin, "dcgtestinterp");
+  writeFileSync(interp, `#!/bin/sh\nexec ${process.execPath} "$@"\n`);
+  chmodSync(interp, 0o755);
+
+  const interpWrap = path.join(mkdtempSync(path.join(tmp, "t4-iw-")), "dcg-ctx-wrap");
+  writeFileSync(interpWrap,
+    "#!/usr/bin/env dcgtestinterp\n" +
+    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+    'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+  chmodSync(interpWrap, 0o755);
+
+  const sD = settings([staleEntry(interpWrap)]);
+  const rD = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({
+      HOOK_SETTINGS: sD, HOOK_SWEEP: sweep(0), CTX_WRAP: interpWrap,
+      // The ONLY thing that makes the wrapper runnable, and it lives in the operator's shell.
+      PATH: `${opBin}${path.delimiter}${process.env.PATH || ""}`,
+    }),
+  });
+  const outD = (rD.stdout || "") + (rD.stderr || "");
+  check("T4d: an interpreter reachable only from the operator's PATH drives the canary RED",
+    rD.status !== 0);
+  check("T4d: it fails as a command the harness could not run, not as a false green",
+    /CANARY FAILED/.test(outD));
+  check("T4d: and settings.json was left untouched", /was NOT modified/.test(outD));
 }
 
 rmSync(tmp, { recursive: true, force: true });
