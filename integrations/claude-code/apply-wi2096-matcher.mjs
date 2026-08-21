@@ -152,16 +152,46 @@ const soleArgv0 = (command) => {
   return tok.startsWith("~/") ? path.join(HOME, tok.slice(2)) : tok;
 };
 
+// ── THE ONE PREDICATE ────────────────────────────────────────────────────────────────────
+//
+// Three rounds produced three instances of ONE class: THE CHECK AND THE THING CHECKED WERE
+// DIFFERENT OBJECTS.
+//   R2  T5    validated the matcher STRING and never what it routed to.
+//   R4/5 T-R1 validated one binary while canary 3 spawned a different one.
+//   R6  T1    validated the first argv token while the rest of the command sent the verdict to
+//             /dev/null, or piped it through `sed s/deny/allow/` and inverted it.
+// Each was repaired at its own site, and each repair bought exactly one more variant. So the
+// distinction is encoded ONCE, here, and every site that decides "does this entry deliver a
+// scanner verdict?" consults it instead of re-deriving its own answer. Two halves, named for
+// what they actually are:
+//
+//   hookCommand(h)     IDENTITY — the EXACT command string the harness will exec, or "".
+//   deliversVerdict()  DELIVERY — run THAT string the way the harness runs it and see what
+//                      arrives. Defined with the canaries below, because it must execute.
+//
+// Identity alone would have made the divergence moot rather than closed: constrain the command
+// to a single absolute token and spawning the binary directly happens to be equivalent — until
+// someone relaxes the constraint for a good reason (an `env VAR=x` prefix, an interpreter, a
+// launcher) and the canary silently goes back to certifying something the harness never runs.
+// Delivery tests the property we actually care about, so it survives that relaxation.
 const wrapperName = path.basename(WRAPPER);
-const hookWrapperPath = (h) => {
+
+const hookCommand = (h) => {
   if (!isCommandHook(h)) return "";
   const bin = soleArgv0(h.command);
-  if (path.basename(bin) !== wrapperName) return "";
-  return path.isAbsolute(bin) ? bin : "";
+  if (!bin || path.basename(bin) !== wrapperName) return "";
+  if (!path.isAbsolute(bin)) return "";
+  return String(h.command).trim();
 };
-const entryWrapperPath = (e) =>
-  (Array.isArray(e.hooks) ? e.hooks : []).map(hookWrapperPath).find(Boolean) || "";
-const routesToWrapper = (e) => entryWrapperPath(e) !== "";
+const entryCommand = (e) =>
+  (Array.isArray(e.hooks) ? e.hooks : []).map(hookCommand).find(Boolean) || "";
+const routesToWrapper = (e) => entryCommand(e) !== "";
+// The resolved binary, for the one consumer that needs a PATH rather than a command: the
+// coverage sweep takes CTX_WRAP as a binary. Derived FROM the predicate, never independently.
+const entryWrapperPath = (e) => {
+  const cmd = entryCommand(e);
+  return cmd ? soleArgv0(cmd) : "";
+};
 
 const ctxEntries = pre.filter(isExecCtxEntry);
 const hollow = ctxEntries.filter((e) => !runs(e));
@@ -215,9 +245,10 @@ if (hollow.length > 0) {
 // Everything downstream that claims to have exercised the scanner runs THIS path, so a host
 // whose hook points somewhere other than the installed wrapper can no longer be green-ticked
 // by testing the installed wrapper instead.
-const LIVE_WRAPPER = ctxEntries.map(entryWrapperPath).find(Boolean) || "";
+const LIVE_COMMAND = ctxEntries.map(entryCommand).find(Boolean) || "";
+const LIVE_WRAPPER = LIVE_COMMAND ? soleArgv0(LIVE_COMMAND) : "";
 
-if (ctxEntries.length > 0 && !LIVE_WRAPPER) {
+if (ctxEntries.length > 0 && !LIVE_COMMAND) {
   console.error(
     `context-mode matcher(s) exist in ${SETTINGS} but NONE execs '${wrapperName}'.\n` +
     "The matcher string is not the control — the hook command is. Rewriting the matcher would\n" +
@@ -318,13 +349,21 @@ const canarySweep = (settingsPath, fail) => {
 //    because every adapter-generated denial's reason starts with the literal
 //    `dcg-ctx-wrap: `, while a real verdict is forwarded untouched carrying dcg's own text.
 //
-//    It runs LIVE_WRAPPER — the binary resolved from the hook command in settings.json — and
-//    NOT the CTX_WRAP constant. Spawning the constant is what let four different non-routing
-//    commands publish green: the canary proved a binary worked while the harness was wired to
-//    something else entirely. A hook pointing at an absent path now fails HERE, loudly, with
-//    the canonical file untouched, instead of being reported as a verified control.
+//    This is the DELIVERY half of the predicate above. It runs LIVE_COMMAND — the WHOLE hook
+//    command string out of settings.json — THROUGH A SHELL, exactly as the harness runs it,
+//    and requires a scanner-sourced deny to actually ARRIVE ON STDOUT. It does not spawn a
+//    resolved binary, because "the binary denies" and "the harness receives a denial" are
+//    different claims, and every variant of this defect has lived in that gap.
+//
+//    Testing arrival rather than shape is what makes this robust to shapes nobody enumerated:
+//    a command that redirects the verdict away fails because NOTHING arrives, and one that
+//    pipes it through `sed s/deny/allow/` fails because an ALLOW arrives. Neither needs to be
+//    on a list. The earlier version spawned the CTX_WRAP constant, which let four non-routing
+//    commands publish green; the version after that spawned the resolved binary, which let a
+//    redirect and a pipe publish green with the wrapper behaving perfectly.
 const canaryScanner = (fail) => {
-  const r = spawnSync(LIVE_WRAPPER, [], {
+  const r = spawnSync(LIVE_COMMAND, {
+    shell: true,
     input: JSON.stringify({
       tool_name: "mcp__plugin_context-mode_context-mode__ctx_execute",
       tool_input: { code: DANGEROUS_FIXTURE, language: "shell" },
@@ -334,16 +373,32 @@ const canaryScanner = (fail) => {
   });
   if (r.error) {
     fail(
-      `CANARY FAILED — cannot run '${LIVE_WRAPPER}' (${r.error.message}).\n` +
-      "That path is the hook command's own first argv token, read out of the settings file —\n" +
-      "so the control this file describes does not exist on this host."
+      `CANARY FAILED — cannot run the hook command (${r.error.message}):\n  ${LIVE_COMMAND}\n` +
+      "That is the command string read out of the settings file, run the way the harness runs\n" +
+      "it — so the control this file describes does not work on this host."
+    );
+  }
+  // A denial the host would discard is not a denial. The host treats 2 as blocking and every
+  // other non-zero as NON-blocking, after which the tool proceeds — so a well-formed deny that
+  // exits 3 reads as "guarded" here and runs anyway there. The wrapper this repo ships
+  // normalises to 0 or 2 and cannot reach that state; a same-basename binary that the repo
+  // neither ships nor describes can, and this canary exists to judge whatever is actually wired.
+  if (r.status !== 0 && r.status !== 2) {
+    fail(
+      `CANARY FAILED — the hook command exited ${r.status === null ? `on ${r.signal}` : r.status},\n` +
+      "which the host reads as NON-blocking: the tool would proceed despite the denial.\n" +
+      "Only 0 and 2 are honoured."
     );
   }
   let out;
   try {
     out = JSON.parse(r.stdout || "");
   } catch {
-    fail(`CANARY FAILED — ${LIVE_WRAPPER} returned no decision for a known-dangerous fixture`);
+    fail(
+      "CANARY FAILED — no decision ARRIVED for a known-dangerous fixture. The hook command\n" +
+      `produced ${r.stdout ? "unparseable output" : "NOTHING ON STDOUT"}:\n  ${LIVE_COMMAND}\n` +
+      "The wrapper may well be denying; what matters is that the harness never receives it."
+    );
   }
   const hso = (out && out.hookSpecificOutput) || {};
   if (hso.permissionDecision !== "deny") {
@@ -415,7 +470,27 @@ const tmpPath = `${SETTINGS}.tmp-wi2096-${process.pid}`;
 // which on this fleet is a 0600 file carrying an env block with tokens — sat world-readable
 // for the length of the write. A mode passed at creation is still masked by umask, and umask
 // can only REMOVE bits, so this is never wider than 0600 and never wider than the source.
-writeFileSync(tmpPath, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+// `flag: "wx"` — EXCLUSIVE create, and it is what makes the 0600 claim above actually true.
+// Measured: `mode` applies ONLY at creation, so a path already present at 0644 stayed 0644
+// straight through `writeFileSync(…, {mode: 0o600})`; worse, a SYMLINK at that path was
+// FOLLOWED, landing the entire settings document — env block and tokens included — in whatever
+// the link pointed at. Exclusive create refuses both with EEXIST. Reachability is narrow (a
+// stale same-PID leftover, or a writable settings directory), but this was the one remaining
+// path on which this file's own stated invariant did not hold.
+try {
+  writeFileSync(tmpPath, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+} catch (err) {
+  if (err.code === "EEXIST") {
+    console.error(
+      `refusing to write the candidate: ${tmpPath} already exists.\n` +
+      "It is a stale leftover or a planted symlink. This script will not write the settings\n" +
+      "document through a path it did not create — remove it and re-run."
+    );
+  } else {
+    console.error(`cannot write the candidate ${tmpPath}: ${err.message}`);
+  }
+  process.exit(1);
+}
 
 // An uncaught throw anywhere between the write and the rename left that candidate orphaned on
 // disk, holding the whole document, outliving the process with nothing downstream to remove

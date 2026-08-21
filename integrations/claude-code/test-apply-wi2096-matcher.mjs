@@ -13,7 +13,7 @@
 // Run: node integrations/claude-code/test-apply-wi2096-matcher.mjs   (exit 0 = pass)
 
 import {
-  mkdtempSync, writeFileSync, readFileSync, copyFileSync, readdirSync,
+  mkdtempSync, writeFileSync, readFileSync, copyFileSync, readdirSync, symlinkSync,
   chmodSync, rmSync, existsSync, statSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -52,6 +52,15 @@ function wrapper(kind) {
     adapter: 'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
       'permissionDecision:"deny",permissionDecisionReason:"dcg-ctx-wrap: scanner /nope could not be run"}}));',
     allow: 'console.log(JSON.stringify({continue:true}));',
+    // A well-formed scanner-sourced deny on an exit status the HOST DISCARDS. The host honours
+    // 2 as blocking and treats every other non-zero as non-blocking, after which the tool runs
+    // anyway — so this reads as "guarded" while being nothing of the kind.
+    ignored: 'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));' +
+      'process.exit(3);',
+    // Exits clean and says NOTHING. The delivery half of the predicate is about what ARRIVES,
+    // so a silent command must fail even though its exit status is perfect.
+    silent: 'process.exit(0);',
   };
   writeFileSync(p, `#!/usr/bin/env node\n${bodies[kind]}\n`);
   chmodSync(p, 0o755);
@@ -208,6 +217,29 @@ for (const [label, hooks] of [
     /was NOT denied/.test(r.out));
 }
 
+// 2e. ...and a denial the HOST WOULD DISCARD is not a denial either. Exit 3 is non-blocking:
+//     the host lets the tool proceed, so "denied" here means "ran anyway" there.
+{
+  const ignored = wrapper("ignored");
+  const s = settings([bashEntry(), looseEntry(ignored)]);
+  const r = run(s, sweep(0), [], ignored);
+  check("a deny on a host-ignored exit status fails the canary", r.status !== 0);
+  check("a deny on a host-ignored exit status says the tool would proceed",
+    /NON-blocking|would proceed/.test(r.out));
+}
+
+// 2f. DELIVERY, stated as its own property: a command that exits clean and says NOTHING is not
+//     a control. This is what canary 3 now asserts — that a verdict ARRIVES — rather than that
+//     some binary is capable of producing one.
+{
+  const silent = wrapper("silent");
+  const s = settings([bashEntry(), looseEntry(silent)]);
+  const r = run(s, sweep(0), [], silent);
+  check("a silent hook command fails the canary", r.status !== 0);
+  check("a silent hook command says no decision arrived",
+    /no decision ARRIVED|NOTHING ON STDOUT/.test(r.out));
+}
+
 // 3. Stale matcher, sweep green -> patched and published.
 {
   const s = settings([bashEntry(), staleEntry()]);
@@ -360,6 +392,34 @@ for (const [label, hooks] of [
   const sawPlanted = leaked().length === 1;
   rmSync(planted, { force: true });
   check("the temp-leak assertion can actually fail", sawPlanted);
+}
+
+// 4b. THE CANDIDATE MUST NOT BE WRITTEN THROUGH A PATH THIS SCRIPT DID NOT CREATE.
+//     `mode` applies only at CREATION, so a pre-existing 0644 path keeps 0644 and a SYMLINK
+//     is followed — landing the whole settings document, tokens included, in the link target.
+//     The candidate path is `${settings}.tmp-wi2096-${pid}` of the APPLIER, which is a
+//     spawnSync child, so the test plants every plausible child pid rather than guessing one.
+if (process.platform !== "win32") {
+  const dir = mkdtempSync(path.join(tmp, "excl-"));
+  const s = path.join(dir, "settings.json");
+  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] } }, null, 2) + "\n");
+  const secret = path.join(dir, "secret-target.txt");
+  writeFileSync(secret, "ORIGINAL");
+  // Learn where the pid counter actually is. Planting from `process.pid` was VACUOUS — by
+  // this point the suite has spawned dozens of children and the counter has moved far past
+  // the runner's own pid, so no planted link ever sat on the path the applier used and the
+  // assertion passed against the unfixed applier too. A throwaway child tells us where the
+  // counter is now; the applier is the next fork after it.
+  const probe = spawnSync(process.execPath, ["-e", ""]);
+  const from = (probe.pid || process.pid) + 1;
+  for (let p = from; p < from + 250; p++) {
+    try { symlinkSync(secret, `${s}.tmp-wi2096-${p}`); } catch { /* taken */ }
+  }
+  const r = run(s, sweep(0));
+  check("symlink-planted candidate path: the secret target was NOT written through",
+    readFileSync(secret, "utf8") === "ORIGINAL");
+  check("symlink-planted candidate path: exits 0 or refuses, never silently follows",
+    r.status === 0 || /already exists|refusing to write the candidate/.test(r.out));
 }
 
 // 5. A sweep that cannot be run at all must be a failure, not a pass.
