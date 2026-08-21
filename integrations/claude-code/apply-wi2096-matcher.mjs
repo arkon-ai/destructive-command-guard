@@ -388,11 +388,28 @@ const canaryMatcher = (settingsPath, fail) => {
 // in one glance, and a selector nobody has thought of is excluded by DEFAULT rather than by
 // having been predicted.
 //
-// THE FAILURE DIRECTION IS DELIBERATE. If the real harness carries a richer `PATH` than the
-// floor, this canary goes RED on a host where production works — loud, and fixable in one
-// place: put `PATH` in settings.json's `env` block, which the harness and this canary BOTH
-// read. The converse arrangement, inheriting the operator's `PATH`, fails GREEN over a dark
-// control, which is the defect this replaces.
+// ⚠ THE PATH FLOOR IS A KNOWN, OPEN DIVERGENCE — NOT A CHOSEN FAILURE DIRECTION.
+//
+// The previous text here claimed that a harness with a richer `PATH` than the floor could only
+// make this canary fail RED. THAT CLAIM WAS FALSE, and it was false in the way this whole file
+// keeps being false: it enumerated ONE direction of a TWO-SIDED difference and then stated a
+// property of the whole. Measured, with no adversary — a `python3` shim whose target version had
+// been uninstalled, first on the ambient `PATH`:
+//     the hook on the AMBIENT PATH : exit 1, EMPTY STDOUT — no decision reaches the host
+//     this applier, on the floor   : rc 0, GREEN, settings PUBLISHED
+//     the applier BEFORE the floor : rc 1, RED, nothing published
+// So the floor made that case STRICTLY WORSE than inheriting the environment did. The ambient
+// PATH can be richer than the floor OR it can SHADOW a working interpreter with a broken one,
+// and the floor is blind to the second.
+//
+// WHAT IS ACTUALLY TRUE, and all that is claimed here: the canary runs with `PATH` set to
+// PATH_FLOOR, which is NOT the `PATH` the harness will give the hook. The two environments
+// differ, in both directions, and this file cannot observe the harness's environment at apply
+// time to reconcile them. That is an OPEN defect, not a design property — tracked as R10 T1,
+// and the reason the settings `env` block remains the only place where an operator can make the
+// canary and the hook read the same value.
+//
+// Do not restore a claim about which way this fails without a measurement of BOTH directions.
 //
 // THE COMPOSITION BELOW WAS MEASURED AGAINST THE HARNESS, NOT ASSUMED — assuming it is the
 // exact class this file keeps repairing. A `PreToolUse` hook, the same event this control is,
@@ -549,13 +566,25 @@ const ENV_REMEDY =
 //    on a list. The earlier version spawned the CTX_WRAP constant, which let four non-routing
 //    commands publish green; the version after that spawned the resolved binary, which let a
 //    redirect and a pipe publish green with the wrapper behaving perfectly.
-const canaryScanner = (settingsPath, fail) => {
+//    RUN AGAINST EVERY ROUTING COMMAND THE DOCUMENT CARRIES, NOT THE FIRST ONE FOUND.
+//    `LIVE_COMMAND` is `ctxEntries.map(entryCommand).find(Boolean)` — the FIRST entry that
+//    routes to the wrapper — while `targets` widens EVERY stale entry that routes to it. Those
+//    are different objects whenever a document holds more than one, and which way it went was
+//    decided by ARRAY ORDER. Measured: the applier published rc 0 having widened an entry whose
+//    binary exits 127 with empty stdout, while the green line named the other entry's binary;
+//    with the same two entries in the opposite order it went red. A control chosen by position
+//    in an array is not a control.
+//
+//    This is the same class as everything above it — the check and the thing checked being
+//    different objects — and it is closed the same way: by running the check the file ALREADY
+//    OWNS against each object, rather than by adding a second mechanism to reconcile them.
+const canaryScanner = (settingsPath, command, fail) => {
   // Without this the spawn inherits process.env wholesale, DCG_WRAP_BIN included, and this
   // canary — the ONE check that still separates a live scanner from a dark fail-closed
   // adapter — certifies a binary the harness will never resolve. See canaryEnv above.
   const env = canaryEnv(settingsPath, fail);
   scannerUsed = scannerSelection(env);
-  const r = spawnSync(LIVE_COMMAND, {
+  const r = spawnSync(command, {
     shell: true,
     input: JSON.stringify({
       tool_name: "mcp__plugin_context-mode_context-mode__ctx_execute",
@@ -567,7 +596,7 @@ const canaryScanner = (settingsPath, fail) => {
   });
   if (r.error) {
     fail(
-      `CANARY FAILED — cannot run the hook command (${r.error.message}):\n  ${LIVE_COMMAND}\n` +
+      `CANARY FAILED — cannot run the hook command (${r.error.message}):\n  ${command}\n` +
       "That is the command string read out of the settings file, run the way the harness runs\n" +
       "it — so the control this file describes does not work on this host." + ENV_REMEDY
     );
@@ -581,7 +610,7 @@ const canaryScanner = (settingsPath, fail) => {
     fail(
       `CANARY FAILED — the hook command exited ${r.status === null ? `on ${r.signal}` : r.status},\n` +
       "which the host reads as NON-blocking: the tool would proceed despite the denial.\n" +
-      `Only 0 and 2 are honoured.\n  ${LIVE_COMMAND}` + ENV_REMEDY
+      `Only 0 and 2 are honoured.\n  ${command}` + ENV_REMEDY
     );
   }
   let out;
@@ -590,7 +619,7 @@ const canaryScanner = (settingsPath, fail) => {
   } catch {
     fail(
       "CANARY FAILED — no decision ARRIVED for a known-dangerous fixture. The hook command\n" +
-      `produced ${r.stdout ? "unparseable output" : "NOTHING ON STDOUT"}:\n  ${LIVE_COMMAND}\n` +
+      `produced ${r.stdout ? "unparseable output" : "NOTHING ON STDOUT"}:\n  ${command}\n` +
       "The wrapper may well be denying; what matters is that the harness never receives it." +
       ENV_REMEDY
     );
@@ -610,28 +639,54 @@ const canaryScanner = (settingsPath, fail) => {
       "That is the control being DARK while emitting the right word. Install/repair dcg-wrap."
     );
   }
+  certified.push({ command, scanner: scannerUsed });
   console.log(
-    "canary 3: a known-dangerous fixture was denied BY THE SCANNER\n" +
+    `canary 3: a known-dangerous fixture was denied BY THE SCANNER\n          ${command}\n` +
     `          scanner the canary invoked: ${scannerUsed}`
   );
 };
 
+// EVERY routing command the published document carries, deduplicated, in document order.
+// `targets` first because those are the entries this run MODIFIES, then the rest of ctxEntries,
+// because an entry already at LOOSE is still part of the control this file green-ticks. An
+// entry belonging to another guard yields "" from entryCommand and is not ours to certify.
+const commandsToCertify = () => {
+  const seen = new Set();
+  const out = [];
+  for (const e of [...targets, ...ctxEntries]) {
+    const c = entryCommand(e);
+    if (c && !seen.has(c)) { seen.add(c); out.push(c); }
+  }
+  return out;
+};
+
+// What canary 3 ACTUALLY certified, recorded at the moment of use. The success line quotes
+// this rather than recomputing, so the message and the run cannot drift apart.
+const certified = [];
+
 const verify = (settingsPath, fail) => {
   canaryMatcher(settingsPath, fail);
   canarySweep(settingsPath, fail);
-  canaryScanner(settingsPath, fail);
+  const commands = commandsToCertify();
+  if (!commands.length) {
+    fail("CANARY FAILED — no context-mode entry carries a routing command to certify.");
+  }
+  for (const c of commands) canaryScanner(settingsPath, c, fail);
 };
 
 // R16 — a success line may claim only what the canaries actually earned. Earned: for THIS
 // settings document on THIS host, the ctx exec matcher matches the live tool names, the sweep
-// is green, and the hook command — run through a shell exactly as the harness runs it —
-// delivered a scanner-sourced DENY for ONE known-dangerous fixture, off the scanner named here.
-// NOT earned, and so not claimed: that this machine is protected, that any other tool surface
-// is guarded, or that any other settings scope agrees. Naming the scanner is the load-bearing
-// half — it is what makes a stub visible to the operator reading this line instead of silent.
+// is green, and EVERY routing command the document carries — run through a shell exactly as the
+// harness runs it — delivered a scanner-sourced DENY for ONE known-dangerous fixture, off the
+// scanner named beside it. NOT earned, and so not claimed: that this machine is protected, that
+// any other tool surface is guarded, or that any other settings scope agrees. Naming each
+// command and its scanner is the load-bearing half — it is what makes a stub visible to the
+// operator reading this line instead of silent, and it is what stops the line describing one
+// entry while a different one was published.
 const greenLine = () =>
-  `ctx exec calls in ${SETTINGS} reach ${LIVE_WRAPPER}, and one known-dangerous fixture was ` +
-  `denied by the scanner behind it (${scannerUsed}).\n` +
+  `ctx exec calls in ${SETTINGS} reach ${certified.length} routing command(s), each of which ` +
+  "denied one known-dangerous fixture:\n" +
+  certified.map((c) => `  ${c.command}\n    scanner: ${c.scanner}`).join("\n") + "\n" +
   "That surface, that fixture, this host — nothing wider was checked.";
 
 if (targets.length === 0) {

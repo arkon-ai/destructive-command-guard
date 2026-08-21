@@ -791,6 +791,12 @@ if (process.platform !== "win32") {
     outE.includes(`DCG_WRAP_BIN=${CONFIG_PICK}`));
   check("T3e: patch branch names the wrapper the ctx surface reaches", outE.includes(bin));
   check("T3e: patch branch scopes the claim", /nothing wider was checked/.test(outE));
+  // The SUMMARY must itself list each certified command with its scanner. Asserting only that
+  // the wrapper path appears somewhere in the output does NOT pin this: canary 3 prints the
+  // command too, so a mutant that emptied the summary's per-command lines SURVIVED that check.
+  // Measured, then fixed. This matches the summary's own shape.
+  check("T3e: the green summary lists each certified command with its scanner",
+    /^ {4}scanner: /m.test(outE));
   check("T3e: patch branch does not make the flat claim", !/the control is live/.test(outE));
 
   // The `env` block must survive the publish. The applier re-serialises the whole document, so
@@ -960,6 +966,76 @@ if (process.platform !== "win32") {
   check("T4d: the refusal names the supported remedy — the settings env block",
     /"env" block of the settings file/.test(outD));
   check("T4d: the refusal shows the PATH it actually ran with", /PATH=/.test(outD));
+
+  // (e) R11 item 3 — the comment above canaryEnv no longer claims a FAILURE DIRECTION (that
+  //     claim was false: the floor made a measured no-adversary case strictly worse). All it
+  //     claims now is the mechanism — the canary runs on PATH_FLOOR, which is NOT the PATH the
+  //     harness gives the hook. Pin exactly that, so the comment cannot drift from the code.
+  if (process.platform !== "win32") {
+    const FLOOR = "/usr/bin:/bin";
+    const fp = path.join(mkdtempSync(path.join(tmp, "t4-floor-")), "dcg-ctx-wrap");
+    writeFileSync(fp,
+      `#!${process.execPath}\n` +
+      `const ok = process.env.PATH === ${JSON.stringify(FLOOR)};\n` +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason: ok ? ' +
+      '"BLOCKED by dcg  Reason: git_reset_hard" : ' +
+      '"dcg-ctx-wrap: CANARY PATH WAS " + process.env.PATH}}));\n');
+    chmodSync(fp, 0o755);
+    const rf = spawnSync(process.execPath, [APPLY], {
+      encoding: "utf8",
+      env: opEnv({
+        HOOK_SETTINGS: settings([staleEntry(fp)]), HOOK_SWEEP: sweep(0), CTX_WRAP: fp,
+        PATH: `${hijackDir}${path.delimiter}${process.env.PATH || ""}`,
+      }),
+    });
+    const outF = (rf.stdout || "") + (rf.stderr || "");
+    check("T4e: the canary runs on the PATH floor, not the operator's PATH",
+      !/CANARY PATH WAS/.test(outF));
+    check("T4e: that run is green", rf.status === 0);
+  }
+}
+
+// ── T5 (R11 item 2) — CERTIFY EVERY ROUTING COMMAND PUBLISHED, NOT THE FIRST ONE FOUND ────
+//
+// `LIVE_COMMAND` was `ctxEntries.map(entryCommand).find(Boolean)` — the FIRST entry routing to
+// the wrapper — while `targets` widens EVERY stale entry that routes to it. Different objects
+// whenever a document holds more than one, and which way it went was decided by ARRAY ORDER.
+//
+// The fixture is the measured shape: a healthy entry ALREADY at LOOSE sits first, so it becomes
+// the one the old code canaried; a STALE entry whose binary is dark sits second, so it is the
+// one actually widened and published. The old code certified the first and published the
+// second.
+{
+  const darkDir = mkdtempSync(path.join(tmp, "t5-dark-"));
+  const dark = path.join(darkDir, "dcg-ctx-wrap");
+  // Exits 127 with EMPTY STDOUT: the host receives no decision and the guarded call proceeds.
+  writeFileSync(dark, `#!${process.execPath}\nprocess.exit(127);\n`);
+  chmodSync(dark, 0o755);
+
+  const s = settings([looseEntry(SCANNER), staleEntry(dark)]);
+  const r = run(s, sweep(0), [], SCANNER);
+  check("T5: an entry whose command is DARK is refused even when another entry is healthy",
+    r.status !== 0);
+  check("T5: it names the dark command, not the healthy one", r.out.includes(dark));
+  check("T5: and settings.json was NOT modified", /was NOT modified/.test(r.out));
+
+  // Negative control — the SAME two entries with the dark one absent must still go green, so
+  // the assertions above are pinning the dark command and not merely "two entries fail".
+  const ok = run(settings([looseEntry(SCANNER), staleEntry(SCANNER)]), sweep(0), [], SCANNER);
+  check("T5: two healthy entries still publish green", ok.status === 0);
+
+  // TWO TARGETS, THE DARK ONE SECOND. This is the case the LOOP exists for, and the case the
+  // first fixture does NOT reach: there the dark entry happened to sort first among targets, so
+  // certifying only `commands[0]` would still have caught it. A mutant that reverts the loop to
+  // a single command SURVIVED against the fixture above and is killed only by this one —
+  // measured, not assumed. Both entries are stale, so BOTH are widened and published.
+  const r2 = run(settings([staleEntry(SCANNER), staleEntry(dark)]), sweep(0), [], SCANNER);
+  check("T5: with TWO entries widened, a dark one in second position is still refused",
+    r2.status !== 0);
+  check("T5: the second-position dark command is the one named", r2.out.includes(dark));
+  check("T5: and settings.json was NOT modified in that case either",
+    /was NOT modified/.test(r2.out));
 }
 
 rmSync(tmp, { recursive: true, force: true });
