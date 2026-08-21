@@ -347,9 +347,12 @@ const canaryMatcher = (settingsPath, fail) => {
 
 // ── THE CANARY ENVIRONMENT ───────────────────────────────────────────────────────────────
 //
-// `dcg-ctx-wrap` resolves its scanner as `os.environ.get("DCG_WRAP_BIN", ~/.local/bin/dcg-wrap)`,
-// so whoever holds that variable when the hook runs decides which binary actually scans. Two
-// different holders can, and they are NOT the same thing:
+// WHAT SELECTS THE SCANNER IS NOT ONE VARIABLE. `dcg-ctx-wrap` resolves its scanner as
+// `os.environ.get("DCG_WRAP_BIN", ~/.local/bin/dcg-wrap)` — but it is itself
+// `#!/usr/bin/env python3`, and canary 3 runs the hook command THROUGH A SHELL. So `PATH`
+// chooses the interpreter that runs the adapter, and `PYTHONPATH` chooses what that
+// interpreter imports before the adapter's first line. Three different holders can decide
+// what actually scans, and they are NOT the same thing:
 //
 //   THE OPERATOR'S SHELL — must NOT reach the canary. Claude Code launches from a desktop
 //   entry, a systemd unit or cron, where a variable exported in someone's terminal does not
@@ -358,15 +361,38 @@ const canaryMatcher = (settingsPath, fail) => {
 //   the variable unset then DENIED every guarded ctx call — a total outage certified as "the
 //   control is live". Converse and worse: if the real scanner is a stub or a silent `true`,
 //   production ALLOWS everything while the canary was green off the env binary.
+//   The same divergence rides EVERY interpreter selector, not just that one name. Measured
+//   with no adversary at all: with `python3` present only in the operator's shell, this applier
+//   published GREEN, while the identical hook command on a launcher-shaped `PATH` exited 127
+//   with EMPTY STDOUT — the host receives no decision and the guarded call proceeds. A green
+//   certificate over a control that is completely dark in production.
 //
 //   THE `env` BLOCK OF THE SETTINGS DOCUMENT — must reach the canary, because the harness
-//   delivers that block to every hook it spawns. Stripping it unconditionally, as the previous
+//   delivers that block to every hook it spawns. Stripping it unconditionally, as an earlier
 //   version of this function did, reproduces the very same divergence with the sign flipped:
 //   point `DCG_WRAP_BIN` at a silent `exit 0` stub VIA THE CONFIG and the live hook uses the
 //   stub while the canary certifies a different scanner entirely. Measured: green tick, dark
 //   control. A green certificate over a binary the harness never runs.
 //
-// So the rule is a PRECEDENCE, not a strip: shell out, config in.
+// So the rule is: the canary's BASE environment is an ALLOWLIST — only the names in
+// CANARY_ENV_KEEP below survive from this process, plus a deterministic `PATH` floor — and the
+// settings document's `env` block is then applied ON TOP of it. That is the exact domain: not
+// "the shell is out" in general, but "only these names survive, and config overrides them".
+//
+// AN ALLOWLIST, NOT A LIST OF INTERPRETER SELECTORS TO STRIP — for the same reason
+// SHELL_LITERAL above is a whitelist. The set of variables that can steer an interpreter or a
+// loader is open-ended: PATH, PYTHONPATH, PYTHONHOME, PYTHONSTARTUP, PYTHONEXECUTABLE,
+// LD_PRELOAD, LD_LIBRARY_PATH, DYLD_INSERT_LIBRARIES, BASH_ENV, ENV, IFS, NODE_OPTIONS, and
+// whatever the next interpreter adds. Every previous remedy in this file was beaten by a shape
+// nobody had enumerated, and a strip-list cannot be shown complete. An allowlist can be read
+// in one glance, and a selector nobody has thought of is excluded by DEFAULT rather than by
+// having been predicted.
+//
+// THE FAILURE DIRECTION IS DELIBERATE. If the real harness carries a richer `PATH` than the
+// floor, this canary goes RED on a host where production works — loud, and fixable in one
+// place: put `PATH` in settings.json's `env` block, which the harness and this canary BOTH
+// read. The converse arrangement, inheriting the operator's `PATH`, fails GREEN over a dark
+// control, which is the defect this replaces.
 //
 // THE COMPOSITION BELOW WAS MEASURED AGAINST THE HARNESS, NOT ASSUMED — assuming it is the
 // exact class this file keeps repairing. A `PreToolUse` hook, the same event this control is,
@@ -401,9 +427,40 @@ const configEnv = (settingsPath, fail) => {
   return Object.fromEntries(Object.entries(block).map(([k, v]) => [k, String(v)]));
 };
 
+// The ONLY names that survive from this process into a canary. Everything here is required to
+// start an interpreter at all or to let it find the user's own files; nothing here selects
+// WHICH interpreter or WHAT it loads. `DCG_WRAP_BIN` is absent, which is how the operator's
+// scanner choice is refused — by construction now, rather than by a `delete` that had to name
+// it.
+const CANARY_ENV_KEEP = new Set([
+  // The wrapper resolves `~` for its default scanner, so losing HOME changes which path it
+  // resolves — a divergence of exactly the kind this function exists to prevent.
+  "HOME", "USERPROFILE",
+  // Decoding of the scanner's own output. A different locale can change how the verdict text
+  // is read back, and the reason string is load-bearing here.
+  "LANG", "LC_ALL", "LC_CTYPE",
+  "TMPDIR", "TEMP", "TMP",
+  // cmd.exe cannot start at all without these, so on win32 dropping them would make every
+  // canary fail for a reason that has nothing to do with the control.
+  "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR", "SYSTEMDRIVE",
+]);
+
+// A deterministic floor, not the operator's. This is what a desktop entry, a systemd unit or
+// cron actually hands a hook, which is the environment the canary is trying to be honest about.
+const PATH_FLOOR = process.platform === "win32"
+  ? [
+      `${process.env.SystemRoot || "C:\\Windows"}\\system32`,
+      `${process.env.SystemRoot || "C:\\Windows"}`,
+      `${process.env.SystemRoot || "C:\\Windows"}\\system32\\Wbem`,
+    ].join(";")
+  : "/usr/bin:/bin";
+
 const canaryEnv = (settingsPath, fail, extra) => {
-  const env = { ...process.env };
-  delete env.DCG_WRAP_BIN;                             // the operator's shell does not choose
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (CANARY_ENV_KEEP.has(k)) env[k] = v;
+  }
+  env.PATH = PATH_FLOOR;                               // the operator's PATH does not choose
   Object.assign(env, configEnv(settingsPath, fail));   // the settings document does
   // This applier's own pins go LAST so the document under test cannot redirect the canary that
   // is judging it — the sweep must run against LIVE_WRAPPER and the file under test whatever

@@ -62,7 +62,10 @@ function wrapper(kind) {
     // so a silent command must fail even though its exit status is perfect.
     silent: 'process.exit(0);',
   };
-  writeFileSync(p, `#!/usr/bin/env node\n${bodies[kind]}\n`);
+  // The interpreter is named ABSOLUTELY, not via `/usr/bin/env`: the canary environment now
+  // carries a deterministic PATH floor, so a fixture that resolves its own interpreter through
+  // PATH would be testing the floor rather than the behaviour under test.
+  writeFileSync(p, `#!${process.execPath}\n${bodies[kind]}\n`);
   chmodSync(p, 0o755);
   return p;
 }
@@ -609,7 +612,7 @@ if (process.platform !== "win32") {
   const d = mkdtempSync(path.join(tmp, "t2-"));
   const bin = path.join(d, "dcg-ctx-wrap");
   writeFileSync(bin,
-    "#!/usr/bin/env node\n" +
+    `#!${process.execPath}\n` +
     "const leaked = !!process.env.DCG_WRAP_BIN;\n" +
     'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
     'permissionDecision:"deny",permissionDecisionReason: leaked ? ' +
@@ -688,7 +691,7 @@ if (process.platform !== "win32") {
   // reason and names itself, instead of surfacing as a bare non-zero that could be anything.
   const bin = path.join(d, "dcg-ctx-wrap");
   writeFileSync(bin,
-    "#!/usr/bin/env node\n" +
+    `#!${process.execPath}\n` +
     "const got = process.env.DCG_WRAP_BIN || '(unset)';\n" +
     `const want = ${JSON.stringify(CONFIG_PICK)};\n` +
     'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
@@ -748,7 +751,7 @@ if (process.platform !== "win32") {
   const delegDir = mkdtempSync(path.join(tmp, "t3-deleg-"));
   const deleg = path.join(delegDir, "dcg-ctx-wrap");
   writeFileSync(deleg,
-    "#!/usr/bin/env node\n" +
+    `#!${process.execPath}\n` +
     "// Behaves like dcg-ctx-wrap in the one respect under test: it runs DCG_WRAP_BIN and\n" +
     "// forwards whatever that scanner says. A scanner that exits 0 saying nothing is an ALLOW.\n" +
     "const { spawnSync } = require('node:child_process');\n" +
@@ -760,7 +763,7 @@ if (process.platform !== "win32") {
   chmodSync(deleg, 0o755);
 
   const silentStub = path.join(d, "silent-stub");
-  writeFileSync(silentStub, "#!/usr/bin/env node\nprocess.exit(0);\n");
+  writeFileSync(silentStub, `#!${process.execPath}\nprocess.exit(0);\n`);
   chmodSync(silentStub, 0o755);
 
   const sD = settings([staleEntry(deleg)], { DCG_WRAP_BIN: silentStub });
@@ -812,6 +815,102 @@ if (process.platform !== "win32") {
   check("T3f: with no config env the line reports the scanner as unselected",
     /DCG_WRAP_BIN unset/.test(rF.out));
   check("T3f: that run is still green", rF.status === 0);
+}
+
+// ── T4 (R9 fold) — THE CANARY ENVIRONMENT IS AN ALLOWLIST, NOT ONE STRIPPED NAME ──────────
+//
+// R9's first attempt bound exactly one selector, `DCG_WRAP_BIN`, while `dcg-ctx-wrap` is
+// `#!/usr/bin/env python3` and canary 3 runs the hook command through a SHELL. So `PATH` chose
+// the interpreter and `PYTHONPATH` chose what it imported, both still arriving from the
+// operator's shell. Measured with NO ADVERSARY: with `python3` present only in the operator's
+// shell the applier published GREEN, while the identical command on a launcher-shaped `PATH`
+// exited 127 with EMPTY STDOUT — no decision reaches the host and the guarded call proceeds.
+//
+// These pin the ALLOWLIST property rather than a list of blocked names: the last variable in
+// the leak set below is one NOBODY ENUMERATED, and it must be excluded by default. A test that
+// only checked known selectors would pass against a strip-list and prove nothing.
+{
+  const d = mkdtempSync(path.join(tmp, "t4-"));
+  const hijackDir = mkdtempSync(path.join(tmp, "t4-hijack-"));
+
+  const opEnv = (over) => {
+    const e = { ...process.env };
+    delete e.DCG_WRAP_BIN;
+    return { ...e, ...over };
+  };
+
+  // Denies EITHER WAY, so canary 3's own criterion is satisfied in every world and the only
+  // variable under test is WHAT ARRIVED. Leaks come back through the reason and name themselves.
+  const probe = path.join(d, "dcg-ctx-wrap");
+  writeFileSync(probe,
+    `#!${process.execPath}\n` +
+    "const watch = ['PYTHONPATH','PYTHONHOME','LD_PRELOAD','NODE_OPTIONS','BASH_ENV'," +
+    "'DCG_UNENUMERATED_SELECTOR'];\n" +
+    "const leaked = watch.filter((k) => process.env[k]);\n" +
+    `if ((process.env.PATH || '').includes(${JSON.stringify(hijackDir)})) leaked.push('PATH');\n` +
+    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+    'permissionDecision:"deny",permissionDecisionReason: leaked.length ? ' +
+    '"dcg-ctx-wrap: OPERATOR ENV LEAKED " + leaked.join(",") : ' +
+    '"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+  chmodSync(probe, 0o755);
+
+  // (a) NO interpreter/loader selector reaches the canary from the operator's shell — including
+  //     `DCG_UNENUMERATED_SELECTOR`, which no strip-list could have named in advance.
+  const sA = settings([staleEntry(probe)]);
+  const rA = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({
+      HOOK_SETTINGS: sA, HOOK_SWEEP: sweep(0), CTX_WRAP: probe,
+      PYTHONPATH: path.join(d, "evil-site-packages"),
+      PYTHONHOME: path.join(d, "evil-home"),
+      LD_PRELOAD: path.join(d, "evil.so"),
+      // Benign ON PURPOSE. `--require=<path>` would crash the APPLIER's own node process
+      // before it ran a single canary, so the test would fail for a reason that has nothing
+      // to do with the environment reaching the canary. What is under test is whether the
+      // NAME arrives, not what a hostile value would do once it did.
+      NODE_OPTIONS: "--max-old-space-size=512",
+      BASH_ENV: path.join(d, "evil.sh"),
+      DCG_UNENUMERATED_SELECTOR: "a name no strip-list predicted",
+      PATH: `${hijackDir}${path.delimiter}${process.env.PATH || ""}`,
+    }),
+  });
+  const outA = (rA.stdout || "") + (rA.stderr || "");
+  check("T4a: no operator interpreter/loader selector reaches the canary",
+    !/OPERATOR ENV LEAKED/.test(outA));
+  check("T4a: the run is green off the allowlisted environment", rA.status === 0);
+
+  // (b) The hijack half, stated on its own so a failure names itself: a directory planted at
+  //     the FRONT of the operator's PATH must not be on the canary's PATH at all.
+  check("T4b: a PATH entry planted by the operator does not reach the canary",
+    !/OPERATOR ENV LEAKED[^"]*PATH/.test(outA));
+
+  // (c) The settings document CAN still set PATH, and it beats the floor. This is the operator's
+  //     one supported remedy when the real harness needs a richer PATH than the floor, and it is
+  //     the same block the harness itself reads — so canary and hook stay the same object.
+  const wantPath = path.join(d, "config-chosen-bin");
+  const pathProbe = path.join(d, "p", "dcg-ctx-wrap");
+  mkdirSync(path.dirname(pathProbe), { recursive: true });
+  writeFileSync(pathProbe,
+    `#!${process.execPath}\n` +
+    `const ok = process.env.PATH === ${JSON.stringify(wantPath)};\n` +
+    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+    'permissionDecision:"deny",permissionDecisionReason: ok ? ' +
+    '"BLOCKED by dcg  Reason: git_reset_hard" : ' +
+    '"dcg-ctx-wrap: CONFIG PATH DID NOT WIN, saw " + process.env.PATH}}));\n');
+  chmodSync(pathProbe, 0o755);
+
+  const rC = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({
+      HOOK_SETTINGS: settings([staleEntry(pathProbe)], { PATH: wantPath }),
+      HOOK_SWEEP: sweep(0), CTX_WRAP: pathProbe,
+      PATH: `${hijackDir}${path.delimiter}${process.env.PATH || ""}`,
+    }),
+  });
+  const outC = (rC.stdout || "") + (rC.stderr || "");
+  check("T4c: the settings env block can still set PATH and beats the floor",
+    !/CONFIG PATH DID NOT WIN/.test(outC));
+  check("T4c: that run is green", rC.status === 0);
 }
 
 rmSync(tmp, { recursive: true, force: true });
