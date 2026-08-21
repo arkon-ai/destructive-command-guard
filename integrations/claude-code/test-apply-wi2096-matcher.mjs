@@ -62,9 +62,8 @@ function wrapper(kind) {
     // so a silent command must fail even though its exit status is perfect.
     silent: 'process.exit(0);',
   };
-  // The interpreter is named ABSOLUTELY, not via `/usr/bin/env`: the canary environment now
-  // carries a deterministic PATH floor, so a fixture that resolves its own interpreter through
-  // PATH would be testing the floor rather than the behaviour under test.
+  // The interpreter is named ABSOLUTELY, not via `/usr/bin/env`: a PATH-resolving shebang
+  // would be testing the settings document's PATH pin rather than the behaviour under test.
   writeFileSync(p, `#!${process.execPath}\n${bodies[kind]}\n`);
   chmodSync(p, 0o755);
   return p;
@@ -72,13 +71,26 @@ function wrapper(kind) {
 
 const SCANNER = wrapper("scanner");
 
-// `envBlock` is the settings document's own `env` — the block the harness delivers to every
-// hook it spawns, and therefore part of the environment the canaries have to reproduce. Omitted
-// by every fixture that predates T3, so the document is byte-identical to what it was.
+// The four names the applier refuses to certify without. Empty string is a declaration.
+// Tests that omit the env block entirely pass `null` as the second argument.
+function pins(extra) {
+  return {
+    PATH: process.platform === "win32"
+      ? `${process.env.SystemRoot || "C:\\Windows"}\\system32`
+      : "/usr/bin:/bin",
+    PYTHONPATH: "",
+    PYTHONHOME: "",
+    PYTHONSTARTUP: "",
+    ...extra,
+  };
+}
+
+// `envBlock` is merged ON TOP of the four pins (so a test can override PATH). Pass `null`
+// to omit the env block entirely — that is the fail-closed missing-pin case.
 function settings(entries, envBlock) {
   const p = path.join(tmp, `settings-${Math.random().toString(36).slice(2)}.json`);
   const doc = { hooks: { PreToolUse: entries } };
-  if (envBlock) doc.env = envBlock;
+  if (envBlock !== null) doc.env = pins(envBlock || {});
   writeFileSync(p, JSON.stringify(doc, null, 2) + "\n");
   return p;
 }
@@ -176,7 +188,7 @@ for (const [label, hooks] of [
   const m1 = /Rollback: cp (\S+)/.exec(r1.out);
   check("first run names a backup", !!m1);
   // Make it stale again so a second run also writes.
-  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] } }, null, 2) + "\n");
+  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] }, env: pins() }, null, 2) + "\n");
   const r2 = run(s, sweep(0));
   const m2 = /Rollback: cp (\S+)/.exec(r2.out);
   check("second run names a backup", !!m2);
@@ -410,7 +422,7 @@ for (const [label, hooks] of [
 if (process.platform !== "win32") {
   const dir = mkdtempSync(path.join(tmp, "excl-"));
   const s = path.join(dir, "settings.json");
-  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] } }, null, 2) + "\n");
+  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] }, env: pins() }, null, 2) + "\n");
   const secret = path.join(dir, "secret-target.txt");
   writeFileSync(secret, "ORIGINAL");
   // Learn where the pid counter actually is. Planting from `process.pid` was VACUOUS — by
@@ -449,7 +461,7 @@ if (process.platform !== "win32") {
 {
   const dir = mkdtempSync(path.join(tmp, "moved-"));
   const s = path.join(dir, "settings.json");
-  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] } }, null, 2) + "\n");
+  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] }, env: pins() }, null, 2) + "\n");
   const writer = path.join(tmp, `sweep-writer-${Math.random().toString(36).slice(2)}.mjs`);
   writeFileSync(writer,
     'import { readFileSync, writeFileSync } from "node:fs";\n' +
@@ -791,6 +803,13 @@ if (process.platform !== "win32") {
     outE.includes(`DCG_WRAP_BIN=${CONFIG_PICK}`));
   check("T3e: patch branch names the wrapper the ctx surface reaches", outE.includes(bin));
   check("T3e: patch branch scopes the claim", /nothing wider was checked/.test(outE));
+  check("T3e: patch branch names the four established env pins",
+    /PATH=/.test(outE) && /PYTHONPATH=/.test(outE) && /PYTHONHOME=/.test(outE) &&
+    /PYTHONSTARTUP=/.test(outE));
+  check("T3e: patch branch names native preload as not established",
+    /Not established: native preload/.test(outE));
+  check("T3e: patch branch does not claim this host was checked",
+    !/this host — nothing wider/.test(outE));
   check("T3e: patch branch does not make the flat claim", !/the control is live/.test(outE));
 
   // The `env` block must survive the publish. The applier re-serialises the whole document, so
@@ -806,6 +825,8 @@ if (process.platform !== "win32") {
   check("T3e: already-current branch names the resolved scanner it invoked",
     outE2.includes(`DCG_WRAP_BIN=${CONFIG_PICK}`));
   check("T3e: already-current branch scopes the claim", /nothing wider was checked/.test(outE2));
+  check("T3e: already-current branch names native preload as not established",
+    /Not established: native preload/.test(outE2));
   check("T3e: already-current branch does not make the flat claim",
     !/the control is live/.test(outE2));
 
@@ -908,7 +929,7 @@ if (process.platform !== "win32") {
     }),
   });
   const outC = (rC.stdout || "") + (rC.stderr || "");
-  check("T4c: the settings env block can still set PATH and beats the floor",
+  check("T4c: the settings env block's PATH is the PATH the canary uses",
     !/CONFIG PATH DID NOT WIN/.test(outC));
   check("T4c: that run is green", rC.status === 0);
 
@@ -952,14 +973,145 @@ if (process.platform !== "win32") {
     /CANARY FAILED/.test(outD));
   check("T4d: and settings.json was left untouched", /was NOT modified/.test(outD));
 
-  // R16 ON THE REFUSAL. The false-refusal direction is chosen deliberately, so a refusal that
-  // does not say how to fix it is a mystery outage for an operator who has not read our notes:
-  // the command works when they type it and fails here, which reads as a bug in this tool.
-  check("T4d: the refusal explains that the canary uses a launcher-shaped environment",
-    /launcher-shaped environment/.test(outD));
-  check("T4d: the refusal names the supported remedy — the settings env block",
-    /"env" block of the settings file/.test(outD));
-  check("T4d: the refusal shows the PATH it actually ran with", /PATH=/.test(outD));
+  // R16 ON THE REFUSAL. Document PATH is /usr/bin:/bin (the test default pin); the
+  // interpreter lives only on the operator PATH. A refusal that does not name the
+  // declared block is a mystery outage for an operator whose shell can run the command.
+  check("T4d: the refusal names the settings env block as what the canary ran on",
+    /env block of the settings file/.test(outD));
+  check("T4d: the refusal shows the declared PATH", /PATH=/.test(outD));
+  check("T4d: the refusal does not claim a launcher-shaped PATH floor",
+    !/launcher-shaped environment/.test(outD));
+}
+
+// ── T5 — FAIL-CLOSED: REFUSE WHEN THE DOCUMENT DOES NOT ESTABLISH THE HOOK ENV ──────────
+//
+// Establishing means the four names are keys in the settings env block, which the harness
+// overlays. Missing any of them, this tool must not invent a PATH floor (R10) and must not
+// inherit this process (R9). Each red case has a green negative control: the same fixture
+// with the missing names declared.
+{
+  const src = readFileSync(APPLY, "utf8");
+  check("T5: the false R10 failure-direction claim is gone from the applier",
+    !/THE FAILURE DIRECTION IS DELIBERATE/.test(src));
+  check("T5: the converse-is-impossible claim is gone from the applier",
+    !/converse arrangement/.test(src));
+  check("T5: PATH_FLOOR is not assigned into the canary env",
+    !/env\.PATH = PATH_FLOOR/.test(src));
+  check("T5: PATH_FLOOR is not defined", !/const PATH_FLOOR/.test(src));
+  check("T5: HOOK_ENV_PINS is exactly the four names the contract names",
+    /HOOK_ENV_PINS = \["PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"\]/.test(src));
+
+  // (a) No env block at all. The operator PATH would make a shebang wrapper runnable — that
+  //     is the R9 inheritance that printed green. Must REFUSE, not canary-fail, not green.
+  const opBin = mkdtempSync(path.join(tmp, "t5-opbin-"));
+  const interp = path.join(opBin, "dcgtestinterp");
+  writeFileSync(interp, `#!/bin/sh\nexec ${process.execPath} "$@"\n`);
+  chmodSync(interp, 0o755);
+  const interpWrap = path.join(mkdtempSync(path.join(tmp, "t5-iw-")), "dcg-ctx-wrap");
+  writeFileSync(interpWrap,
+    "#!/usr/bin/env dcgtestinterp\n" +
+    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+    'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+  chmodSync(interpWrap, 0o755);
+
+  const opEnv = (over) => {
+    const e = { ...process.env };
+    delete e.DCG_WRAP_BIN;
+    return { ...e, ...over };
+  };
+
+  const sA = settings([staleEntry(interpWrap)], null);
+  const beforeA = readFileSync(sA, "utf8");
+  const rA = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({
+      HOOK_SETTINGS: sA, HOOK_SWEEP: sweep(0), CTX_WRAP: interpWrap,
+      PATH: `${opBin}${path.delimiter}${process.env.PATH || ""}`,
+    }),
+  });
+  const outA = (rA.stdout || "") + (rA.stderr || "");
+  check("T5a: missing env block refuses to certify (does not inherit operator PATH)",
+    rA.status !== 0);
+  check("T5a: the refusal is REFUSING TO CERTIFY, not a canary failure under a substitute",
+    /REFUSING TO CERTIFY/.test(outA) && !/canary 3:/.test(outA));
+  check("T5a: it names PATH as undeclared", /does not declare PATH/.test(outA));
+  check("T5a: settings were not published", readFileSync(sA, "utf8") === beforeA);
+  check("T5a: the refusal names empty string as a valid declaration", /empty string counts/.test(outA));
+
+  // Negative control: declare PATH as the operator's interp dir (plus the other three).
+  // Same wrapper, same operator PATH — now green, because canary and hook agree on PATH.
+  const rAok = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({
+      HOOK_SETTINGS: settings([staleEntry(interpWrap)], { PATH: opBin }),
+      HOOK_SWEEP: sweep(0), CTX_WRAP: interpWrap,
+      PATH: `${opBin}${path.delimiter}${process.env.PATH || ""}`,
+    }),
+  });
+  const outAok = (rAok.stdout || "") + (rAok.stderr || "");
+  check("T5a-neg: declaring PATH that contains the interpreter goes green", rAok.status === 0);
+  check("T5a-neg: that green names the declared PATH", outAok.includes(`PATH=${opBin}`));
+}
+
+{
+  // One pin missing at a time. A PATH-only check would green PYTHONPATH/HOME/STARTUP gaps;
+  // R9 measured sitecustomize on a clean PATH as a working lever.
+  for (const drop of ["PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"]) {
+    const env = pins();
+    delete env[drop];
+    const sB = path.join(tmp, `t5b-${drop}-${Math.random().toString(36).slice(2)}.json`);
+    writeFileSync(sB, JSON.stringify({
+      hooks: { PreToolUse: [staleEntry(SCANNER)] },
+      env,
+    }, null, 2) + "\n");
+    const beforeB = readFileSync(sB, "utf8");
+    const rB = run(sB, sweep(0));
+    check(`T5b: ${drop} missing refuses to certify`, rB.status !== 0);
+    check(`T5b: ${drop} missing names ${drop} and not a false PATH gap`,
+      rB.out.includes(`does not declare ${drop}`) && !/does not declare PATH,/.test(rB.out));
+    check(`T5b: ${drop} missing does not publish`, readFileSync(sB, "utf8") === beforeB);
+  }
+  const rBok = run(settings([staleEntry(SCANNER)], { PYTHONPATH: "", PYTHONHOME: "", PYTHONSTARTUP: "" }), sweep(0));
+  check("T5b-neg: declaring the three python pins empty goes green", rBok.status === 0);
+}
+
+{
+  // (c) Two different wrapper binaries, both routing. Round 10 T2: canary 3 exercised the
+  //     first, publish widened the second. Both array orders must refuse. Negative: the
+  //     same path twice (one LOOSE, one stale) still publishes.
+  const aDir = mkdtempSync(path.join(tmp, "t5c-a-"));
+  const bDir = mkdtempSync(path.join(tmp, "t5c-b-"));
+  const binA = path.join(aDir, "dcg-ctx-wrap");
+  const binB = path.join(bDir, "dcg-ctx-wrap");
+  copyFileSync(SCANNER, binA); chmodSync(binA, 0o755);
+  copyFileSync(SCANNER, binB); chmodSync(binB, 0o755);
+
+  const two = (first, second) => settings([
+    { matcher: LOOSE, hooks: hookFor(first) },
+    { matcher: "mcp__context-mode__ctx_execute", hooks: hookFor(second) },
+  ]);
+
+  const rAB = run(two(binA, binB), sweep(0), [], binA);
+  const rBA = run(two(binB, binA), sweep(0), [], binB);
+  check("T5c: two different wrapper paths refuse (A then B)", rAB.status !== 0);
+  check("T5c: two different wrapper paths refuse (B then A) — order is not the finding",
+    rBA.status !== 0);
+  check("T5c: the refusal names both binaries",
+    rAB.out.includes(binA) && rAB.out.includes(binB));
+  check("T5c: the refusal says the canary and the publish would be different objects",
+    /same object/.test(rAB.out) || /different/.test(rAB.out));
+  const beforeBA = two(binB, binA);
+  const bytes = readFileSync(beforeBA, "utf8");
+  const rBAagain = run(beforeBA, sweep(0), [], binB);
+  check("T5c: settings were not published over two wrappers",
+    readFileSync(beforeBA, "utf8") === bytes && rBAagain.status !== 0);
+
+  const rSame = run(settings([
+    { matcher: LOOSE, hooks: hookFor(SCANNER) },
+    { matcher: "mcp__context-mode__ctx_execute", hooks: hookFor(SCANNER) },
+  ]), sweep(0));
+  check("T5c-neg: two entries pointing at the SAME wrapper still publish", rSame.status === 0);
+  check("T5c-neg: the stale one was rewritten", /canaries green/.test(rSame.out));
 }
 
 rmSync(tmp, { recursive: true, force: true });

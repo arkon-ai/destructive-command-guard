@@ -124,6 +124,12 @@ node apply-wi2096-matcher.mjs --dry-run   # show the change, touch nothing
 node apply-wi2096-matcher.mjs             # candidate → canary ×3 → backup → publish
 ```
 
+The applier will **refuse to certify** unless the settings document's `env` block
+declares `PATH`, `PYTHONPATH`, `PYTHONHOME` and `PYTHONSTARTUP` (empty string
+counts). It does not invent a PATH floor and does not inherit the calling
+shell. A green line names those four values and states that native preload
+(`LD_PRELOAD` and friends) was not established.
+
 | canary | asserts |
 |---|---|
 | 1 | the matcher **on disk** matches every live ctx tool name (read back, not asserted against this script's own constants) |

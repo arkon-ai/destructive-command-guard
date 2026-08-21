@@ -278,6 +278,26 @@ if (hollow.length > 0) {
 const LIVE_COMMAND = ctxEntries.map(entryCommand).find(Boolean) || "";
 const LIVE_WRAPPER = LIVE_COMMAND ? soleArgv0(LIVE_COMMAND) : "";
 
+// routesToWrapper is a basename check, so two entries can both pass it while naming two
+// different binaries. LIVE_COMMAND took the first; `targets` took every non-LOOSE routing
+// entry. Canary 3 then exercised one object and a publish widened another. The check at
+// canary 3 that "only 0 and 2 are honoured" already catches a dead binary — it just never
+// ran against the object being modified. Forcing the routing set to a single command makes
+// that check apply to every entry a publish would touch, without a second mechanism.
+const routingCommands = ctxEntries.map(entryCommand).filter(Boolean);
+const uniqueRouting = [...new Set(routingCommands)];
+if (uniqueRouting.length > 1) {
+  console.error(
+    `context-mode entries in ${SETTINGS} route to ${uniqueRouting.length} different ` +
+    `'${wrapperName}' binaries:\n` +
+    uniqueRouting.map((c) => `  ${c}`).join("\n") + "\n" +
+    "Canary 3 exercises one hook command; a publish rewrites every non-LOOSE routing entry.\n" +
+    "Those have to be the same object, or a green certificate names one binary and widens another.\n" +
+    "Point every routing entry at the same absolute path, then re-run."
+  );
+  process.exit(1);
+}
+
 if (ctxEntries.length > 0 && !LIVE_COMMAND) {
   console.error(
     `context-mode matcher(s) exist in ${SETTINGS} but NONE execs '${wrapperName}'.\n` +
@@ -347,70 +367,41 @@ const canaryMatcher = (settingsPath, fail) => {
 
 // ── THE CANARY ENVIRONMENT ───────────────────────────────────────────────────────────────
 //
-// WHAT SELECTS THE SCANNER IS NOT ONE VARIABLE. `dcg-ctx-wrap` resolves its scanner as
-// `os.environ.get("DCG_WRAP_BIN", ~/.local/bin/dcg-wrap)` — but it is itself
-// `#!/usr/bin/env python3`, and canary 3 runs the hook command THROUGH A SHELL. So `PATH`
-// chooses the interpreter that runs the adapter, and `PYTHONPATH` chooses what that
-// interpreter imports before the adapter's first line. Three different holders can decide
-// what actually scans, and they are NOT the same thing:
+// CONTRACT (fail-closed). The harness composes `{...ambient, ...settingsEnv}` — measured,
+// with a negative control, against Claude Code 2.1.238 (probe below). This process's
+// environment is not ambient. A desktop entry, a systemd unit and cron each supply a
+// different one, and this tool cannot observe any of them. Round 9 inherited this process
+// and printed green over a dark control. Round 10 invented PATH=/usr/bin:/bin and printed
+// green the other way. Substituting an environment is the class. This tool refuses instead.
 //
-//   THE OPERATOR'S SHELL — must NOT reach the canary. Claude Code launches from a desktop
-//   entry, a systemd unit or cron, where a variable exported in someone's terminal does not
-//   exist. Measured in both directions on a host with no `~/.local/bin/dcg-wrap`: with a deny
-//   stub in `DCG_WRAP_BIN` the applier published green at rc 0, and the same hook command with
-//   the variable unset then DENIED every guarded ctx call — a total outage certified as "the
-//   control is live". Converse and worse: if the real scanner is a stub or a silent `true`,
-//   production ALLOWS everything while the canary was green off the env binary.
-//   The same divergence rides EVERY interpreter selector, not just that one name. Measured
-//   with no adversary at all: with `python3` present only in the operator's shell, this applier
-//   published GREEN, while the identical hook command on a launcher-shaped `PATH` exited 127
-//   with EMPTY STDOUT — the host receives no decision and the guarded call proceeds. A green
-//   certificate over a control that is completely dark in production.
+// Establishing the environment means: PATH, PYTHONPATH, PYTHONHOME and PYTHONSTARTUP are
+// keys in the settings document's `env` block. Empty string is a declaration (it dominates
+// ambient with empty). A missing key is not. The canary uses those declared values and
+// nothing it invented; the harness overlays the same block; the four names therefore agree.
 //
-//   THE `env` BLOCK OF THE SETTINGS DOCUMENT — must reach the canary, because the harness
-//   delivers that block to every hook it spawns. Stripping it unconditionally, as an earlier
-//   version of this function did, reproduces the very same divergence with the sign flipped:
-//   point `DCG_WRAP_BIN` at a silent `exit 0` stub VIA THE CONFIG and the live hook uses the
-//   stub while the canary certifies a different scanner entirely. Measured: green tick, dark
-//   control. A green certificate over a binary the harness never runs.
+// When any of the four is missing, this tool REFUSES TO CERTIFY. It does not invent a PATH
+// floor, it does not inherit this process's selectors, and it does not run a canary under a
+// substitute and then print a narrower claim. settings.json is not touched.
 //
-// So the rule is: the canary's BASE environment is an ALLOWLIST — only the names in
-// CANARY_ENV_KEEP below survive from this process, plus a deterministic `PATH` floor — and the
-// settings document's `env` block is then applied ON TOP of it. That is the exact domain: not
-// "the shell is out" in general, but "only these names survive, and config overrides them".
+// CLOSED: those four names, for this settings document. A bare DCG_WRAP_BIN is resolved
+// against the declared PATH, so canary and hook agree on it too.
+// NOT CLOSED, and a green line that omits this list is a lie: native preload (LD_PRELOAD,
+// LD_LIBRARY_PATH, DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH); any env name not in the four;
+// other settings scopes (enterprise, project, --settings); HOME, used only for the wrapper's
+// default scanner path when DCG_WRAP_BIN is unset.
 //
-// AN ALLOWLIST, NOT A LIST OF INTERPRETER SELECTORS TO STRIP — for the same reason
-// SHELL_LITERAL above is a whitelist. The set of variables that can steer an interpreter or a
-// loader is open-ended: PATH, PYTHONPATH, PYTHONHOME, PYTHONSTARTUP, PYTHONEXECUTABLE,
-// LD_PRELOAD, LD_LIBRARY_PATH, DYLD_INSERT_LIBRARIES, BASH_ENV, ENV, IFS, NODE_OPTIONS, and
-// whatever the next interpreter adds. Every previous remedy in this file was beaten by a shape
-// nobody had enumerated, and a strip-list cannot be shown complete. An allowlist can be read
-// in one glance, and a selector nobody has thought of is excluded by DEFAULT rather than by
-// having been predicted.
+// THE COMPOSITION WAS MEASURED AGAINST THE HARNESS, NOT ASSUMED. A PreToolUse hook, the same
+// event this control is, was spawned by Claude Code 2.1.238 with a probe variable set to one
+// sentinel in the launching shell and a DIFFERENT sentinel in the settings `env` block. The
+// hook observed the CONFIG sentinel. A variable present only in the shell still arrived, and
+// one present only in the config also arrived. With the `env` block removed and nothing else
+// changed, the same hook observed the SHELL sentinel — the negative control. Values are
+// coerced by plain string conversion (`42`, `true`, `null`, `x,y`, `[object Object]`) —
+// `String(v)` reproduces all five.
 //
-// THE FAILURE DIRECTION IS DELIBERATE. If the real harness carries a richer `PATH` than the
-// floor, this canary goes RED on a host where production works — loud, and fixable in one
-// place: put `PATH` in settings.json's `env` block, which the harness and this canary BOTH
-// read. The converse arrangement, inheriting the operator's `PATH`, fails GREEN over a dark
-// control, which is the defect this replaces.
-//
-// THE COMPOSITION BELOW WAS MEASURED AGAINST THE HARNESS, NOT ASSUMED — assuming it is the
-// exact class this file keeps repairing. A `PreToolUse` hook, the same event this control is,
-// was spawned by Claude Code 2.1.238 with a probe variable set to one sentinel in the launching
-// shell and a DIFFERENT sentinel in the settings `env` block. The hook observed the CONFIG
-// sentinel. A variable present only in the shell still arrived, and one present only in the
-// config also arrived. With the `env` block removed and nothing else changed, the same hook
-// observed the SHELL sentinel — the negative control, without which the probe proves nothing.
-// So the harness composes `{...ambient, ...settingsEnv}`: ambient is the base, the config block
-// overrides it. Values are coerced by plain string conversion, measured across number, boolean,
-// null, array and object (`42`, `true`, `null`, `x,y`, `[object Object]`) — `String(v)`
-// reproduces all five, and filtering any of them out would be a divergence of its own.
-//
-// BOUNDARY, stated exactly because the next reader will otherwise assume more: this honours the
-// `env` block of THE SETTINGS DOCUMENT UNDER TEST — the candidate on the patch path, the live
-// file on the already-current path. Other scopes the harness may additionally merge (enterprise,
-// project, `--settings`) are NOT read here, and an `env` that is not a JSON object is treated as
-// absent. Nothing here closes those.
+// BOUNDARY: this honours the `env` block of THE SETTINGS DOCUMENT UNDER TEST — the candidate
+// on the patch path, the live file on the already-current path. An `env` that is not a JSON
+// object is treated as absent, which fails the pin check rather than being filled in.
 const configEnv = (settingsPath, fail) => {
   let block;
   try {
@@ -445,23 +436,47 @@ const CANARY_ENV_KEEP = new Set([
   "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR", "SYSTEMDRIVE",
 ]);
 
-// A deterministic floor, not the operator's. This is what a desktop entry, a systemd unit or
-// cron actually hands a hook, which is the environment the canary is trying to be honest about.
-const PATH_FLOOR = process.platform === "win32"
-  ? [
-      `${process.env.SystemRoot || "C:\\Windows"}\\system32`,
-      `${process.env.SystemRoot || "C:\\Windows"}`,
-      `${process.env.SystemRoot || "C:\\Windows"}\\system32\\Wbem`,
-    ].join(";")
-  : "/usr/bin:/bin";
+// The four names the shipped adapter's process-start consults that ambient can set, and that
+// the settings overlay can dominate. Not a claim that the selector set is closed — the green
+// line names what is not established. A fifth name is a new pin, not a silent expansion of
+// the certificate.
+const HOOK_ENV_PINS = ["PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"];
+
+// Recorded at the moment of use, quoted by the success line and by refusals. Recomputing
+// it for the message would let the message and the run drift apart.
+let declaredEnv = {};
+
+const missingPins = (declared) =>
+  HOOK_ENV_PINS.filter((k) => !Object.prototype.hasOwnProperty.call(declared, k));
+
+const pinLines = (declared, missing) =>
+  HOOK_ENV_PINS.map((k) => {
+    if (missing.includes(k)) return `  ${k}  NOT DECLARED`;
+    return `  ${k}=${declared[k]}`;
+  }).join("\n");
+
+const refuseUnestablished = (_settingsPath, missing) =>
+  `REFUSING TO CERTIFY — ${SETTINGS} env block does not declare ${missing.join(", ")}.\n` +
+  "dcg-ctx-wrap is #!/usr/bin/env python3, so PATH selects the interpreter and PYTHONPATH /\n" +
+  "PYTHONHOME / PYTHONSTARTUP select what that interpreter imports before the adapter's first\n" +
+  "line. This tool cannot observe the harness's ambient environment (a desktop entry, a\n" +
+  "systemd unit or cron — not this process). Inventing PATH=/usr/bin:/bin printed green over\n" +
+  "a dark control (WI-2096 R10). Inheriting this process printed green the other way (R9).\n" +
+  "Declared:\n" + pinLines(declaredEnv, missing) + "\n" +
+  "Add the missing names to the env block of the settings file (empty string counts — it\n" +
+  "dominates ambient). The harness overlays that block onto every hook, so canary and hook\n" +
+  "then read the same four names. Re-run after that. " + SETTINGS + " was NOT modified.";
 
 const canaryEnv = (settingsPath, fail, extra) => {
+  const declared = configEnv(settingsPath, fail);
+  declaredEnv = declared;
+  const missing = missingPins(declared);
+  if (missing.length) fail(refuseUnestablished(settingsPath, missing));
   const env = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (CANARY_ENV_KEEP.has(k)) env[k] = v;
   }
-  env.PATH = PATH_FLOOR;                               // the operator's PATH does not choose
-  Object.assign(env, configEnv(settingsPath, fail));   // the settings document does
+  Object.assign(env, declared);   // the settings document — including PATH. No floor.
   // This applier's own pins go LAST so the document under test cannot redirect the canary that
   // is judging it — the sweep must run against LIVE_WRAPPER and the file under test whatever
   // the `env` block says.
@@ -512,20 +527,16 @@ const canarySweep = (settingsPath, fail) => {
 };
 
 // R16 applies to a REFUSAL as much as to a success line: it is an operator-facing claim, and
-// one that does not say how to fix it is a mystery outage. This canary DELIBERATELY runs on a
-// launcher-shaped environment rather than the operator's, so the commonest TRUE refusal here is
-// "the interpreter is on your PATH but not on the harness's" — the command works when you type
-// it and fails here, which looks like a bug in this tool unless the message says otherwise.
-// The remedy is one line of config, and it is the SAME block the harness reads, so naming it
-// keeps the canary and the hook the same object rather than sending the operator somewhere else.
-const ENV_REMEDY =
+// one that does not say how to fix it is a mystery outage. The canary runs on the declared
+// env block, so the commonest TRUE refusal here is "the interpreter is on your shell PATH
+// but not on the PATH you declared" — the command works when you type it and fails here.
+// Naming the declared block keeps the canary and the hook the same object.
+const ENV_REMEDY = () =>
   "\n\nIf that command works when you run it by hand, that difference IS the finding, not a bug\n" +
-  "in this check. The canaries run on a launcher-shaped environment —\n" +
-  `  PATH=${PATH_FLOOR}\n` +
-  "— because that is what a desktop entry, a systemd unit or cron actually hands a hook, and\n" +
-  "your shell's PATH is not available there. If the hook genuinely needs more than that, declare\n" +
-  'it in the "env" block of the settings file (for example "PATH"), which the harness delivers to\n' +
-  "every hook it spawns and which these canaries honour — so both end up reading the same thing.";
+  "in this check. The canaries run on the env block of the settings file — the same block the\n" +
+  "harness overlays onto every hook — not on this process and not on an invented PATH floor.\n" +
+  "Declared:\n" + pinLines(declaredEnv, []) + "\n" +
+  "Change that block, then re-run.";
 
 // 3. Prove the SCANNER produced the denial, not the adapter.
 //
@@ -569,7 +580,7 @@ const canaryScanner = (settingsPath, fail) => {
     fail(
       `CANARY FAILED — cannot run the hook command (${r.error.message}):\n  ${LIVE_COMMAND}\n` +
       "That is the command string read out of the settings file, run the way the harness runs\n" +
-      "it — so the control this file describes does not work on this host." + ENV_REMEDY
+      "it — so the control this file describes does not work on this host." + ENV_REMEDY()
     );
   }
   // A denial the host would discard is not a denial. The host treats 2 as blocking and every
@@ -581,7 +592,7 @@ const canaryScanner = (settingsPath, fail) => {
     fail(
       `CANARY FAILED — the hook command exited ${r.status === null ? `on ${r.signal}` : r.status},\n` +
       "which the host reads as NON-blocking: the tool would proceed despite the denial.\n" +
-      `Only 0 and 2 are honoured.\n  ${LIVE_COMMAND}` + ENV_REMEDY
+      `Only 0 and 2 are honoured.\n  ${LIVE_COMMAND}` + ENV_REMEDY()
     );
   }
   let out;
@@ -592,7 +603,7 @@ const canaryScanner = (settingsPath, fail) => {
       "CANARY FAILED — no decision ARRIVED for a known-dangerous fixture. The hook command\n" +
       `produced ${r.stdout ? "unparseable output" : "NOTHING ON STDOUT"}:\n  ${LIVE_COMMAND}\n` +
       "The wrapper may well be denying; what matters is that the harness never receives it." +
-      ENV_REMEDY
+      ENV_REMEDY()
     );
   }
   const hso = (out && out.hookSpecificOutput) || {};
@@ -617,22 +628,45 @@ const canaryScanner = (settingsPath, fail) => {
 };
 
 const verify = (settingsPath, fail) => {
+  // Pin check FIRST, so a missing declaration never prints a canary-1 green and then refuses.
+  // canaryEnv repeats it so a future caller that skips verify still cannot spawn a substitute.
+  const declared = configEnv(settingsPath, fail);
+  declaredEnv = declared;
+  const missing = missingPins(declared);
+  if (missing.length) fail(refuseUnestablished(settingsPath, missing));
   canaryMatcher(settingsPath, fail);
   canarySweep(settingsPath, fail);
   canaryScanner(settingsPath, fail);
 };
 
 // R16 — a success line may claim only what the canaries actually earned. Earned: for THIS
-// settings document on THIS host, the ctx exec matcher matches the live tool names, the sweep
-// is green, and the hook command — run through a shell exactly as the harness runs it —
-// delivered a scanner-sourced DENY for ONE known-dangerous fixture, off the scanner named here.
-// NOT earned, and so not claimed: that this machine is protected, that any other tool surface
-// is guarded, or that any other settings scope agrees. Naming the scanner is the load-bearing
-// half — it is what makes a stub visible to the operator reading this line instead of silent.
+// settings document, the ctx exec matcher matches the live tool names, the sweep is green,
+// the hook command — run through a shell exactly as the harness runs it — delivered a
+// scanner-sourced DENY for ONE known-dangerous fixture, off the scanner named here, under
+// the four env names declared in that document. NOT earned, and so not claimed: that this
+// machine is protected, that ambient native preload agrees, that any other env name agrees,
+// that any other tool surface is guarded, or that any other settings scope agrees.
 const greenLine = () =>
   `ctx exec calls in ${SETTINGS} reach ${LIVE_WRAPPER}, and one known-dangerous fixture was ` +
   `denied by the scanner behind it (${scannerUsed}).\n` +
-  "That surface, that fixture, this host — nothing wider was checked.";
+  `The canary used the env block of that file:\n${pinLines(declaredEnv, [])}\n` +
+  "The harness overlays the same block, so those four names agree.\n" +
+  "Not established: native preload (LD_PRELOAD, LD_LIBRARY_PATH, DYLD_*), any other env name, " +
+  "other settings scopes (enterprise, project, --settings).\n" +
+  "That surface, that fixture, those four names — nothing wider was checked.";
+
+// Pin check at the door, not after printing a rewrite plan. The candidate's env block is
+// this file's env block (this tool does not rewrite env). verify() reads the file it is
+// handed again so a future split of those two objects cannot skip this.
+{
+  const declared = configEnv(SETTINGS, (why) => { console.error(why); process.exit(1); });
+  declaredEnv = declared;
+  const missing = missingPins(declared);
+  if (missing.length) {
+    console.error(refuseUnestablished(SETTINGS, missing));
+    process.exit(1);
+  }
+}
 
 if (targets.length === 0) {
   // "Nothing to patch" is NOT "verified working". The matcher may name a wrapper that is
