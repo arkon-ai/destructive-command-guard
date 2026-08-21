@@ -512,8 +512,25 @@ const canaryEnv = (settingsPath, fail, extra) => {
   // This applier's own pins go LAST so the document under test cannot redirect the canary that
   // is judging it — the sweep must run against LIVE_WRAPPER and the file under test whatever
   // the `env` block says.
-  return { ...env, ...extra };
+  const out = { ...env, ...extra };
+  // Node-runtime / native-loader keys from the document must not reach ANY child this
+  // certifier spawns. Canary 2 is process.execPath. Test fixtures are Node shebang
+  // wrappers. A `--require` in declared NODE_OPTIONS would otherwise execute in the
+  // certifier, which production's Python wrapper never starts.
+  for (const k of [
+    "NODE_OPTIONS", "NODE_PATH", "NODE_REPL_EXTERNAL_MODULE",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+  ]) {
+    delete out[k];
+  }
+  return out;
 };
+
+const sweepEnv = (settingsPath, fail) => canaryEnv(settingsPath, fail, {
+  HOOK_SETTINGS: settingsPath,
+  DCG_CTX_WRAP: LIVE_WRAPPER,
+  CTX_WRAP: LIVE_WRAPPER,
+});
 
 // What the canary environment SELECTED as the scanner, named exactly. When `DCG_WRAP_BIN` is
 // set this IS the literal path `dcg-ctx-wrap` will exec; when it is not, the only true
@@ -550,12 +567,9 @@ const canarySweep = (settingsPath, fail) => {
     // dropped. The first is measured, the second is ours.
     //
     // LIVE_WRAPPER, not WRAPPER, is still the right VALUE: the binary the hook in this
-    // settings file execs.
-    env: canaryEnv(settingsPath, fail, {
-      HOOK_SETTINGS: settingsPath,
-      DCG_CTX_WRAP: LIVE_WRAPPER,
-      CTX_WRAP: LIVE_WRAPPER,
-    }),
+    // settings file execs. Node-runtime selectors from the document are stripped in
+    // sweepEnv — they must not reach process.execPath.
+    env: sweepEnv(settingsPath, fail),
   });
   process.stdout.write(r.stdout || "");
   // Diagnostics conventionally go to stderr. Swallowing it left the operator with

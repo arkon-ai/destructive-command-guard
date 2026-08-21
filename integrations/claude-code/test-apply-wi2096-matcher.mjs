@@ -1203,6 +1203,20 @@ if (process.platform !== "win32") {
     rWrong.status !== 0);
 }
 
+// B1 (round after 954912c) — declared NODE_OPTIONS must not reach the Node sweep child.
+{
+  const d = mkdtempSync(path.join(tmp, "nodeopt-"));
+  const marker = path.join(d, "PWNED");
+  const pwn = path.join(d, "pwn.js");
+  writeFileSync(pwn, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "pwned");\n`);
+  const r = run(settings([staleEntry()], {
+    NODE_OPTIONS: `--require ${pwn}`,
+  }), sweep(0));
+  check("B1-node: declared NODE_OPTIONS --require does not run in the sweep",
+    !existsSync(marker));
+  check("B1-node: that run can still go green off a stub sweep", r.status === 0);
+}
+
 // ── T7 — THE APPLIER'S SWEEP PIN IS DCG_CTX_WRAP ─────────────────────────────────────────
 //
 // Hermetic half always runs: a stub sweep that reads DCG_CTX_WRAP (the name the real
