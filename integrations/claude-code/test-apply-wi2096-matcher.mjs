@@ -1114,6 +1114,108 @@ if (process.platform !== "win32") {
   check("T5c-neg: the stale one was rewritten", /canaries green/.test(rSame.out));
 }
 
+// ── T7 — DRIVE THE REAL COVERAGE SWEEP, NOT A STUB ──────────────────────────────────────
+//
+// Every other case points HOOK_SWEEP at a stub whose exit status we choose. That is right
+// for testing how the applier HANDLES a sweep result, and it is why a defect in the
+// applier's CONTRACT WITH the sweep survived: the applier exported CTX_WRAP while
+// audit-hook-matchers.mjs reads process.env.DCG_CTX_WRAP, so canary 2 swept the sweep's
+// own default binary. A stub reads neither name and cannot show that.
+//
+// Pointed at explicitly rather than found by the applier's default. That default is
+// path.join(homedir(), "dev/warden-memory/scripts/audit-hook-matchers.mjs"), which does
+// not resolve under WSL (os.homedir() is not /mnt/c/Users/brynn). The SCRIPT is still
+// the real one. If it is absent this case FAILS, it does not skip quietly.
+{
+  const src = readFileSync(APPLY, "utf8");
+  check("T7: the false CTX_WRAP-is-what-the-sweep-reads claim is gone",
+    !/not the one CTX_WRAP happens to name/.test(src));
+  const anchor = "DCG_CTX_WRAP: LIVE_WRAPPER";
+  const hits = src.split(anchor).length - 1;
+  check("T7: DCG_CTX_WRAP pin is present exactly once", hits === 1);
+  const anchored = src.split("\n").find((l) => l.includes(anchor)) || "";
+  console.log(`T7 mutant-anchor hit=${hits} line=${anchored.trim()}`);
+
+  const candidates = [
+    path.join(process.env.HOME || process.env.USERPROFILE || "",
+      "dev/warden-memory/scripts/audit-hook-matchers.mjs"),
+    "/mnt/c/Users/brynn/dev/warden-memory/scripts/audit-hook-matchers.mjs",
+    "C:/Users/brynn/dev/warden-memory/scripts/audit-hook-matchers.mjs",
+  ];
+  const realSweep = candidates.find((p) => p && existsSync(p));
+
+  if (!realSweep) {
+    console.log(
+      "T7: real coverage sweep was not found. Looked in:\n  " +
+      candidates.filter(Boolean).join("\n  "));
+    failures.push("T7 — real sweep absent, applier/sweep contract unverified here");
+  } else {
+    const writeEntry = () => ({
+      matcher: "Write|Edit|MultiEdit",
+      hooks: [{ type: "command", command: "dcg-wrap" }],
+    });
+    const d = mkdtempSync(path.join(tmp, "t7-"));
+    const marker = path.join(d, "wrapper-ran");
+    const rec = path.join(mkdtempSync(path.join(tmp, "t7-rec-")), "dcg-ctx-wrap");
+    writeFileSync(rec,
+      `#!${process.execPath}\n` +
+      `require("node:fs").appendFileSync(${JSON.stringify(marker)}, "ran\\n");\n` +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+    chmodSync(rec, 0o755);
+
+    const r = run(settings([bashEntry(), writeEntry(), staleEntry(rec)]), realSweep, [], rec);
+    check("T7: the applier's wrapper pin REACHES the real coverage sweep",
+      existsSync(marker));
+    check("T7: a complete fixture plus the real sweep can go green",
+      r.status === 0);
+
+    // NEGATIVE CONTROL, driving the real script directly: CTX_WRAP alone must not
+    // reach this binary. If this ever passes, the sweep has changed which name it
+    // reads and the contract needs re-measuring.
+    const marker2 = path.join(d, "oldname-ran");
+    const rec2 = path.join(mkdtempSync(path.join(tmp, "t7-rec2-")), "dcg-ctx-wrap");
+    writeFileSync(rec2,
+      `#!${process.execPath}\n` +
+      `require("node:fs").appendFileSync(${JSON.stringify(marker2)}, "ran\\n");\n` +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: x"}}));\n');
+    chmodSync(rec2, 0o755);
+    const envOld = { ...process.env, HOOK_SETTINGS: settings([staleEntry(rec2)]), CTX_WRAP: rec2 };
+    delete envOld.DCG_CTX_WRAP;
+    spawnSync(process.execPath, [realSweep], { encoding: "utf8", timeout: 120000, env: envOld });
+    check("T7: CTX_WRAP alone does NOT reach the real sweep (the defect, pinned)",
+      !existsSync(marker2));
+
+    // R17: a mutant that reverts the name fix is killed by the real-sweep assertion.
+    if (hits === 1) {
+      const mutantPath = path.join(d, "apply-mutant.mjs");
+      writeFileSync(mutantPath, src.replace(anchor, "CTX_WRAP_NOT_READ: LIVE_WRAPPER"));
+      const markerM = path.join(d, "mutant-ran");
+      const recM = path.join(mkdtempSync(path.join(tmp, "t7-mut-")), "dcg-ctx-wrap");
+      writeFileSync(recM,
+        `#!${process.execPath}\n` +
+        `require("node:fs").appendFileSync(${JSON.stringify(markerM)}, "ran\\n");\n` +
+        'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+        'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+      chmodSync(recM, 0o755);
+      const sM = settings([bashEntry(), writeEntry(), staleEntry(recM)]);
+      spawnSync(process.execPath, [mutantPath], {
+        encoding: "utf8",
+        timeout: 120000,
+        env: {
+          ...process.env,
+          HOOK_SETTINGS: sM,
+          HOOK_SWEEP: realSweep,
+          CTX_WRAP: recM,
+        },
+      });
+      check("T7: reverting DCG_CTX_WRAP to a name the sweep does not read is killed",
+        !existsSync(markerM));
+    }
+  }
+}
+
 rmSync(tmp, { recursive: true, force: true });
 
 if (failures.length) {

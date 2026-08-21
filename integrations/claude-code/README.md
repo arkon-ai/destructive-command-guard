@@ -160,8 +160,11 @@ matcher text, and the matcher text is not the control.
 |---|---|---|
 | `HOOK_SETTINGS` | `~/.claude/settings.json` | canonical hook config to patch |
 | `HOOK_SWEEP` | `~/dev/warden-memory/scripts/audit-hook-matchers.mjs` | coverage sweep |
-| `CTX_WRAP` | `~/.local/bin/dcg-ctx-wrap` | wrapper the canaries exercise |
+| `CTX_WRAP` | `~/.local/bin/dcg-ctx-wrap` | wrapper basename the routing check uses |
 | `HOOK_SWEEP_TIMEOUT_MS` | `120000` | ceiling on a hung sweep |
+
+The sweep script reads `DCG_CTX_WRAP`, not `CTX_WRAP`. The applier sets both to the
+wrapper path from the settings document when it spawns the sweep.
 
 ### Coverage sweep
 
