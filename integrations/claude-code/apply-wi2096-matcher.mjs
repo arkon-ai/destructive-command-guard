@@ -167,9 +167,20 @@ const runs = (e) => Array.isArray(e.hooks) && e.hooks.some(isCommandHook);
 // beaten by a shape nobody had enumerated; a whitelist cannot be outflanked by a character no
 // one thought of, which is the only property that makes this different from its predecessors.
 //
-// The tilde expansion is kept, and it is also the artifact's own admission that a shell is
-// involved: nothing but a shell expands `~`.
+// A leading `~/` is expanded by the shell under HOME. Module-load os.homedir() is not that
+// HOME: the harness overlays the settings `env` block, which may set HOME to something else.
+// Expanding with os.homedir() for identity while canary 3 / the harness expand under the
+// overlay is two inodes for one command. So `~/` is accepted only when HOME (or USERPROFILE)
+// is a key in this document's env block — the same establishment rule as PATH — and identity
+// uses that declared value. Otherwise the token is refused: use an absolute path.
 const SHELL_LITERAL = /^[A-Za-z0-9_@%+=:,.\/-]+$/;
+const declaredHome = () => {
+  const block = cfg && cfg.env;
+  if (!block || typeof block !== "object" || Array.isArray(block)) return "";
+  if (Object.prototype.hasOwnProperty.call(block, "HOME")) return String(block.HOME);
+  if (Object.prototype.hasOwnProperty.call(block, "USERPROFILE")) return String(block.USERPROFILE);
+  return "";
+};
 const soleArgv0 = (command) => {
   const m = String(command).trim().match(/^"([^"]+)"$|^'([^']+)'$|^(\S+)$/);
   const tok = m ? (m[1] || m[2] || m[3] || "") : "";
@@ -179,7 +190,12 @@ const soleArgv0 = (command) => {
   // tested on its CONTENTS: inside double quotes `$` and a backtick are still live, and
   // treating single quotes as safe would mean two rules where one fails closed.
   if (!SHELL_LITERAL.test(tok.startsWith("~/") ? tok.slice(2) : tok)) return "";
-  return tok.startsWith("~/") ? path.join(HOME, tok.slice(2)) : tok;
+  if (tok.startsWith("~/")) {
+    const h = declaredHome();
+    if (!h) return "";
+    return path.join(h, tok.slice(2));
+  }
+  return tok;
 };
 
 // ── THE ONE PREDICATE ────────────────────────────────────────────────────────────────────
@@ -213,8 +229,9 @@ const hookCommand = (h) => {
   if (!path.isAbsolute(bin)) return "";
   return String(h.command).trim();
 };
-const entryCommand = (e) =>
-  (Array.isArray(e.hooks) ? e.hooks : []).map(hookCommand).find(Boolean) || "";
+const commandHooksOf = (e) => (Array.isArray(e.hooks) ? e.hooks : []).filter(isCommandHook);
+const entryRoutingCommands = (e) => commandHooksOf(e).map(hookCommand).filter(Boolean);
+const entryCommand = (e) => entryRoutingCommands(e)[0] || "";
 const routesToWrapper = (e) => entryCommand(e) !== "";
 // The resolved binary, for the one consumer that needs a PATH rather than a command: the
 // coverage sweep takes CTX_WRAP as a binary. Derived FROM the predicate, never independently.
@@ -275,17 +292,30 @@ if (hollow.length > 0) {
 // Everything downstream that claims to have exercised the scanner runs THIS path, so a host
 // whose hook points somewhere other than the installed wrapper can no longer be green-ticked
 // by testing the installed wrapper instead.
-const LIVE_COMMAND = ctxEntries.map(entryCommand).find(Boolean) || "";
+// routesToWrapper is a basename check. Collecting one command per ENTRY left a second
+// hook on the SAME entry invisible: canary 3 ran the first, publish widened the matcher,
+// and the sibling started firing on tools it never handled (another wrapper, or a foreign
+// command). Walk every command hook. Mixed wrapper+other is a refuse — rewriting that
+// matcher would drag the other command onto the exec triple.
+const mixed = ctxEntries.filter((e) => {
+  const nCmd = commandHooksOf(e).length;
+  const nRoute = entryRoutingCommands(e).length;
+  return nRoute > 0 && nRoute < nCmd;
+});
+if (mixed.length) {
+  console.error(
+    `a context-mode entry in ${SETTINGS} mixes a '${wrapperName}' hook with another command.\n` +
+    "Rewriting its matcher would make the other command fire on tools it never handled.\n" +
+    "Give that other command its own matcher, then re-run."
+  );
+  process.exit(1);
+}
+
+const routingCommands = ctxEntries.flatMap(entryRoutingCommands);
+const uniqueRouting = [...new Set(routingCommands)];
+const LIVE_COMMAND = uniqueRouting[0] || "";
 const LIVE_WRAPPER = LIVE_COMMAND ? soleArgv0(LIVE_COMMAND) : "";
 
-// routesToWrapper is a basename check, so two entries can both pass it while naming two
-// different binaries. LIVE_COMMAND took the first; `targets` took every non-LOOSE routing
-// entry. Canary 3 then exercised one object and a publish widened another. The check at
-// canary 3 that "only 0 and 2 are honoured" already catches a dead binary — it just never
-// ran against the object being modified. Forcing the routing set to a single command makes
-// that check apply to every entry a publish would touch, without a second mechanism.
-const routingCommands = ctxEntries.map(entryCommand).filter(Boolean);
-const uniqueRouting = [...new Set(routingCommands)];
 if (uniqueRouting.length > 1) {
   console.error(
     `context-mode entries in ${SETTINGS} route to ${uniqueRouting.length} different ` +
@@ -311,9 +341,11 @@ if (ctxEntries.length > 0 && !LIVE_COMMAND) {
     "canaries run the binary: `> /dev/null` would leave the harness with no decision at all,\n" +
     "and `| sed s/deny/allow/` would turn a denial into an approval, both while the wrapper\n" +
     "itself behaved perfectly. If you need a wrapper script, point the hook AT that script.\n" +
-    "The path itself must also be a plain literal — letters, digits and _ @ % + = : , . / -\n" +
-    "with an optional leading `~/`. That is a whitelist, and it covers the INTERIOR of the\n" +
-    "path, not just its last segment: a shell construct in any earlier segment (for example\n" +
+    "The path itself must also be a plain literal — letters, digits and _ @ % + = : , . / -.\n" +
+    "A leading `~/` is accepted only when HOME (or USERPROFILE) is declared in this file's\n" +
+    "env block, because the shell expands it under that HOME; otherwise use an absolute path.\n" +
+    "The whitelist covers the INTERIOR of the path, not just its last segment: a shell\n" +
+    "construct in any earlier segment (for example\n" +
     "`/opt/$(...)/" + wrapperName + "`) is executed by the shell the moment this tool tests\n" +
     "the command, so it is refused before that can happen. A path containing anything outside\n" +
     "that set — a space, a quote — is refused rather than escaped; rename or symlink it.\n" +
@@ -723,6 +755,7 @@ if (DRY) process.exit(0);
 const orig = statSync(SETTINGS);
 
 const tmpPath = `${SETTINGS}.tmp-wi2096-${process.pid}`;
+const candidateBytes = JSON.stringify(cfg, null, 2) + "\n";
 
 // The candidate is created at 0600 REGARDLESS of the source's mode, and only widened to the
 // source's mode once the bytes are down. It used to be created at the umask default (0644
@@ -738,7 +771,7 @@ const tmpPath = `${SETTINGS}.tmp-wi2096-${process.pid}`;
 // stale same-PID leftover, or a writable settings directory), but this was the one remaining
 // path on which this file's own stated invariant did not hold.
 try {
-  writeFileSync(tmpPath, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+  writeFileSync(tmpPath, candidateBytes, { mode: 0o600, flag: "wx" });
 } catch (err) {
   if (err.code === "EEXIST") {
     console.error(
@@ -820,6 +853,23 @@ if (sha256(nowBytes) !== sha256(srcBytes)) {
     "The candidate was built from the earlier bytes, so publishing it would silently discard\n" +
     "whatever was written in between — which has previously included another guard's entry.\n" +
     `A backup of the current file is at ${backup}. Re-run to pick up the new contents.`
+  );
+}
+
+// The canaries judged THIS file. Hashing SETTINGS (above) does not bind the inode we are
+// about to rename. A writer that only replaces the candidate leaves SETTINGS untouched and
+// would otherwise publish bytes no canary saw. Same class, one path over.
+let nowCandidate;
+try {
+  nowCandidate = readFileSync(tmpPath, "utf8");
+} catch (err) {
+  abort(`refusing to publish — the candidate ${tmpPath} could not be re-read (${err.message})`);
+}
+if (sha256(nowCandidate) !== sha256(candidateBytes)) {
+  abort(
+    `refusing to publish — the candidate CHANGED while the canaries ran.\n` +
+    "The canaries judged the earlier bytes; publishing would put something else live.\n" +
+    `${SETTINGS} was not the file that moved — the candidate was.`
   );
 }
 

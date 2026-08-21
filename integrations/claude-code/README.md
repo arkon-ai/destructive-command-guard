@@ -89,9 +89,12 @@ python3 test-dcg-ctx-wrap.py         # adapter routing, extraction, decision con
 node test-apply-wi2096-matcher.mjs   # applier gating, canaries, publish ordering
 ```
 
-Both exit 0 on pass. They stub `dcg-wrap` and the sweep, so no network, no
-secrets, no real scan. They fail loudly if the tool-name keying, the batch
-extraction, or the fail-closed contract regresses to the transformate WI-2096 shape.
+Both exit 0 on pass. They stub `dcg-wrap`. The applier suite stubs the sweep for
+every case except one optional extra: if `warden-memory/scripts/audit-hook-matchers.mjs`
+is present on the machine, T7 also execs that script; if it is not, T7 prints SKIP
+and is not a pass of the pin. No network, no secrets. They fail loudly if the
+tool-name keying, the batch extraction, or the fail-closed contract regresses to
+the transformate WI-2096 shape.
 
 **Run them on Linux.** Git Bash on Windows cannot exec the POSIX-shebang stubs,
 so every scanner verdict masks as a spurious DENY and the results are noise.
