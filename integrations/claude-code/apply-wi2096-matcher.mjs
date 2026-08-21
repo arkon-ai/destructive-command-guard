@@ -462,23 +462,58 @@ const CANARY_ENV_KEEP = new Set([
   "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR", "SYSTEMDRIVE",
 ]);
 
-// A deterministic floor, not the operator's. This is what a desktop entry, a systemd unit or
-// cron actually hands a hook, which is the environment the canary is trying to be honest about.
-const PATH_FLOOR = process.platform === "win32"
-  ? [
-      `${process.env.SystemRoot || "C:\\Windows"}\\system32`,
-      `${process.env.SystemRoot || "C:\\Windows"}`,
-      `${process.env.SystemRoot || "C:\\Windows"}\\system32\\Wbem`,
-    ].join(";")
-  : "/usr/bin:/bin";
+// ── THE ESTABLISHED-ENVIRONMENT CONTRACT ─────────────────────────────────────────────────
+//
+// A canary run is evidence about production only if it runs the hook in the environment
+// production will give it. THIS TOOL CANNOT OBSERVE THAT ENVIRONMENT. The harness composes
+// `{...ambient, ...settingsEnv}` (measured against Claude Code 2.1.238, both directions, with a
+// negative control), and `ambient` belongs to whatever launches the harness LATER — a desktop
+// entry, a systemd unit, cron. It does not exist at apply time and cannot be sampled from here.
+//
+// Two rounds each answered that by INVENTING an environment and then certifying against it:
+//   inheriting the operator's shell  -> green over a scanner the harness never resolves
+//   substituting a fixed PATH floor  -> green over a control that is DARK in production, and
+//                                       measured STRICTLY WORSE than inheriting had been
+// Both are one mistake: substitute an environment we can see for one we cannot, then make a
+// claim about the one we cannot. A third substitution would be a third failure direction.
+//
+// So this file stops guessing. THE CONTRACT, in four parts:
+//
+//   ESTABLISHED — a variable is established iff the settings document's own `env` block declares
+//   it. That block is the one thing this tool and the harness demonstrably read the same way:
+//   the harness delivers it to every hook it spawns and it OVERRIDES ambient. Nothing else about
+//   the runtime environment is knowable from here.
+//
+//   DECIDING — for this control the deciding variable is PATH, and it decides twice.
+//   `dcg-ctx-wrap` is `#!/usr/bin/env python3`, so PATH selects the INTERPRETER. And the wrapper
+//   resolves its scanner with `subprocess.run([DCG_WRAP])`, whose list form uses execvp
+//   semantics, so a BARE-NAME `DCG_WRAP_BIN` makes PATH select the SCANNER itself. Measured:
+//   with a planted directory on PATH the bare name resolved to the planted binary; on a clean
+//   PATH it raised FileNotFoundError.
+//
+//   REFUSE — if a deciding variable is NOT established, this tool refuses to certify. It does
+//   not substitute a value of its own. That refusal is the whole point: the two defects above
+//   were both produced by substituting rather than refusing.
+//
+//   WHAT MAY BE CLAIMED AFTERWARDS — even with PATH established, any variable the document does
+//   NOT declare still comes from the harness's ambient environment and remains unobservable
+//   here. So the green line states a CONDITIONAL claim, scoped to the environment this document
+//   declares, and never asserts that the two environments are equal. R16 applies: the reduced
+//   claim has to be visible in the message, not merely true in the author's head.
+//
+// Widening DECIDING_VARS is a widening of the contract and must arrive with its own measurement
+// of why that variable decides what executes.
+const DECIDING_VARS = ["PATH"];
+
+const unestablished = (block) => DECIDING_VARS.filter((k) => !(k in block));
 
 const canaryEnv = (settingsPath, fail, extra) => {
   const env = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (CANARY_ENV_KEEP.has(k)) env[k] = v;
   }
-  env.PATH = PATH_FLOOR;                               // the operator's PATH does not choose
-  Object.assign(env, configEnv(settingsPath, fail));   // the settings document does
+  // No floor and no inheritance: PATH arrives from the document or this run already refused.
+  Object.assign(env, configEnv(settingsPath, fail));   // the settings document decides
   // This applier's own pins go LAST so the document under test cannot redirect the canary that
   // is judging it — the sweep must run against LIVE_WRAPPER and the file under test whatever
   // the `env` block says.
@@ -537,12 +572,12 @@ const canarySweep = (settingsPath, fail) => {
 // keeps the canary and the hook the same object rather than sending the operator somewhere else.
 const ENV_REMEDY =
   "\n\nIf that command works when you run it by hand, that difference IS the finding, not a bug\n" +
-  "in this check. The canaries run on a launcher-shaped environment —\n" +
-  `  PATH=${PATH_FLOOR}\n` +
-  "— because that is what a desktop entry, a systemd unit or cron actually hands a hook, and\n" +
-  "your shell's PATH is not available there. If the hook genuinely needs more than that, declare\n" +
-  'it in the "env" block of the settings file (for example "PATH"), which the harness delivers to\n' +
-  "every hook it spawns and which these canaries honour — so both end up reading the same thing.";
+  "in this check. The canaries do NOT inherit your shell: they run with the environment this\n" +
+  'settings document declares in its "env" block, because that block is the only thing this tool\n' +
+  "and the harness demonstrably read the same way. Your shell's PATH is not available to a hook\n" +
+  "started from a desktop entry, a systemd unit or cron either.\n" +
+  'So the fix is to correct the "PATH" this document declares, not to widen your own — that is\n' +
+  "the one change that moves BOTH what the harness gives the hook and what this canary tested.";
 
 // 3. Prove the SCANNER produced the denial, not the adapter.
 //
@@ -665,6 +700,31 @@ const commandsToCertify = () => {
 const certified = [];
 
 const verify = (settingsPath, fail) => {
+  // THE CONTRACT IS CHECKED FIRST, BEFORE ANY HOOK IS EXECUTED. A refusal that happens after
+  // the thing it guards is not a refusal — the same shape as a guard that runs after its
+  // target — so nothing is spawned until the environment is known to be establishable.
+  const missing = unestablished(configEnv(settingsPath, fail));
+  if (missing.length) {
+    fail(
+      `CANARY FAILED — REFUSING TO CERTIFY: ${settingsPath} does not declare ` +
+      `${missing.join(", ")} in its "env" block.\n` +
+      "\n" +
+      "This tool cannot observe the environment the harness will give the hook. That environment\n" +
+      "is composed as {ambient, then this document's env block on top}, and `ambient` belongs to\n" +
+      "whatever launches the harness later — a desktop entry, a systemd unit, cron — which does\n" +
+      "not exist yet and cannot be sampled from here.\n" +
+      `${missing.join(", ")} decides WHAT ACTUALLY EXECUTES: the wrapper is started through a\n` +
+      "shell and resolves both its interpreter and, for a bare-name DCG_WRAP_BIN, its scanner\n" +
+      "through PATH. Certifying against a PATH this tool invented is how the two previous\n" +
+      "versions of this check produced green certificates over controls that were dark in\n" +
+      "production — once by inheriting the operator's shell, once by substituting a fixed floor.\n" +
+      "\n" +
+      `REMEDY: declare ${missing.join(", ")} in the "env" block of ${SETTINGS}. The harness\n` +
+      "delivers that block to every hook it spawns and these canaries read the same block, so it\n" +
+      "is the one value that moves both sides together. Nothing else here is guessed on your\n" +
+      "behalf, and that refusal is deliberate."
+    );
+  }
   canaryMatcher(settingsPath, fail);
   canarySweep(settingsPath, fail);
   const commands = commandsToCertify();
@@ -684,10 +744,13 @@ const verify = (settingsPath, fail) => {
 // operator reading this line instead of silent, and it is what stops the line describing one
 // entry while a different one was published.
 const greenLine = () =>
-  `ctx exec calls in ${SETTINGS} reach ${certified.length} routing command(s), each of which ` +
-  "denied one known-dangerous fixture:\n" +
+  `WITH THE ENVIRONMENT ${SETTINGS} DECLARES, ctx exec calls reach ${certified.length} routing ` +
+  "command(s), each of which denied one known-dangerous fixture:\n" +
   certified.map((c) => `  ${c.command}\n    scanner: ${c.scanner}`).join("\n") + "\n" +
-  "That surface, that fixture, this host — nothing wider was checked.";
+  "That surface, that fixture, this host — nothing wider was checked.\n" +
+  "This is a CONDITIONAL claim, and the condition is load-bearing: variables this document does\n" +
+  "not declare come from the harness's ambient environment, which this tool cannot observe. It\n" +
+  "is not a claim that the two environments are equal.";
 
 if (targets.length === 0) {
   // "Nothing to patch" is NOT "verified working". The matcher may name a wrapper that is

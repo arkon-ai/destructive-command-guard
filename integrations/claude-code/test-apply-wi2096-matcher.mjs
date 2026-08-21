@@ -75,10 +75,19 @@ const SCANNER = wrapper("scanner");
 // `envBlock` is the settings document's own `env` — the block the harness delivers to every
 // hook it spawns, and therefore part of the environment the canaries have to reproduce. Omitted
 // by every fixture that predates T3, so the document is byte-identical to what it was.
-function settings(entries, envBlock) {
+// Captured ONCE, before any case perturbs the environment, so a fixture's declared PATH is a
+// clean value and never whatever a later test planted on its own PATH.
+const SUITE_PATH = process.env.PATH || "/usr/bin:/bin";
+
+// Every fixture declares PATH by default, because the applier now REFUSES to certify a document
+// that does not establish its deciding variables — see the established-environment contract.
+// A case that wants to exercise the refusal passes `noEnv: true`; one that wants a specific
+// value overrides it in `envBlock`.
+function settings(entries, envBlock, opts = {}) {
   const p = path.join(tmp, `settings-${Math.random().toString(36).slice(2)}.json`);
   const doc = { hooks: { PreToolUse: entries } };
-  if (envBlock) doc.env = envBlock;
+  if (!opts.noEnv) doc.env = { PATH: SUITE_PATH, ...(envBlock || {}) };
+  else if (envBlock) doc.env = envBlock;
   writeFileSync(p, JSON.stringify(doc, null, 2) + "\n");
   return p;
 }
@@ -175,8 +184,10 @@ for (const [label, hooks] of [
   const r1 = run(s, sweep(0));
   const m1 = /Rollback: cp (\S+)/.exec(r1.out);
   check("first run names a backup", !!m1);
-  // Make it stale again so a second run also writes.
-  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] } }, null, 2) + "\n");
+  // Make it stale again so a second run also writes. The `env` block must be carried through:
+  // the applier refuses to certify a document that does not establish its deciding variables.
+  writeFileSync(s, JSON.stringify(
+    { env: { PATH: SUITE_PATH }, hooks: { PreToolUse: [bashEntry(), staleEntry()] } }, null, 2) + "\n");
   const r2 = run(s, sweep(0));
   const m2 = /Rollback: cp (\S+)/.exec(r2.out);
   check("second run names a backup", !!m2);
@@ -449,7 +460,8 @@ if (process.platform !== "win32") {
 {
   const dir = mkdtempSync(path.join(tmp, "moved-"));
   const s = path.join(dir, "settings.json");
-  writeFileSync(s, JSON.stringify({ hooks: { PreToolUse: [bashEntry(), staleEntry()] } }, null, 2) + "\n");
+  writeFileSync(s, JSON.stringify(
+    { env: { PATH: SUITE_PATH }, hooks: { PreToolUse: [bashEntry(), staleEntry()] } }, null, 2) + "\n");
   const writer = path.join(tmp, `sweep-writer-${Math.random().toString(36).slice(2)}.mjs`);
   writeFileSync(writer,
     'import { readFileSync, writeFileSync } from "node:fs";\n' +
@@ -961,39 +973,37 @@ if (process.platform !== "win32") {
   // R16 ON THE REFUSAL. The false-refusal direction is chosen deliberately, so a refusal that
   // does not say how to fix it is a mystery outage for an operator who has not read our notes:
   // the command works when they type it and fails here, which reads as a bug in this tool.
-  check("T4d: the refusal explains that the canary uses a launcher-shaped environment",
-    /launcher-shaped environment/.test(outD));
-  check("T4d: the refusal names the supported remedy — the settings env block",
-    /"env" block of the settings file/.test(outD));
-  check("T4d: the refusal shows the PATH it actually ran with", /PATH=/.test(outD));
+  check("T4d: the refusal explains the canary does not inherit the operator's shell",
+    /do NOT inherit your shell/.test(outD));
+  check("T4d: the refusal names the supported remedy — the document's declared PATH",
+    /correct the "PATH" this document declares/.test(outD));
 
-  // (e) R11 item 3 — the comment above canaryEnv no longer claims a FAILURE DIRECTION (that
-  //     claim was false: the floor made a measured no-adversary case strictly worse). All it
-  //     claims now is the mechanism — the canary runs on PATH_FLOOR, which is NOT the PATH the
-  //     harness gives the hook. Pin exactly that, so the comment cannot drift from the code.
-  if (process.platform !== "win32") {
-    const FLOOR = "/usr/bin:/bin";
-    const fp = path.join(mkdtempSync(path.join(tmp, "t4-floor-")), "dcg-ctx-wrap");
-    writeFileSync(fp,
-      `#!${process.execPath}\n` +
-      `const ok = process.env.PATH === ${JSON.stringify(FLOOR)};\n` +
-      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-      'permissionDecision:"deny",permissionDecisionReason: ok ? ' +
-      '"BLOCKED by dcg  Reason: git_reset_hard" : ' +
-      '"dcg-ctx-wrap: CANARY PATH WAS " + process.env.PATH}}));\n');
-    chmodSync(fp, 0o755);
-    const rf = spawnSync(process.execPath, [APPLY], {
-      encoding: "utf8",
-      env: opEnv({
-        HOOK_SETTINGS: settings([staleEntry(fp)]), HOOK_SWEEP: sweep(0), CTX_WRAP: fp,
-        PATH: `${hijackDir}${path.delimiter}${process.env.PATH || ""}`,
-      }),
-    });
-    const outF = (rf.stdout || "") + (rf.stderr || "");
-    check("T4e: the canary runs on the PATH floor, not the operator's PATH",
-      !/CANARY PATH WAS/.test(outF));
-    check("T4e: that run is green", rf.status === 0);
-  }
+  // (e) THE CONTRACT'S POSITIVE HALF — the canary runs with the PATH THE DOCUMENT DECLARES, not
+  //     the operator's and not a value this tool invented. That is the whole substance of the
+  //     established-environment contract, so it is pinned directly rather than inferred from a
+  //     hijack not arriving.
+  const declared = path.join(mkdtempSync(path.join(tmp, "t4-declared-")), "sentinel-bin");
+  const fp = path.join(mkdtempSync(path.join(tmp, "t4-decl-")), "dcg-ctx-wrap");
+  writeFileSync(fp,
+    `#!${process.execPath}\n` +
+    `const ok = process.env.PATH === ${JSON.stringify(declared)};\n` +
+    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+    'permissionDecision:"deny",permissionDecisionReason: ok ? ' +
+    '"BLOCKED by dcg  Reason: git_reset_hard" : ' +
+    '"dcg-ctx-wrap: CANARY PATH WAS " + process.env.PATH}}));\n');
+  chmodSync(fp, 0o755);
+  const rf = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({
+      HOOK_SETTINGS: settings([staleEntry(fp)], { PATH: declared }),
+      HOOK_SWEEP: sweep(0), CTX_WRAP: fp,
+      PATH: `${hijackDir}${path.delimiter}${process.env.PATH || ""}`,
+    }),
+  });
+  const outF = (rf.stdout || "") + (rf.stderr || "");
+  check("T4e: the canary runs on the PATH the DOCUMENT declares, not the operator's",
+    !/CANARY PATH WAS/.test(outF));
+  check("T4e: that run is green", rf.status === 0);
 }
 
 // ── T5 (R11 item 2) — CERTIFY EVERY ROUTING COMMAND PUBLISHED, NOT THE FIRST ONE FOUND ────
@@ -1036,6 +1046,105 @@ if (process.platform !== "win32") {
   check("T5: the second-position dark command is the one named", r2.out.includes(dark));
   check("T5: and settings.json was NOT modified in that case either",
     /was NOT modified/.test(r2.out));
+}
+
+// ── T6 (R11) — THE ESTABLISHED-ENVIRONMENT CONTRACT ───────────────────────────────────────
+//
+// Two rounds each answered "what environment will the hook run in?" by INVENTING one and
+// certifying against it — the operator's shell, then a fixed PATH floor — and each produced a
+// green certificate over a control that was dark in production. The floor was measured STRICTLY
+// WORSE than inheriting had been.
+//
+// The contract stops guessing: a variable is ESTABLISHED only if the settings document's own
+// `env` block declares it, because that block is the one thing this tool and the harness
+// demonstrably read the same way. PATH is deciding — it selects the interpreter via the
+// adapter's shebang, and the SCANNER itself when DCG_WRAP_BIN is a bare name (execvp semantics,
+// measured). If a deciding variable is not established, the applier REFUSES rather than
+// substituting a value of its own.
+{
+  const d = mkdtempSync(path.join(tmp, "t6-"));
+  const opEnv = (over) => {
+    const e = { ...process.env };
+    delete e.DCG_WRAP_BIN;
+    return { ...e, ...over };
+  };
+
+  // A wrapper that RECORDS THE FACT IT RAN. The refusal must happen before this can execute —
+  // a guard that runs after the thing it guards is not a guard.
+  const marker = path.join(d, "wrapper-was-invoked");
+  const recording = path.join(mkdtempSync(path.join(tmp, "t6-rec-")), "dcg-ctx-wrap");
+  writeFileSync(recording,
+    `#!${process.execPath}\n` +
+    `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n` +
+    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+    'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+  chmodSync(recording, 0o755);
+
+  // (a) NO `env` block at all -> REFUSE. This is the case every host is in today, so the
+  //     refusal has to be legible, not just correct.
+  const sA = settings([staleEntry(recording)], null, { noEnv: true });
+  const rA = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({ HOOK_SETTINGS: sA, HOOK_SWEEP: sweep(0), CTX_WRAP: recording }),
+  });
+  const outA = (rA.stdout || "") + (rA.stderr || "");
+  check("T6a: a document that declares no PATH is REFUSED, not certified", rA.status !== 0);
+  check("T6a: the refusal says it is refusing to certify", /REFUSING TO CERTIFY/.test(outA));
+  check("T6a: it names the variable that is missing", /PATH/.test(outA));
+  check("T6a: it names the remedy — declare it in the env block", /REMEDY: declare/.test(outA));
+  check("T6a: and settings.json was NOT modified", /was NOT modified/.test(outA));
+
+  // (b) THE REFUSAL PRECEDES EXECUTION. If the contract were checked after the canaries, this
+  //     marker would exist and the refusal would be decoration on top of a side effect.
+  check("T6b: nothing was executed before the refusal", !existsSync(marker));
+
+  // (c) NEGATIVE CONTROL — the SAME fixture with PATH declared must certify. Without this, (a)
+  //     would also pass against an applier that refused everything.
+  const sC = settings([staleEntry(recording)], { PATH: SUITE_PATH });
+  const rC = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({ HOOK_SETTINGS: sC, HOOK_SWEEP: sweep(0), CTX_WRAP: recording }),
+  });
+  const outC = (rC.stdout || "") + (rC.stderr || "");
+  check("T6c: the same document WITH PATH declared certifies green", rC.status === 0);
+  check("T6c: and the wrapper really did run on that path", existsSync(marker));
+
+  // (d) R16 ON THE GREEN CLAIM. Even with PATH established, undeclared variables still come
+  //     from the harness's ambient environment. The message must say so rather than reading
+  //     like the old unconditional line.
+  check("T6d: the green claim is explicitly CONDITIONAL on the declared environment",
+    /WITH THE ENVIRONMENT .* DECLARES/.test(outC));
+  check("T6d: it says plainly it is not a claim the environments are equal",
+    /not a claim that the two environments are equal/.test(outC));
+
+  // (e) PRECEDENCE, ON A VARIABLE THE BASE ACTUALLY CARRIES.
+  //     The harness composes {ambient, then the env block ON TOP} — measured. The canary must
+  //     reproduce that ORDER, not merely end up with the same values. Once the PATH floor was
+  //     removed, every previously-tested variable was absent from the base, so "config fills
+  //     gaps" and "config overrides" became indistinguishable and a reversed-precedence mutant
+  //     SURVIVED. Measured, then fixed: LANG is in CANARY_ENV_KEEP, so it IS inherited into the
+  //     base, and a document declaring it must still win.
+  const langProbe = path.join(mkdtempSync(path.join(tmp, "t6-lang-")), "dcg-ctx-wrap");
+  writeFileSync(langProbe,
+    `#!${process.execPath}\n` +
+    'const ok = process.env.LANG === "dcg_TEST.UTF-8";\n' +
+    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+    'permissionDecision:"deny",permissionDecisionReason: ok ? ' +
+    '"BLOCKED by dcg  Reason: git_reset_hard" : ' +
+    '"dcg-ctx-wrap: CONFIG DID NOT OVERRIDE, LANG=" + process.env.LANG}}));\n');
+  chmodSync(langProbe, 0o755);
+  const rE = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({
+      HOOK_SETTINGS: settings([staleEntry(langProbe)], { PATH: SUITE_PATH, LANG: "dcg_TEST.UTF-8" }),
+      HOOK_SWEEP: sweep(0), CTX_WRAP: langProbe,
+      LANG: "en_ZA.UTF-8",   // the ambient value the base inherits, which config must beat
+    }),
+  });
+  const outE = (rE.stdout || "") + (rE.stderr || "");
+  check("T6e: the env block OVERRIDES an inherited variable, it does not merely fill a gap",
+    !/CONFIG DID NOT OVERRIDE/.test(outE));
+  check("T6e: that run is green", rE.status === 0);
 }
 
 rmSync(tmp, { recursive: true, force: true });
