@@ -382,15 +382,38 @@ if (DRY) process.exit(0);
 //
 // Verifying the candidate first deletes the whole rollback path: on red, settings.json was
 // never touched at all, which is strictly stronger than modified-then-restored.
+// Stat the SOURCE before the candidate exists — every mode decision below is derived from it.
+const orig = statSync(SETTINGS);
+
 const tmpPath = `${SETTINGS}.tmp-wi2096-${process.pid}`;
-writeFileSync(tmpPath, JSON.stringify(cfg, null, 2) + "\n");
+
+// The candidate is created at 0600 REGARDLESS of the source's mode, and only widened to the
+// source's mode once the bytes are down. It used to be created at the umask default (0644
+// under a typical 022) and chmod'd afterwards, so a COMPLETE copy of the settings document —
+// which on this fleet is a 0600 file carrying an env block with tokens — sat world-readable
+// for the length of the write. A mode passed at creation is still masked by umask, and umask
+// can only REMOVE bits, so this is never wider than 0600 and never wider than the source.
+writeFileSync(tmpPath, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+
+// An uncaught throw anywhere between the write and the rename left that candidate orphaned on
+// disk, holding the whole document, outliving the process with nothing downstream to remove
+// it. `abort()` covers the paths this script controls; this covers the ones it does not.
+let tmpLive = true;
+const dropTmp = () => {
+  if (!tmpLive) return;
+  tmpLive = false;
+  try {
+    unlinkSync(tmpPath);
+  } catch {
+    // Already gone — renamed into place, or removed by an earlier path.
+  }
+};
+process.on("exit", dropTmp);
 
 // rename() replaces the inode, so without this the published file inherits the temp file's
-// umask-derived mode (0644 under a typical 022) and this process's ownership instead of the
-// original's. settings.json can carry an env block with tokens, so a 0600 file silently
-// becoming world-readable is a credential exposure; and a sudo run would flip ownership and
-// cost the renderer its write access on the next sync.
-const orig = statSync(SETTINGS);
+// mode and this process's ownership instead of the original's. A 0600 file silently becoming
+// world-readable is a credential exposure; and a sudo run would flip ownership and cost the
+// renderer its write access on the next sync.
 chmodSync(tmpPath, orig.mode & 0o7777);
 try {
   chownSync(tmpPath, orig.uid, orig.gid);
@@ -399,11 +422,7 @@ try {
 }
 
 const abort = (why) => {
-  try {
-    unlinkSync(tmpPath);
-  } catch {
-    // Nothing to clean up.
-  }
+  dropTmp();
   console.error(`\n${why}\n${SETTINGS} was NOT modified.`);
   process.exit(1);
 };
@@ -422,6 +441,7 @@ try {
   abort(`refusing to publish — could not take a backup at ${backup} (${err.message})`);
 }
 renameSync(tmpPath, SETTINGS);
+tmpLive = false;  // published, not orphaned — the exit hook must not chase the old path
 console.log(
   `\npatched ${targets.length} matcher(s) — all three canaries green BEFORE publish.` +
   `\nRollback: cp ${backup} ${SETTINGS}`

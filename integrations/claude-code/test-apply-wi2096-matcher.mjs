@@ -13,7 +13,8 @@
 // Run: node integrations/claude-code/test-apply-wi2096-matcher.mjs   (exit 0 = pass)
 
 import {
-  mkdtempSync, writeFileSync, readFileSync, copyFileSync, chmodSync, rmSync, existsSync, statSync,
+  mkdtempSync, writeFileSync, readFileSync, copyFileSync, readdirSync,
+  chmodSync, rmSync, existsSync, statSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -335,8 +336,22 @@ for (const [label, hooks] of [
   check("stale+red reports the sweep exit status", /sweep exit 3/.test(r.out));
   check("stale+red left the file untouched", readFileSync(s, "utf8") === before);
   check("stale+red says the file was not modified", /was NOT modified/.test(r.out));
-  check("stale+red left no temp file behind",
-    !existsSync(`${s}.tmp-wi2096-${process.pid}`));
+  // GLOB the directory — do NOT build the path from the runner's pid. The applier runs as a
+  // spawnSync CHILD with a different pid, so `${s}.tmp-wi2096-${process.pid}` named a path
+  // that could never exist: the assertion passed unconditionally and could not fail. Measured
+  // before the fix — with a real `.tmp-wi2096-999999` sitting in the directory, existsSync on
+  // the runner-pid path still returned false. Four vendors filed this.
+  const leaked = () => readdirSync(path.dirname(s))
+    .filter((f) => f.startsWith(`${path.basename(s)}.tmp-wi2096-`));
+  check("stale+red left no temp file behind", leaked().length === 0);
+
+  // ...and the assertion must be CAPABLE of failing, which is the entire finding. Plant one
+  // and confirm the glob sees it, or this check is the same vacuity wearing a new expression.
+  const planted = `${s}.tmp-wi2096-999999`;
+  writeFileSync(planted, "{}");
+  const sawPlanted = leaked().length === 1;
+  rmSync(planted, { force: true });
+  check("the temp-leak assertion can actually fail", sawPlanted);
 }
 
 // 5. A sweep that cannot be run at all must be a failure, not a pass.
@@ -359,6 +374,11 @@ if (process.platform !== "win32") {
   check("restrictive-mode run exits 0", r.status === 0);
   check("published settings.json keeps mode 0600",
     (statSync(s).mode & 0o777) === 0o600);
+  // A candidate surviving the SUCCESS path is the likelier exposure than one surviving an
+  // abort, and it holds a complete copy of a 0600 document that can carry tokens.
+  check("a successful publish leaves no candidate behind",
+    readdirSync(path.dirname(s))
+      .filter((f) => f.startsWith(`${path.basename(s)}.tmp-wi2096-`)).length === 0);
 }
 
 // 6. --dry-run touches nothing.

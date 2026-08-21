@@ -332,6 +332,15 @@ def main():
 
     # ---- from here the call is GUARDED: no path out of this function allows it
     # through because something failed. ----
+    # DO NOT "fix" this to match the key-membership check used for `tool_name` above.
+    #
+    # It looks like the same bug and it is not. That shape WAS filed here as a Major
+    # (`{"tool_input": null, "toolInput": {...}}` supposedly laundering a payload) and it was
+    # REFUTED WITH A MEASUREMENT: the alias resolves to the only payload actually present, and
+    # that payload IS scanned — 182 bytes reached the scanner. The `tool_name` case leaked
+    # because a wrong IDENTIFICATION skips the raw-token tie-breaker entirely; there is no
+    # equivalent here, because every path below this point is already on the guarded surface
+    # and none of them allows. Read the R5 adjudication's refutation before touching this.
     ti = inp.get("tool_input")
     if ti is None:
         ti = inp.get("toolInput")
