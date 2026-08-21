@@ -345,29 +345,84 @@ const canaryMatcher = (settingsPath, fail) => {
   console.log(`canary 1: matcher on disk matches all ${LIVE_CTX_TOOLS.length} known ctx tool names`);
 };
 
-// The canaries must not inherit the OPERATOR'S scanner selection. `dcg-ctx-wrap` resolves its
-// scanner as `os.environ.get("DCG_WRAP_BIN", ~/.local/bin/dcg-wrap)`, so a value set in the
-// shell that happens to run this applier silently points the canaries at a DIFFERENT binary
-// from the one the harness will use — Claude Code launches from a desktop entry, a systemd unit
-// or cron, where that variable does not exist. Measured in both directions on a host with no
-// `~/.local/bin/dcg-wrap`: with a deny stub in `DCG_WRAP_BIN` the applier published green at
-// rc 0, and the same hook command with the variable unset then DENIED every guarded ctx call —
-// a total outage certified as "the control is live". Converse, and worse: if the real scanner
-// is a stub or a silent `true`, production ALLOWS everything while canary 3 was green off the
-// env binary — a fail-open under a green certificate.
+// ── THE CANARY ENVIRONMENT ───────────────────────────────────────────────────────────────
 //
-// This is the SAME class as the predicate above — the check and the thing checked were
-// different objects — one layer down, in the ENVIRONMENT rather than in the command string.
-// The applier already refuses to depend on this kind of divergence for `node` (process.execPath
-// rather than a PATH lookup) and for the wrapper (resolved from settings.json, never from
-// CTX_WRAP); the scanner's own resolution variable was the one that was left inheriting.
-// Stripped rather than pinned: this tool has no business choosing the scanner at all, and
-// setting it to a value of our own would be the same mistake in the opposite direction.
-const canaryEnv = (extra) => {
-  const env = { ...process.env, ...extra };
-  delete env.DCG_WRAP_BIN;
-  return env;
+// `dcg-ctx-wrap` resolves its scanner as `os.environ.get("DCG_WRAP_BIN", ~/.local/bin/dcg-wrap)`,
+// so whoever holds that variable when the hook runs decides which binary actually scans. Two
+// different holders can, and they are NOT the same thing:
+//
+//   THE OPERATOR'S SHELL — must NOT reach the canary. Claude Code launches from a desktop
+//   entry, a systemd unit or cron, where a variable exported in someone's terminal does not
+//   exist. Measured in both directions on a host with no `~/.local/bin/dcg-wrap`: with a deny
+//   stub in `DCG_WRAP_BIN` the applier published green at rc 0, and the same hook command with
+//   the variable unset then DENIED every guarded ctx call — a total outage certified as "the
+//   control is live". Converse and worse: if the real scanner is a stub or a silent `true`,
+//   production ALLOWS everything while the canary was green off the env binary.
+//
+//   THE `env` BLOCK OF THE SETTINGS DOCUMENT — must reach the canary, because the harness
+//   delivers that block to every hook it spawns. Stripping it unconditionally, as the previous
+//   version of this function did, reproduces the very same divergence with the sign flipped:
+//   point `DCG_WRAP_BIN` at a silent `exit 0` stub VIA THE CONFIG and the live hook uses the
+//   stub while the canary certifies a different scanner entirely. Measured: green tick, dark
+//   control. A green certificate over a binary the harness never runs.
+//
+// So the rule is a PRECEDENCE, not a strip: shell out, config in.
+//
+// THE COMPOSITION BELOW WAS MEASURED AGAINST THE HARNESS, NOT ASSUMED — assuming it is the
+// exact class this file keeps repairing. A `PreToolUse` hook, the same event this control is,
+// was spawned by Claude Code 2.1.238 with a probe variable set to one sentinel in the launching
+// shell and a DIFFERENT sentinel in the settings `env` block. The hook observed the CONFIG
+// sentinel. A variable present only in the shell still arrived, and one present only in the
+// config also arrived. With the `env` block removed and nothing else changed, the same hook
+// observed the SHELL sentinel — the negative control, without which the probe proves nothing.
+// So the harness composes `{...ambient, ...settingsEnv}`: ambient is the base, the config block
+// overrides it. Values are coerced by plain string conversion, measured across number, boolean,
+// null, array and object (`42`, `true`, `null`, `x,y`, `[object Object]`) — `String(v)`
+// reproduces all five, and filtering any of them out would be a divergence of its own.
+//
+// BOUNDARY, stated exactly because the next reader will otherwise assume more: this honours the
+// `env` block of THE SETTINGS DOCUMENT UNDER TEST — the candidate on the patch path, the live
+// file on the already-current path. Other scopes the harness may additionally merge (enterprise,
+// project, `--settings`) are NOT read here, and an `env` that is not a JSON object is treated as
+// absent. Nothing here closes those.
+const configEnv = (settingsPath, fail) => {
+  let block;
+  try {
+    // Read from the document under test rather than from the `cfg` parsed at the top: the
+    // candidate is what gets published, and "the object we serialised" and "the file the
+    // harness will read" being ASSUMED identical is precisely the class this file has spent
+    // its rounds closing.
+    block = JSON.parse(readFileSync(settingsPath, "utf8")).env;
+  } catch (err) {
+    fail(`CANARY FAILED — cannot read the env block from ${settingsPath} (${err.message})`);
+    return {};
+  }
+  if (!block || typeof block !== "object" || Array.isArray(block)) return {};
+  return Object.fromEntries(Object.entries(block).map(([k, v]) => [k, String(v)]));
 };
+
+const canaryEnv = (settingsPath, fail, extra) => {
+  const env = { ...process.env };
+  delete env.DCG_WRAP_BIN;                             // the operator's shell does not choose
+  Object.assign(env, configEnv(settingsPath, fail));   // the settings document does
+  // This applier's own pins go LAST so the document under test cannot redirect the canary that
+  // is judging it — the sweep must run against LIVE_WRAPPER and the file under test whatever
+  // the `env` block says.
+  return { ...env, ...extra };
+};
+
+// What the canary environment SELECTED as the scanner, named exactly. When `DCG_WRAP_BIN` is
+// set this IS the literal path `dcg-ctx-wrap` will exec; when it is not, the only true
+// statement is that nothing selected one. It deliberately does not name the fallback path,
+// because the wrapper expands that in ITS OWN process and this file did not resolve it.
+const scannerSelection = (env) => env.DCG_WRAP_BIN
+  ? `DCG_WRAP_BIN=${env.DCG_WRAP_BIN}`
+  : "DCG_WRAP_BIN unset — dcg-ctx-wrap's own default scanner";
+
+// Recorded BY canary 3, AT THE MOMENT OF USE, and quoted verbatim by the success lines.
+// Recomputing it for the message would let the message and the run drift apart, which is the
+// same two-objects mistake one more layer out.
+let scannerUsed = "";
 
 // 2. The coverage sweep must go green against the file under test.
 const canarySweep = (settingsPath, fail) => {
@@ -380,7 +435,7 @@ const canarySweep = (settingsPath, fail) => {
     // patch then gets refused for an environment reason.
     // LIVE_WRAPPER, not WRAPPER: the sweep must exercise the binary the hook in this very
     // settings file execs, not the one CTX_WRAP happens to name.
-    env: canaryEnv({ HOOK_SETTINGS: settingsPath, CTX_WRAP: LIVE_WRAPPER }),
+    env: canaryEnv(settingsPath, fail, { HOOK_SETTINGS: settingsPath, CTX_WRAP: LIVE_WRAPPER }),
   });
   process.stdout.write(r.stdout || "");
   // Diagnostics conventionally go to stderr. Swallowing it left the operator with
@@ -421,7 +476,12 @@ const canarySweep = (settingsPath, fail) => {
 //    on a list. The earlier version spawned the CTX_WRAP constant, which let four non-routing
 //    commands publish green; the version after that spawned the resolved binary, which let a
 //    redirect and a pipe publish green with the wrapper behaving perfectly.
-const canaryScanner = (fail) => {
+const canaryScanner = (settingsPath, fail) => {
+  // Without this the spawn inherits process.env wholesale, DCG_WRAP_BIN included, and this
+  // canary — the ONE check that still separates a live scanner from a dark fail-closed
+  // adapter — certifies a binary the harness will never resolve. See canaryEnv above.
+  const env = canaryEnv(settingsPath, fail);
+  scannerUsed = scannerSelection(env);
   const r = spawnSync(LIVE_COMMAND, {
     shell: true,
     input: JSON.stringify({
@@ -430,10 +490,7 @@ const canaryScanner = (fail) => {
     }),
     encoding: "utf8",
     timeout: 30000,
-    // Without this the spawn inherits process.env wholesale, DCG_WRAP_BIN included, and this
-    // canary — the ONE check that still separates a live scanner from a dark fail-closed
-    // adapter — certifies a binary the harness will never resolve. See canaryEnv above.
-    env: canaryEnv(),
+    env,
   });
   if (r.error) {
     fail(
@@ -479,14 +536,29 @@ const canaryScanner = (fail) => {
       "That is the control being DARK while emitting the right word. Install/repair dcg-wrap."
     );
   }
-  console.log("canary 3: a known-dangerous fixture was denied BY THE SCANNER");
+  console.log(
+    "canary 3: a known-dangerous fixture was denied BY THE SCANNER\n" +
+    `          scanner the canary invoked: ${scannerUsed}`
+  );
 };
 
 const verify = (settingsPath, fail) => {
   canaryMatcher(settingsPath, fail);
   canarySweep(settingsPath, fail);
-  canaryScanner(fail);
+  canaryScanner(settingsPath, fail);
 };
+
+// R16 — a success line may claim only what the canaries actually earned. Earned: for THIS
+// settings document on THIS host, the ctx exec matcher matches the live tool names, the sweep
+// is green, and the hook command — run through a shell exactly as the harness runs it —
+// delivered a scanner-sourced DENY for ONE known-dangerous fixture, off the scanner named here.
+// NOT earned, and so not claimed: that this machine is protected, that any other tool surface
+// is guarded, or that any other settings scope agrees. Naming the scanner is the load-bearing
+// half — it is what makes a stub visible to the operator reading this line instead of silent.
+const greenLine = () =>
+  `ctx exec calls in ${SETTINGS} reach ${LIVE_WRAPPER}, and one known-dangerous fixture was ` +
+  `denied by the scanner behind it (${scannerUsed}).\n` +
+  "That surface, that fixture, this host — nothing wider was checked.";
 
 if (targets.length === 0) {
   // "Nothing to patch" is NOT "verified working". The matcher may name a wrapper that is
@@ -503,7 +575,7 @@ if (targets.length === 0) {
     console.error(`\n${why}`);
     process.exit(1);
   });
-  console.log("\nalready current — matchers at LOOSE and the control is live");
+  console.log(`\nalready current — matchers at LOOSE.\n${greenLine()}`);
   process.exit(0);
 }
 for (const e of targets) {
@@ -631,5 +703,6 @@ renameSync(tmpPath, SETTINGS);
 tmpLive = false;  // published, not orphaned — the exit hook must not chase the old path
 console.log(
   `\npatched ${targets.length} matcher(s) — all three canaries green BEFORE publish.` +
+  `\n${greenLine()}` +
   `\nRollback: cp ${backup} ${SETTINGS}`
 );

@@ -69,9 +69,14 @@ function wrapper(kind) {
 
 const SCANNER = wrapper("scanner");
 
-function settings(entries) {
+// `envBlock` is the settings document's own `env` — the block the harness delivers to every
+// hook it spawns, and therefore part of the environment the canaries have to reproduce. Omitted
+// by every fixture that predates T3, so the document is byte-identical to what it was.
+function settings(entries, envBlock) {
   const p = path.join(tmp, `settings-${Math.random().toString(36).slice(2)}.json`);
-  writeFileSync(p, JSON.stringify({ hooks: { PreToolUse: entries } }, null, 2) + "\n");
+  const doc = { hooks: { PreToolUse: entries } };
+  if (envBlock) doc.env = envBlock;
+  writeFileSync(p, JSON.stringify(doc, null, 2) + "\n");
   return p;
 }
 
@@ -648,6 +653,165 @@ if (process.platform !== "win32") {
   const out2 = (r2.stdout || "") + (r2.stderr || "");
   check("T2: DCG_WRAP_BIN does not reach the coverage sweep either", r2.status === 0);
   check("T2: the sweep did not report the leak", !/sweep exit 3/.test(out2));
+}
+
+// ── T3 (R9) — THE CANARIES MUST HONOUR THE SETTINGS DOCUMENT'S `env` BLOCK ────────────────
+//
+// R7 (T2 above) made the canaries strip `DCG_WRAP_BIN` unconditionally. That stopped the
+// operator's SHELL choosing the scanner, and in the same stroke discarded the value the harness
+// really does deliver: the settings document's own `env` block. Point `DCG_WRAP_BIN` at a stub
+// THROUGH THE CONFIG and the live hook used the stub while the canary certified a different
+// binary — a green certificate over a dark control, in the one check that separates a live
+// scanner from a fail-closed adapter.
+//
+// The composition was MEASURED against Claude Code 2.1.238, with a `PreToolUse` hook — the same
+// event this control is — carrying one sentinel in the launching shell and a different sentinel
+// in the settings `env` block. The hook observed the CONFIG sentinel; with the `env` block
+// removed and nothing else changed it observed the SHELL sentinel. So the harness composes
+// `{...ambient, ...settingsEnv}` and the config OVERRIDES ambient. These tests pin exactly that,
+// in both directions, at BOTH canary sites — a one-site fix here is half a fix.
+{
+  const d = mkdtempSync(path.join(tmp, "t3-"));
+  const CONFIG_PICK = path.join(d, "config-chosen-scanner");
+  const SHELL_PICK = path.join(d, "operator-chosen-scanner");
+
+  // The operator's shell, with `DCG_WRAP_BIN` removed unless a case deliberately sets it — so
+  // a real value in the environment running this suite cannot decide the outcome either way.
+  const opEnv = (over) => {
+    const e = { ...process.env };
+    delete e.DCG_WRAP_BIN;
+    return { ...e, ...over };
+  };
+
+  // Denies EITHER WAY, so canary 3's own criterion is satisfied in every world and the single
+  // variable under test is WHICH `DCG_WRAP_BIN` arrived. A wrong answer comes back through the
+  // reason and names itself, instead of surfacing as a bare non-zero that could be anything.
+  const bin = path.join(d, "dcg-ctx-wrap");
+  writeFileSync(bin,
+    "#!/usr/bin/env node\n" +
+    "const got = process.env.DCG_WRAP_BIN || '(unset)';\n" +
+    `const want = ${JSON.stringify(CONFIG_PICK)};\n` +
+    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+    'permissionDecision:"deny",permissionDecisionReason: got === want ? ' +
+    '"BLOCKED by dcg  Reason: git_reset_hard" : ' +
+    '"dcg-ctx-wrap: CANARY SAW DCG_WRAP_BIN=" + got}}));\n');
+  chmodSync(bin, 0o755);
+
+  // (a) THE R8 DEFECT, INVERTED INTO A PASSING TEST: the config block reaches canary 3.
+  const sA = settings([staleEntry(bin)], { DCG_WRAP_BIN: CONFIG_PICK });
+  const rA = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({ HOOK_SETTINGS: sA, HOOK_SWEEP: sweep(0), CTX_WRAP: bin }),
+  });
+  const outA = (rA.stdout || "") + (rA.stderr || "");
+  check("T3a: the settings env block reaches canary 3", !/CANARY SAW/.test(outA));
+  check("T3a: the run goes green off the config-selected scanner", rA.status === 0);
+
+  // (b) PRECEDENCE, THE LOAD-BEARING CASE: both holders set, config must win. If the ordering
+  //     were reversed — config applied UNDERNEATH the ambient environment — the stub would see
+  //     SHELL_PICK here and this goes red.
+  const sB = settings([staleEntry(bin)], { DCG_WRAP_BIN: CONFIG_PICK });
+  const rB = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({
+      HOOK_SETTINGS: sB, HOOK_SWEEP: sweep(0), CTX_WRAP: bin,
+      DCG_WRAP_BIN: SHELL_PICK,
+    }),
+  });
+  const outB = (rB.stdout || "") + (rB.stderr || "");
+  check("T3b: the config env beats the operator shell at canary 3", !/CANARY SAW/.test(outB));
+  check("T3b: and specifically the operator's choice did not win",
+    !new RegExp(`CANARY SAW DCG_WRAP_BIN=${SHELL_PICK.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(outB));
+  check("T3b: the run succeeds with both holders set", rB.status === 0);
+
+  // (c) THE SECOND SITE. `canarySweep` is an independent spawn; R7's fix had to be ordered at
+  //     both sites for exactly this reason, and so does this one.
+  const cfgSweep = path.join(d, "sweep-config.mjs");
+  writeFileSync(cfgSweep,
+    `process.exit(process.env.DCG_WRAP_BIN === ${JSON.stringify(CONFIG_PICK)} ? 0 : 3);\n`);
+  const rC = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({
+      HOOK_SETTINGS: settings([staleEntry(bin)], { DCG_WRAP_BIN: CONFIG_PICK }),
+      HOOK_SWEEP: cfgSweep, CTX_WRAP: bin,
+      DCG_WRAP_BIN: SHELL_PICK,
+    }),
+  });
+  const outC = (rC.stdout || "") + (rC.stderr || "");
+  check("T3c: the coverage sweep sees the config value too", rC.status === 0);
+  check("T3c: the sweep did not report the wrong value", !/sweep exit 3/.test(outC));
+
+  // (d) THE POINT OF THE WHOLE FIX: a stub scanner delivered VIA THE CONFIG must go RED — and
+  //     it does so with no stub-detector anywhere in the applier. Once the canary honours the
+  //     config, a stub simply ALLOWS the known-dangerous fixture and the existing not-denied
+  //     branch fires. The behaviour falls out of the precedence rule.
+  const delegDir = mkdtempSync(path.join(tmp, "t3-deleg-"));
+  const deleg = path.join(delegDir, "dcg-ctx-wrap");
+  writeFileSync(deleg,
+    "#!/usr/bin/env node\n" +
+    "// Behaves like dcg-ctx-wrap in the one respect under test: it runs DCG_WRAP_BIN and\n" +
+    "// forwards whatever that scanner says. A scanner that exits 0 saying nothing is an ALLOW.\n" +
+    "const { spawnSync } = require('node:child_process');\n" +
+    "const r = spawnSync(process.env.DCG_WRAP_BIN || '/nonexistent', [], { encoding: 'utf8' });\n" +
+    "if (r.error || !(r.stdout || '').trim()) {\n" +
+    "  console.log(JSON.stringify({continue:true})); process.exit(0);\n" +
+    "}\n" +
+    "process.stdout.write(r.stdout);\n");
+  chmodSync(deleg, 0o755);
+
+  const silentStub = path.join(d, "silent-stub");
+  writeFileSync(silentStub, "#!/usr/bin/env node\nprocess.exit(0);\n");
+  chmodSync(silentStub, 0o755);
+
+  const sD = settings([staleEntry(deleg)], { DCG_WRAP_BIN: silentStub });
+  const rD = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: opEnv({ HOOK_SETTINGS: sD, HOOK_SWEEP: sweep(0), CTX_WRAP: deleg }),
+  });
+  const outD = (rD.stdout || "") + (rD.stderr || "");
+  check("T3d: a stub scanner delivered via the config env drives the canary RED",
+    rD.status !== 0);
+  check("T3d: it goes red as a fixture that was NOT DENIED, not via a stub-detector",
+    /was NOT denied/.test(outD));
+  check("T3d: and settings.json was left untouched on that red", /was NOT modified/.test(outD));
+
+  // (e) R16 ON EVERY EMITTING BRANCH. A success line must name the scanner it actually invoked
+  //     and must scope its claim; a flat "the control is live" satisfies neither. Both green
+  //     branches are exercised — the PATCH branch first, then the same file again, which is now
+  //     ALREADY CURRENT and emits from a different place in the script.
+  const sE = settings([staleEntry(bin)], { DCG_WRAP_BIN: CONFIG_PICK });
+  const eEnv = opEnv({ HOOK_SETTINGS: sE, HOOK_SWEEP: sweep(0), CTX_WRAP: bin });
+  const rE = spawnSync(process.execPath, [APPLY], { encoding: "utf8", env: eEnv });
+  const outE = (rE.stdout || "") + (rE.stderr || "");
+  check("T3e: patch branch goes green", rE.status === 0);
+  check("T3e: patch branch names the resolved scanner it invoked",
+    outE.includes(`DCG_WRAP_BIN=${CONFIG_PICK}`));
+  check("T3e: patch branch names the wrapper the ctx surface reaches", outE.includes(bin));
+  check("T3e: patch branch scopes the claim", /nothing wider was checked/.test(outE));
+  check("T3e: patch branch does not make the flat claim", !/the control is live/.test(outE));
+
+  // The `env` block must survive the publish. The applier re-serialises the whole document, so
+  // a regression that dropped it would delete the operator's config while reporting success —
+  // the same shape as the guard-entry loss the mid-run change check already refuses.
+  check("T3e: the env block survives the publish",
+    JSON.parse(readFileSync(sE, "utf8")).env.DCG_WRAP_BIN === CONFIG_PICK);
+
+  const rE2 = spawnSync(process.execPath, [APPLY], { encoding: "utf8", env: eEnv });
+  const outE2 = (rE2.stdout || "") + (rE2.stderr || "");
+  check("T3e: already-current branch goes green", rE2.status === 0);
+  check("T3e: already-current branch still says so", /^already current/m.test(outE2));
+  check("T3e: already-current branch names the resolved scanner it invoked",
+    outE2.includes(`DCG_WRAP_BIN=${CONFIG_PICK}`));
+  check("T3e: already-current branch scopes the claim", /nothing wider was checked/.test(outE2));
+  check("T3e: already-current branch does not make the flat claim",
+    !/the control is live/.test(outE2));
+
+  // (f) The other half of the message: with nothing selecting a scanner, the line says so
+  //     rather than naming a path this file never resolved.
+  const rF = run(settings([staleEntry(SCANNER)]), sweep(0));
+  check("T3f: with no config env the line reports the scanner as unselected",
+    /DCG_WRAP_BIN unset/.test(rF.out));
+  check("T3f: that run is still green", rF.status === 0);
 }
 
 rmSync(tmp, { recursive: true, force: true });
