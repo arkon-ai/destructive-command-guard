@@ -558,6 +558,27 @@ def main():
         check("a null tool_name naming nothing guarded is still allowed",
               out.get("continue") is True)
 
+        # ── T4 (R7) is DEFERRED, and this pins WHY, so the next seat does not "fix" it ──
+        #
+        # T4 is real: dict KEYS are not collected, so a dangerous string in a key is
+        # verdicted on its siblings. The obvious three-line remedy — append `key` in the
+        # dict branch — was written, run, and REVERTED, because it converts a fail-CLOSED
+        # path into a fail-OPEN one. Test 7 above denies `{"timeout": 30}` precisely
+        # because NO string exists anywhere and the shape is unintelligible; every dict
+        # carries its own key names, so with keys collected that payload is scanned as the
+        # benign text "timeout" and ALLOWED. Measured: test 7 flipped deny -> allow.
+        #
+        # So this assertion pins the CURRENT, DOCUMENTED behaviour — values scanned, keys
+        # not — rather than pretending the gap is closed. It fails loudly if someone
+        # appends keys without also solving the intelligibility question, which is the
+        # design decision the deferral exists for.
+        out, seen = run(PLUGIN + "ctx_execute",
+                        {"commands": {"git reset --hard origin/main": {"label": "x"}}}, tmp)
+        cmd = seen_command(seen)
+        check("values are still scanned under an unknown key", "x" in cmd)
+        check("dict keys are NOT scanned (documented residual, deferred to transformate WI-3067)",
+              "git reset --hard origin/main" not in cmd)
+
     if failures:
         for f in failures:
             print(f"FAIL: {f}")

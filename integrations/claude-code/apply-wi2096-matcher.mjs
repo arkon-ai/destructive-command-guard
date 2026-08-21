@@ -143,15 +143,42 @@ const runs = (e) => Array.isArray(e.hooks) && e.hooks.some(isCommandHook);
 //                                          A deny laundered into an allow, certified green.
 // So no redirect, no pipe, no argument, no `;` chain, no trailing comment. A tool that
 // certifies a control must refuse anything it cannot execute end-to-end rather than green-tick
-// it. Metacharacters spelled without a space (`/abs/dcg-ctx-wrap|sed`) fail the basename test
-// below instead — the `;` neighbour was already refused that way, by accident rather than by
-// design, which is exactly the sort of accident not to keep depending on.
+// it.
+//
+// ── WHAT IS CLOSED AND WHAT IS NOT — stated exactly, on purpose ──────────────────────────
+// The previous version of this comment claimed more than the code enforced, and that is the
+// mechanism by which this class survived four rounds: each remedy declared victory slightly
+// wider than it had earned, and the next reader believed the declaration and stopped looking.
+// It said metacharacters spelled without a space "fail the basename test below". That is true
+// only for a metacharacter AFTER the last `/` — `/abs/dcg-ctx-wrap|sed` does fail it — and
+// FALSE for every earlier path segment. `/opt/$(touch /tmp/pwn)w/dcg-ctx-wrap` is one
+// whitespace-free token, its basename is exactly right, it is absolute, and the basename test
+// never looks at its interior. Measured: all three canaries green, rc 0, settings PUBLISHED,
+// and the substitution had already run — because canary 3 hands this string to `shell: true`.
+//
+// CLOSED BY THE CHECK BELOW: the first token must be a SHELL LITERAL — a whitelist of
+// characters a shell passes through unchanged — applied to the WHOLE token, interior segments
+// included, before the string ever reaches a shell.
+// NOT CLOSED BY IT: everything after that first token is refused by the anchored match above,
+// not by this whitelist. And a legitimate path carrying a character outside the whitelist (a
+// space, a quote) is REFUSED, not escaped and not made to work — it fails closed and says so.
+//
+// A WHITELIST, not a blacklist of metacharacters. Each of the previous three remedies was
+// beaten by a shape nobody had enumerated; a whitelist cannot be outflanked by a character no
+// one thought of, which is the only property that makes this different from its predecessors.
 //
 // The tilde expansion is kept, and it is also the artifact's own admission that a shell is
 // involved: nothing but a shell expands `~`.
+const SHELL_LITERAL = /^[A-Za-z0-9_@%+=:,.\/-]+$/;
 const soleArgv0 = (command) => {
   const m = String(command).trim().match(/^"([^"]+)"$|^'([^']+)'$|^(\S+)$/);
   const tok = m ? (m[1] || m[2] || m[3] || "") : "";
+  if (!tok) return "";
+  // Tested AS THE SHELL WILL SEE IT — before tilde expansion, because `~` is itself a shell
+  // construct and the expanded form is not the string that gets executed. A quoted token is
+  // tested on its CONTENTS: inside double quotes `$` and a backtick are still live, and
+  // treating single quotes as safe would mean two rules where one fails closed.
+  if (!SHELL_LITERAL.test(tok.startsWith("~/") ? tok.slice(2) : tok)) return "";
   return tok.startsWith("~/") ? path.join(HOME, tok.slice(2)) : tok;
 };
 
@@ -264,6 +291,12 @@ if (ctxEntries.length > 0 && !LIVE_COMMAND) {
     "canaries run the binary: `> /dev/null` would leave the harness with no decision at all,\n" +
     "and `| sed s/deny/allow/` would turn a denial into an approval, both while the wrapper\n" +
     "itself behaved perfectly. If you need a wrapper script, point the hook AT that script.\n" +
+    "The path itself must also be a plain literal — letters, digits and _ @ % + = : , . / -\n" +
+    "with an optional leading `~/`. That is a whitelist, and it covers the INTERIOR of the\n" +
+    "path, not just its last segment: a shell construct in any earlier segment (for example\n" +
+    "`/opt/$(...)/" + wrapperName + "`) is executed by the shell the moment this tool tests\n" +
+    "the command, so it is refused before that can happen. A path containing anything outside\n" +
+    "that set — a space, a quote — is refused rather than escaped; rename or symlink it.\n" +
     "Point one context-mode entry's hook command at the wrapper, then re-run."
   );
   process.exit(1);
@@ -312,6 +345,30 @@ const canaryMatcher = (settingsPath, fail) => {
   console.log(`canary 1: matcher on disk matches all ${LIVE_CTX_TOOLS.length} known ctx tool names`);
 };
 
+// The canaries must not inherit the OPERATOR'S scanner selection. `dcg-ctx-wrap` resolves its
+// scanner as `os.environ.get("DCG_WRAP_BIN", ~/.local/bin/dcg-wrap)`, so a value set in the
+// shell that happens to run this applier silently points the canaries at a DIFFERENT binary
+// from the one the harness will use — Claude Code launches from a desktop entry, a systemd unit
+// or cron, where that variable does not exist. Measured in both directions on a host with no
+// `~/.local/bin/dcg-wrap`: with a deny stub in `DCG_WRAP_BIN` the applier published green at
+// rc 0, and the same hook command with the variable unset then DENIED every guarded ctx call —
+// a total outage certified as "the control is live". Converse, and worse: if the real scanner
+// is a stub or a silent `true`, production ALLOWS everything while canary 3 was green off the
+// env binary — a fail-open under a green certificate.
+//
+// This is the SAME class as the predicate above — the check and the thing checked were
+// different objects — one layer down, in the ENVIRONMENT rather than in the command string.
+// The applier already refuses to depend on this kind of divergence for `node` (process.execPath
+// rather than a PATH lookup) and for the wrapper (resolved from settings.json, never from
+// CTX_WRAP); the scanner's own resolution variable was the one that was left inheriting.
+// Stripped rather than pinned: this tool has no business choosing the scanner at all, and
+// setting it to a value of our own would be the same mistake in the opposite direction.
+const canaryEnv = (extra) => {
+  const env = { ...process.env, ...extra };
+  delete env.DCG_WRAP_BIN;
+  return env;
+};
+
 // 2. The coverage sweep must go green against the file under test.
 const canarySweep = (settingsPath, fail) => {
   const r = spawnSync(process.execPath, [SWEEP], {
@@ -323,7 +380,7 @@ const canarySweep = (settingsPath, fail) => {
     // patch then gets refused for an environment reason.
     // LIVE_WRAPPER, not WRAPPER: the sweep must exercise the binary the hook in this very
     // settings file execs, not the one CTX_WRAP happens to name.
-    env: { ...process.env, HOOK_SETTINGS: settingsPath, CTX_WRAP: LIVE_WRAPPER },
+    env: canaryEnv({ HOOK_SETTINGS: settingsPath, CTX_WRAP: LIVE_WRAPPER }),
   });
   process.stdout.write(r.stdout || "");
   // Diagnostics conventionally go to stderr. Swallowing it left the operator with
@@ -373,6 +430,10 @@ const canaryScanner = (fail) => {
     }),
     encoding: "utf8",
     timeout: 30000,
+    // Without this the spawn inherits process.env wholesale, DCG_WRAP_BIN included, and this
+    // canary — the ONE check that still separates a live scanner from a dark fail-closed
+    // adapter — certifies a binary the harness will never resolve. See canaryEnv above.
+    env: canaryEnv(),
   });
   if (r.error) {
     fail(

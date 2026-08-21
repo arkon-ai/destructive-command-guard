@@ -38,9 +38,13 @@ once and reverted; the suite now pins the decorated names as guarded.
 `ctx_execute` / `ctx_execute_file` carry a single `tool_input.code`;
 `ctx_batch_execute` carries `tool_input.commands[]` of `{label, command}` (older
 builds add a `processing` sibling) and **no** top-level `code`. But the adapter
-does not key on any of that — it walks the whole `tool_input` and collects
-*every* string it finds, at any depth, then joins the non-blank ones one per line
-into the synthetic command. Keying on field names reproduced the transformate WI-2096
+does not key on any of that — it walks the whole `tool_input` and collects every
+string **value** it finds, at any depth, then joins the non-blank ones one per
+line into the synthetic command. Dict **keys** are not collected: a payload
+shaped `{"commands": {"<command text>": {…}}}` is verdicted on the values alone.
+That is a known, bounded gap in the drift-resistance claim rather than a live
+bypass — no context-mode shape carries executable text in a key — and the
+adapter documents why appending keys is not the fix. Keying on field names reproduced the transformate WI-2096
 drift one layer down: rename the field and a guarded call extracts nothing and sails
 through with the suite green.
 

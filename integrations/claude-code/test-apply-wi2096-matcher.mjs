@@ -13,7 +13,7 @@
 // Run: node integrations/claude-code/test-apply-wi2096-matcher.mjs   (exit 0 = pass)
 
 import {
-  mkdtempSync, writeFileSync, readFileSync, copyFileSync, readdirSync, symlinkSync,
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, readdirSync, symlinkSync,
   chmodSync, rmSync, existsSync, statSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -545,6 +545,109 @@ if (process.platform !== "win32") {
   check("the PUBLISHED matcher still refuses Bash", !pre.test("Bash"));
   check("the PUBLISHED matcher still refuses ctx_search",
     !pre.test("mcp__plugin_context-mode_context-mode__ctx_search"));
+}
+
+// ── T1 (R7) — A SHELL CONSTRUCT INSIDE A PATH SEGMENT MUST BE REFUSED BEFORE IT RUNS ──────
+//
+// The previous remedy required the command to be ONE whitespace-free absolute token whose
+// basename matched. That says nothing about the INTERIOR of the path. Measured on the unfixed
+// tree: all three canaries green, rc 0, settings PUBLISHED, and the substitution had already
+// executed — because canary 3 hands the whole string to `shell: true`.
+//
+// The fixture is built exactly as the defect requires, and each detail is load-bearing:
+//   * `${IFS}` and not a space — a space is caught by the anchored single-token match for an
+//     UNRELATED reason, and the control would then pass without testing the interior at all.
+//     That is the vacuous-control shape this suite has already shipped once.
+//   * the real stub lives at `<base>/w/dcg-ctx-wrap`, because `$()` collapses to the empty
+//     string, so the surviving path resolves to a genuinely working scanner and NOTHING
+//     downstream notices the substitution happened.
+// The marker assertion is the one that cannot be satisfied by accident: it fails if the
+// substitution ran, whatever the exit status says.
+{
+  const base = mkdtempSync(path.join(tmp, "t1-"));
+  const realDir = path.join(base, "w");
+  mkdirSync(realDir, { recursive: true });
+  const realBin = path.join(realDir, "dcg-ctx-wrap");
+  copyFileSync(SCANNER, realBin);
+  chmodSync(realBin, 0o755);
+
+  const marker = path.join(base, "SUBSTITUTION-RAN");
+  const evil = base + "/$(touch" + "${IFS}" + marker + ")w/dcg-ctx-wrap";
+
+  const s = settings([staleEntry(evil)]);
+  const before = readFileSync(s, "utf8");
+  const r = run(s, sweep(0), [], realBin);
+
+  check("T1: a shell construct in a path SEGMENT is refused", r.status !== 0);
+  check("T1: the substitution never executed", !existsSync(marker));
+  check("T1: settings were not published over a refused command",
+    readFileSync(s, "utf8") === before);
+  // Name WHICH refusal fired. A rc!=0 that came from some other gate would make the three
+  // assertions above pass while testing nothing — the same reason the earlier symlink control
+  // was vacuous.
+  check("T1: refused as an unroutable command, not by some unrelated gate",
+    /NONE execs/.test(r.out));
+}
+
+// ── T2 (R7) — THE CANARIES MUST NOT INHERIT `DCG_WRAP_BIN` ────────────────────────────────
+//
+// `dcg-ctx-wrap` resolves its scanner from `DCG_WRAP_BIN`, so a value in the operator's shell
+// pointed canary 3 at a different binary from the one the harness resolves — the harness runs
+// from a desktop entry, a systemd unit or cron, where the variable does not exist. Measured
+// both ways on the unfixed tree: green off an env stub while production denied every guarded
+// call, and the converse fail-open if the real scanner is a stub.
+//
+// The fixture denies EITHER WAY, so canary 3's own criterion is satisfied in both worlds and
+// the only variable under test is whether the environment leaked. It reports the leak through
+// the REASON, which makes the failure name itself instead of showing up as a bare non-zero.
+{
+  const d = mkdtempSync(path.join(tmp, "t2-"));
+  const bin = path.join(d, "dcg-ctx-wrap");
+  writeFileSync(bin,
+    "#!/usr/bin/env node\n" +
+    "const leaked = !!process.env.DCG_WRAP_BIN;\n" +
+    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+    'permissionDecision:"deny",permissionDecisionReason: leaked ? ' +
+    '"dcg-ctx-wrap: DCG_WRAP_BIN LEAKED INTO THE CANARY" : ' +
+    '"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+  chmodSync(bin, 0o755);
+
+  const s = settings([staleEntry(bin)]);
+  const r = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOOK_SETTINGS: s,
+      HOOK_SWEEP: sweep(0),
+      CTX_WRAP: bin,
+      // Exactly the condition that produced a green certificate over a dark control.
+      DCG_WRAP_BIN: path.join(d, "operator-scanner-choice"),
+    },
+  });
+  const out = (r.stdout || "") + (r.stderr || "");
+  check("T2: DCG_WRAP_BIN does not reach the canary", !/LEAKED INTO THE CANARY/.test(out));
+  check("T2: the run succeeds with DCG_WRAP_BIN set in the operator environment",
+    r.status === 0);
+
+  // The SWEEP half needs its own fixture. The stub above only exercises canary 3, and
+  // `canarySweep` is a second, independent spawn that inherited the same variable — a
+  // control that covers one of two call sites is half a control, which is the standard
+  // this file is repeatedly held to.
+  const leakSweep = path.join(d, "sweep-leak.mjs");
+  writeFileSync(leakSweep, "process.exit(process.env.DCG_WRAP_BIN ? 3 : 0);\n");
+  const r2 = spawnSync(process.execPath, [APPLY], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOOK_SETTINGS: settings([staleEntry(bin)]),
+      HOOK_SWEEP: leakSweep,
+      CTX_WRAP: bin,
+      DCG_WRAP_BIN: path.join(d, "operator-scanner-choice"),
+    },
+  });
+  const out2 = (r2.stdout || "") + (r2.stderr || "");
+  check("T2: DCG_WRAP_BIN does not reach the coverage sweep either", r2.status === 0);
+  check("T2: the sweep did not report the leak", !/sweep exit 3/.test(out2));
 }
 
 rmSync(tmp, { recursive: true, force: true });

@@ -241,15 +241,39 @@ def is_ctx_tool(tool):
 
 
 def collect_strings(value, depth=0):
-    """Every string anywhere in the tool input, in document order.
+    """Every string VALUE anywhere in the tool input, in document order.
 
     Deliberately shape-agnostic: it does NOT key on field names. Keying on
     `code` / `commands[].command` reproduced the WI-2096 drift one layer down —
     rename the field and a guarded call extracts nothing and fails open. Walking
     the structure means a renamed field is still scanned.
 
-    dcg scans text, so joining everything into one document is equivalent to
-    scanning each piece: any single offending fragment still matches.
+    WHAT THIS DOES NOT COLLECT, stated because the previous wording said "every
+    string" flatly and that is not what the walk does: dict KEYS are not
+    collected. A payload shaped {"commands": {"<command text>": {"label": "x"}}}
+    is verdicted on "x" alone. No context-mode shape ships executable text in a
+    key — `commands` is an array of {label, command} — so this is a bounded gap
+    in the drift-resistance claim rather than a live bypass, and it is carried as
+    a stated residual. Do not "fix" it by appending keys here: that was measured
+    and reverted, because it turns the no-strings-anywhere DENY into an ALLOW
+    (see the comment at the dict branch below).
+
+    dcg scans text and the collected pieces are joined with newlines into one
+    document. WHAT THAT EARNS, AND WHAT IT DOES NOT — stated exactly, because
+    the previous wording ("equivalent to scanning each piece") claimed more than
+    it holds and a docstring in a security control is a load-bearing artifact:
+
+      * An offending fragment wholly contained in ONE collected string still
+        matches, because that string reaches the scanner intact on its own line.
+      * A phrase SPLIT ACROSS SIBLING STRINGS does not match a line-oriented
+        pack. Measured with {"code": ["git","reset","--hard","origin/main"]}:
+        the scanner receives "git\nreset\n--hard\norigin/main" and the phrase
+        appears on no single line.
+
+    No path from a split phrase to execution has been demonstrated — the
+    context-mode runtime stringifies a list and runs the literal, which fails —
+    so this is a bounded gap in the joining claim, NOT a known bypass. It is
+    carried as a stated residual and must not be described as proven equivalence.
     """
     if depth > MAX_DEPTH:
         # NOT `return []`. Silently yielding nothing below the ceiling means a payload with a
@@ -261,6 +285,17 @@ def collect_strings(value, depth=0):
         return [value]
     out = []
     if isinstance(value, dict):
+        # VALUES ONLY — and that is a KNOWN, BOUNDED GAP, not an oversight. See the
+        # "what this does not collect" paragraph in the docstring above.
+        #
+        # Collecting keys as well was tried and REVERTED, because it converts a
+        # fail-CLOSED path into a fail-OPEN one: a guarded payload with no strings
+        # anywhere (`{"timeout": 30}`) is a shape this adapter does not understand and
+        # therefore DENIES without calling dcg. Every dict carries its own key names, so
+        # scanning keys means that payload is scanned as the benign text "timeout" and
+        # ALLOWED. Measured — the suite's own test 7 flipped from deny to allow.
+        # Closing the key gap requires distinguishing key-strings from value-strings when
+        # deciding "is this shape intelligible", which is machinery, not a three-line fix.
         for item in value.values():
             out.extend(collect_strings(item, depth + 1))
     elif isinstance(value, list):
