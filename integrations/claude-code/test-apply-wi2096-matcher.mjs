@@ -1148,6 +1148,73 @@ if (process.platform !== "win32") {
   check("T6e: that run is green", rE.status === 0);
 }
 
+// ── T7 (R11) — DRIVE THE **REAL** COVERAGE SWEEP, NOT A STUB ──────────────────────────────
+//
+// Every other case in this file points HOOK_SWEEP at a stub whose exit status we choose. That is
+// right for testing the applier's handling of a sweep result, and it is exactly why a defect in
+// the applier's CONTRACT WITH THE SWEEP survived for a month: the applier exported `CTX_WRAP`
+// while audit-hook-matchers.mjs reads `process.env.DCG_CTX_WRAP`, so canary 2 swept the sweep's
+// own default binary instead of the settings file's. No stub could show that, because a stub
+// reads neither name.
+//
+// So at least one case runs the REAL script. It is pointed at explicitly rather than found by
+// the applier's default, because the default is an absolute path under $HOME that does not
+// resolve on every host this suite runs on — but the SCRIPT is the real one either way, which is
+// the property that matters.
+{
+  // The applier's own default location first, then the layout this fleet actually uses.
+  const candidates = [
+    path.join(process.env.HOME || process.env.USERPROFILE || "",
+      "dev/warden-memory/scripts/audit-hook-matchers.mjs"),
+    "/mnt/c/Users/brynn/dev/warden-memory/scripts/audit-hook-matchers.mjs",
+    "C:/Users/brynn/dev/warden-memory/scripts/audit-hook-matchers.mjs",
+  ];
+  const realSweep = candidates.find((p) => p && existsSync(p));
+
+  if (!realSweep) {
+    // LOUD, not silent. A skipped case must never read as a passing one.
+    console.log(
+      "SKIP: T7 — the real coverage sweep was not found at any known path, so the " +
+      "applier/sweep contract is NOT exercised on this host. Looked in:\n  " +
+      candidates.filter(Boolean).join("\n  "));
+    failures.push("T7 SKIPPED — real sweep absent, applier/sweep contract unverified here");
+  } else {
+    const d = mkdtempSync(path.join(tmp, "t7-"));
+    const marker = path.join(d, "wrapper-ran");
+    const rec = path.join(mkdtempSync(path.join(tmp, "t7-rec-")), "dcg-ctx-wrap");
+    writeFileSync(rec,
+      `#!${process.execPath}\n` +
+      `require("node:fs").appendFileSync(${JSON.stringify(marker)}, "ran\\n");\n` +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+    chmodSync(rec, 0o755);
+
+    // THE ASSERTION THAT MATTERS: the applier's pin must reach the real sweep, so the binary
+    // this settings document names is the one the sweep interrogates. Before the fix this
+    // marker did not appear at all — the sweep resolved its own default instead.
+    const r = run(settings([staleEntry(rec)]), realSweep, [], rec);
+    check("T7: the applier's wrapper pin REACHES the real coverage sweep",
+      existsSync(marker));
+
+    // NEGATIVE CONTROL, driving the real script directly: with only the OLD variable name
+    // exported, the sweep must NOT reach this binary. This is the defect, encoded — if it ever
+    // passes, the sweep has changed which name it reads and this contract needs re-measuring.
+    const marker2 = path.join(d, "oldname-ran");
+    const rec2 = path.join(mkdtempSync(path.join(tmp, "t7-rec2-")), "dcg-ctx-wrap");
+    writeFileSync(rec2,
+      `#!${process.execPath}\n` +
+      `require("node:fs").appendFileSync(${JSON.stringify(marker2)}, "ran\\n");\n` +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: x"}}));\n');
+    chmodSync(rec2, 0o755);
+    const envOld = { ...process.env, HOOK_SETTINGS: settings([staleEntry(rec2)]), CTX_WRAP: rec2 };
+    delete envOld.DCG_CTX_WRAP;
+    spawnSync(process.execPath, [realSweep], { encoding: "utf8", timeout: 120000, env: envOld });
+    check("T7: CTX_WRAP alone does NOT reach the real sweep (the defect, pinned)",
+      !existsSync(marker2));
+  }
+}
+
 rmSync(tmp, { recursive: true, force: true });
 
 if (failures.length) {

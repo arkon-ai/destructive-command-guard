@@ -552,9 +552,28 @@ const canarySweep = (settingsPath, fail) => {
     // process.execPath, not a PATH lookup for "node": under a systemd unit, a cron entry or
     // an nvm shell the lookup picks a different runtime or fails outright, and a correct
     // patch then gets refused for an environment reason.
-    // LIVE_WRAPPER, not WRAPPER: the sweep must exercise the binary the hook in this very
-    // settings file execs, not the one CTX_WRAP happens to name.
-    env: canaryEnv(settingsPath, fail, { HOOK_SETTINGS: settingsPath, CTX_WRAP: LIVE_WRAPPER }),
+    // THE SWEEP READS `DCG_CTX_WRAP`, NOT `CTX_WRAP`. Measured, because the previous version of
+    // this comment claimed the opposite of what the code did and sat directly above the line
+    // that disproved it:
+    //   audit-hook-matchers.mjs:41  `const CTX_WRAP = process.env.DCG_CTX_WRAP || <its default>`
+    // The sweep's LOCAL CONSTANT is named `CTX_WRAP`, which is exactly why reading the code
+    // misses this — the name matches and the source does not. With only `CTX_WRAP` exported,
+    // NEITHER a binary named by it nor one named by `DCG_CTX_WRAP` ran; with both exported to
+    // different binaries, `DCG_CTX_WRAP` won and `CTX_WRAP` was ignored entirely. So for as long
+    // as this pin used only `CTX_WRAP`, canary 2 swept the sweep's OWN DEFAULT binary — one this
+    // applier never resolved and never verified — while claiming to sweep the settings file's.
+    //
+    // Both names are set deliberately. `DCG_CTX_WRAP` is the one the sweep obeys and is the fix;
+    // `CTX_WRAP` is this repo's own convention and is kept so a consumer following it is not
+    // silently dropped. Neither is a guess: the first is measured, the second is ours.
+    //
+    // LIVE_WRAPPER, not WRAPPER, remains the right VALUE: the sweep must exercise the binary the
+    // hook in this very settings file execs.
+    env: canaryEnv(settingsPath, fail, {
+      HOOK_SETTINGS: settingsPath,
+      DCG_CTX_WRAP: LIVE_WRAPPER,
+      CTX_WRAP: LIVE_WRAPPER,
+    }),
   });
   process.stdout.write(r.stdout || "");
   // Diagnostics conventionally go to stderr. Swallowing it left the operator with
