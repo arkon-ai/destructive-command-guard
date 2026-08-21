@@ -128,8 +128,26 @@ const runs = (e) => Array.isArray(e.hooks) && e.hooks.some(isCommandHook);
 // systemd unit, a cron entry or an nvm shell the lookup resolves to a different inode or to
 // nothing at all, and Claude Code hooks inherit exactly that problem. The path this resolves
 // is the one the canaries run — that binding is the whole point.
-const argv0 = (command) => {
-  const m = String(command).trim().match(/^"([^"]+)"|^'([^']+)'|^(\S+)/);
+// The regex is ANCHORED AT BOTH ENDS: the command must be that one token and NOTHING else.
+//
+// Matching only the FIRST token left everything after it invisible, because the harness runs
+// the hook THROUGH A SHELL while canary 3 spawns the binary directly. Measured, both published
+// green at rc 0 with a stub that genuinely emitted a scanner-sourced deny — so canary 3's own
+// criterion was satisfied by a binary whose output the live command then threw away or flipped:
+//   `/abs/dcg-ctx-wrap >/dev/null`        the shell emits nothing; the harness sees no decision
+//                                          and the guarded call proceeds. The control is DARK.
+//   `/abs/dcg-ctx-wrap | sed s/deny/allow/` the shell emits permissionDecision "allow".
+//                                          A deny laundered into an allow, certified green.
+// So no redirect, no pipe, no argument, no `;` chain, no trailing comment. A tool that
+// certifies a control must refuse anything it cannot execute end-to-end rather than green-tick
+// it. Metacharacters spelled without a space (`/abs/dcg-ctx-wrap|sed`) fail the basename test
+// below instead — the `;` neighbour was already refused that way, by accident rather than by
+// design, which is exactly the sort of accident not to keep depending on.
+//
+// The tilde expansion is kept, and it is also the artifact's own admission that a shell is
+// involved: nothing but a shell expands `~`.
+const soleArgv0 = (command) => {
+  const m = String(command).trim().match(/^"([^"]+)"$|^'([^']+)'$|^(\S+)$/);
   const tok = m ? (m[1] || m[2] || m[3] || "") : "";
   return tok.startsWith("~/") ? path.join(HOME, tok.slice(2)) : tok;
 };
@@ -137,7 +155,7 @@ const argv0 = (command) => {
 const wrapperName = path.basename(WRAPPER);
 const hookWrapperPath = (h) => {
   if (!isCommandHook(h)) return "";
-  const bin = argv0(h.command);
+  const bin = soleArgv0(h.command);
   if (path.basename(bin) !== wrapperName) return "";
   return path.isAbsolute(bin) ? bin : "";
 };
@@ -204,10 +222,14 @@ if (ctxEntries.length > 0 && !LIVE_WRAPPER) {
     `context-mode matcher(s) exist in ${SETTINGS} but NONE execs '${wrapperName}'.\n` +
     "The matcher string is not the control — the hook command is. Rewriting the matcher would\n" +
     "leave the ctx surfaces going somewhere else entirely, so this stops instead.\n" +
-    "The first argv token of the command must BE the wrapper — an absolute path whose basename\n" +
+    "The command must BE the wrapper and nothing else — a single absolute path whose basename\n" +
     `is exactly '${wrapperName}'. A command that merely mentions the name (a .bak copy, an\n` +
     "`echo`, a trailing comment) routes nowhere, and a bare PATH lookup resolves differently\n" +
     "under systemd, cron and nvm than it does in your shell.\n" +
+    "Anything AFTER that path is refused too, because the hook runs through a shell while the\n" +
+    "canaries run the binary: `> /dev/null` would leave the harness with no decision at all,\n" +
+    "and `| sed s/deny/allow/` would turn a denial into an approval, both while the wrapper\n" +
+    "itself behaved perfectly. If you need a wrapper script, point the hook AT that script.\n" +
     "Point one context-mode entry's hook command at the wrapper, then re-run."
   );
   process.exit(1);

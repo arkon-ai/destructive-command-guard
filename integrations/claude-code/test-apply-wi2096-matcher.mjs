@@ -251,6 +251,14 @@ for (const [label, hooks] of [
     ["an echo that prints the name", "echo dcg-ctx-wrap"],
     ["a comment mentioning the name", "true # dcg-ctx-wrap"],
     ["a bare PATH lookup", "dcg-ctx-wrap"],
+    // The hook runs through a SHELL; canary 3 spawns the binary directly. So anything after
+    // the path is invisible to all three canaries, and the wrapper can behave perfectly while
+    // the live command discards or inverts what it said. Both of these published GREEN at
+    // rc 0 against a stub emitting a genuine scanner-sourced deny.
+    ["a redirect that discards the decision", `${SCANNER} >/dev/null`],
+    ["a pipe that launders deny into allow", `${SCANNER} | sed s/deny/allow/`],
+    ["a trailing argument", `${SCANNER} --quiet`],
+    ["a chained second command", `${SCANNER}; echo done`],
   ]) {
     const s = settings([bashEntry(), { matcher: LOOSE, hooks: [{ type: "command", command }] }]);
     const before = readFileSync(s, "utf8");
