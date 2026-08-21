@@ -375,7 +375,7 @@ const canaryMatcher = (settingsPath, fail) => {
 //   control. A green certificate over a binary the harness never runs.
 //
 // So the rule is: the canary's BASE environment is an ALLOWLIST — only the names in
-// CANARY_ENV_KEEP below survive from this process, plus a deterministic `PATH` floor — and the
+// CANARY_ENV_KEEP below survive from this process, and NO `PATH` is supplied by this tool — and the
 // settings document's `env` block is then applied ON TOP of it. That is the exact domain: not
 // "the shell is out" in general, but "only these names survive, and config overrides them".
 //
@@ -402,12 +402,22 @@ const canaryMatcher = (settingsPath, fail) => {
 // PATH can be richer than the floor OR it can SHADOW a working interpreter with a broken one,
 // and the floor is blind to the second.
 //
-// WHAT IS ACTUALLY TRUE, and all that is claimed here: the canary runs with `PATH` set to
-// PATH_FLOOR, which is NOT the `PATH` the harness will give the hook. The two environments
-// differ, in both directions, and this file cannot observe the harness's environment at apply
-// time to reconcile them. That is an OPEN defect, not a design property — tracked as R10 T1,
-// and the reason the settings `env` block remains the only place where an operator can make the
-// canary and the hook read the same value.
+// THE FLOOR IS GONE. That history is kept because it is why the code looks the way it does, but
+// it no longer describes anything this file executes: there is no PATH_FLOOR and the canary
+// invents no PATH at all.
+//
+// WHAT IS ACTUALLY TRUE, and all that is claimed here: `PATH` reaches a canary ONLY from the
+// settings document's own `env` block, and if the document does not declare it this tool
+// REFUSES TO CERTIFY rather than supplying one — see the established-environment contract below,
+// which is where that behaviour is defined and enforced. When the document does declare it,
+// canary and hook read the SAME declared value, and the green line is scoped to exactly that:
+// a conditional claim about the environment this document declares, never a claim that the
+// canary's environment and the harness's are equal.
+//
+// What remains open, and is NOT claimed closed anywhere: variables the document does not declare
+// still come from the harness's ambient environment, which this file cannot observe at apply
+// time. PYTHONPATH, PYTHONHOME and LD_PRELOAD all act on the interpreter and are excluded from
+// the canary by CANARY_ENV_KEEP while the harness may still carry them.
 //
 // Do not restore a claim about which way this fails without a measurement of BOTH directions.
 //

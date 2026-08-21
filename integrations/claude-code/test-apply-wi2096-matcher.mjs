@@ -63,8 +63,9 @@ function wrapper(kind) {
     silent: 'process.exit(0);',
   };
   // The interpreter is named ABSOLUTELY, not via `/usr/bin/env`: the canary environment now
-  // carries a deterministic PATH floor, so a fixture that resolves its own interpreter through
-  // PATH would be testing the floor rather than the behaviour under test.
+  // carries only the PATH the settings document DECLARES, so a fixture that resolved its own
+  // interpreter through PATH would be testing that declaration rather than the behaviour under
+  // test.
   writeFileSync(p, `#!${process.execPath}\n${bodies[kind]}\n`);
   chmodSync(p, 0o755);
   return p;
@@ -902,8 +903,8 @@ if (process.platform !== "win32") {
   check("T4b: a PATH entry planted by the operator does not reach the canary",
     !/OPERATOR ENV LEAKED[^"]*PATH/.test(outA));
 
-  // (c) The settings document CAN still set PATH, and it beats the floor. This is the operator's
-  //     one supported remedy when the real harness needs a richer PATH than the floor, and it is
+  // (c) The settings document is the ONLY source of PATH, and its value is what the canary runs
+  //     with. This is the operator's one supported way to control that environment, and it is
   //     the same block the harness itself reads — so canary and hook stay the same object.
   const wantPath = path.join(d, "config-chosen-bin");
   const pathProbe = path.join(d, "p", "dcg-ctx-wrap");
@@ -926,7 +927,7 @@ if (process.platform !== "win32") {
     }),
   });
   const outC = (rC.stdout || "") + (rC.stderr || "");
-  check("T4c: the settings env block can still set PATH and beats the floor",
+  check("T4c: the settings env block is the sole source of the canary PATH",
     !/CONFIG PATH DID NOT WIN/.test(outC));
   check("T4c: that run is green", rC.status === 0);
 
@@ -941,7 +942,7 @@ if (process.platform !== "win32") {
   //
   //     The interpreter is named something no host ships in /usr/bin ON PURPOSE, so this
   //     measures PATH INHERITANCE rather than whether this particular box happens to have
-  //     python3 sitting where the floor can reach it.
+  //     python3 sitting where a declared PATH happens to reach it.
   const opBin = mkdtempSync(path.join(tmp, "t4-opbin-"));
   const interp = path.join(opBin, "dcgtestinterp");
   writeFileSync(interp, `#!/bin/sh\nexec ${process.execPath} "$@"\n`);
