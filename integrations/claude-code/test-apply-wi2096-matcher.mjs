@@ -1203,18 +1203,41 @@ if (process.platform !== "win32") {
     rWrong.status !== 0);
 }
 
-// B1 (round after 954912c) — declared NODE_OPTIONS must not reach the Node sweep child.
+// B1 — a settings document that declares Node-runtime or native-preload keys is a
+// substitute: the harness overlays them onto the live hook, and this certifier cannot
+// run that process. Refuse, do not strip-and-publish. B1-node is the --require receipt:
+// the certifier itself must not load a planted module on the way to that refusal.
 {
   const d = mkdtempSync(path.join(tmp, "nodeopt-"));
   const marker = path.join(d, "PWNED");
   const pwn = path.join(d, "pwn.js");
   writeFileSync(pwn, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "pwned");\n`);
-  const r = run(settings([staleEntry()], {
-    NODE_OPTIONS: `--require ${pwn}`,
-  }), sweep(0));
-  check("B1-node: declared NODE_OPTIONS --require does not run in the sweep",
+  const keys = [
+    ["NODE_OPTIONS", `--require ${pwn}`],
+    ["NODE_PATH", d],
+    ["NODE_REPL_EXTERNAL_MODULE", pwn],
+    ["LD_PRELOAD", path.join(d, "neuter.so")],
+    ["LD_LIBRARY_PATH", d],
+    ["DYLD_INSERT_LIBRARIES", path.join(d, "neuter.dylib")],
+    ["DYLD_LIBRARY_PATH", d],
+  ];
+  for (const [key, value] of keys) {
+    const s = settings([staleEntry()], { [key]: value });
+    const before = readFileSync(s, "utf8");
+    const r = run(s, sweep(0));
+    check(`B1: declared ${key} refuses`, r.status !== 0);
+    check(`B1: declared ${key} is REFUSING TO CERTIFY`, /REFUSING TO CERTIFY/.test(r.out));
+    // Anchored to the REFUSAL line, not to r.out: the green line prints its own residual
+    // list ("native preload (LD_PRELOAD, LD_LIBRARY_PATH, DYLD_*)"), so a bare
+    // r.out.includes(key) passes off THAT text for LD_PRELOAD and LD_LIBRARY_PATH and
+    // cannot tell a naming refusal from no refusal at all. Key names are [A-Z_] only.
+    check(`B1: declared ${key} refusal names the key`,
+      new RegExp(`REFUSING TO CERTIFY[^\n]*declares[^\n]*${key}`).test(r.out));
+    check(`B1: declared ${key} does not publish`, readFileSync(s, "utf8") === before);
+    check(`B1: declared ${key} never reaches canary 3`, !/canary 3:/.test(r.out));
+  }
+  check("B1-node: declared NODE_OPTIONS --require does not run in the certifier",
     !existsSync(marker));
-  check("B1-node: that run can still go green off a stub sweep", r.status === 0);
 }
 
 // ── T7 — THE APPLIER'S SWEEP PIN IS DCG_CTX_WRAP ─────────────────────────────────────────

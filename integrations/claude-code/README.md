@@ -130,8 +130,12 @@ node apply-wi2096-matcher.mjs             # candidate → canary ×3 → backup 
 The applier will **refuse to certify** unless the settings document's `env` block
 declares `PATH`, `PYTHONPATH`, `PYTHONHOME` and `PYTHONSTARTUP` (empty string
 counts). It does not invent a PATH floor and does not inherit the calling
-shell. A green line names those four values and states that native preload
-(`LD_PRELOAD` and friends) was not established.
+shell. It also refuses if that block declares Node-runtime or native-preload
+selectors (`NODE_OPTIONS`, `NODE_PATH`, `NODE_REPL_EXTERNAL_MODULE`, `LD_PRELOAD`,
+`LD_LIBRARY_PATH`, `DYLD_*`): the harness would overlay those onto the live hook,
+and a canary that stripped them would be certifying a different process. A green
+line names the four pin values and states that ambient native preload was not
+established.
 
 | canary | asserts |
 |---|---|

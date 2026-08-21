@@ -417,10 +417,14 @@ const canaryMatcher = (settingsPath, fail) => {
 //
 // CLOSED: those four names, for this settings document. A bare DCG_WRAP_BIN is resolved
 // against the declared PATH, so canary and hook agree on it too.
-// NOT CLOSED, and a green line that omits this list is a lie: native preload (LD_PRELOAD,
-// LD_LIBRARY_PATH, DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH); any env name not in the four;
-// other settings scopes (enterprise, project, --settings); HOME, used only for the wrapper's
-// default scanner path when DCG_WRAP_BIN is unset.
+// CLOSED AS REFUSAL, not as a pin: NODE_OPTIONS, NODE_PATH, NODE_REPL_EXTERNAL_MODULE,
+// LD_PRELOAD, LD_LIBRARY_PATH, DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH. A document that
+// declares any of those is refused. The harness overlays them onto the live hook; this
+// certifier cannot run that process (canary 2 is process.execPath; production's wrapper
+// is python3). Stripping them from the canary and publishing is a substitute.
+// NOT CLOSED, and a green line that omits this list is a lie: ambient (undeclared) native
+// preload; any other env name; other settings scopes (enterprise, project, --settings);
+// HOME, used only for the wrapper's default scanner path when DCG_WRAP_BIN is unset.
 //
 // THE COMPOSITION WAS MEASURED AGAINST THE HARNESS, NOT ASSUMED. A PreToolUse hook, the same
 // event this control is, was spawned by Claude Code 2.1.238 with a probe variable set to one
@@ -499,11 +503,35 @@ const refuseUnestablished = (_settingsPath, missing) =>
   "dominates ambient). The harness overlays that block onto every hook, so canary and hook\n" +
   "then read the same four names. Re-run after that. " + SETTINGS + " was NOT modified.";
 
-const canaryEnv = (settingsPath, fail, extra) => {
+// Names the harness would overlay onto the live hook, and that this certifier cannot run
+// as the same object. Declaring any of them is a substitute; refuse rather than strip.
+const NODE_RUNTIME_KEYS = ["NODE_OPTIONS", "NODE_PATH", "NODE_REPL_EXTERNAL_MODULE"];
+const NATIVE_PRELOAD_KEYS = [
+  "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+];
+const SUBSTITUTED_ENV_KEYS = [...NATIVE_PRELOAD_KEYS, ...NODE_RUNTIME_KEYS];
+
+const substitutedKeys = (declared) =>
+  SUBSTITUTED_ENV_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(declared, k));
+
+const refuseSubstituted = (keys) =>
+  `REFUSING TO CERTIFY — ${SETTINGS} env block declares ${keys.join(", ")}.\n` +
+  "The harness overlays those onto the hook; this tool will not run the canary without\n" +
+  "them and call the result the same object. Remove them from the env block, then re-run.\n" +
+  SETTINGS + " was NOT modified.";
+
+const refuseIfEnvUnusable = (settingsPath, fail) => {
   const declared = configEnv(settingsPath, fail);
   declaredEnv = declared;
   const missing = missingPins(declared);
   if (missing.length) fail(refuseUnestablished(settingsPath, missing));
+  const substituted = substitutedKeys(declared);
+  if (substituted.length) fail(refuseSubstituted(substituted));
+  return declared;
+};
+
+const canaryEnv = (settingsPath, fail, extra) => {
+  const declared = refuseIfEnvUnusable(settingsPath, fail);
   const env = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (CANARY_ENV_KEEP.has(k)) env[k] = v;
@@ -512,25 +540,21 @@ const canaryEnv = (settingsPath, fail, extra) => {
   // This applier's own pins go LAST so the document under test cannot redirect the canary that
   // is judging it — the sweep must run against LIVE_WRAPPER and the file under test whatever
   // the `env` block says.
-  const out = { ...env, ...extra };
-  // Node-runtime / native-loader keys from the document must not reach ANY child this
-  // certifier spawns. Canary 2 is process.execPath. Test fixtures are Node shebang
-  // wrappers. A `--require` in declared NODE_OPTIONS would otherwise execute in the
-  // certifier, which production's Python wrapper never starts.
-  for (const k of [
-    "NODE_OPTIONS", "NODE_PATH", "NODE_REPL_EXTERNAL_MODULE",
-    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
-  ]) {
-    delete out[k];
-  }
-  return out;
+  return { ...env, ...extra };
 };
 
-const sweepEnv = (settingsPath, fail) => canaryEnv(settingsPath, fail, {
-  HOOK_SETTINGS: settingsPath,
-  DCG_CTX_WRAP: LIVE_WRAPPER,
-  CTX_WRAP: LIVE_WRAPPER,
-});
+const sweepEnv = (settingsPath, fail) => {
+  const out = canaryEnv(settingsPath, fail, {
+    HOOK_SETTINGS: settingsPath,
+    DCG_CTX_WRAP: LIVE_WRAPPER,
+    CTX_WRAP: LIVE_WRAPPER,
+  });
+  // The sweep is THIS certifier's Node child, not the hook. Declared Node-runtime keys are
+  // already refused above; strip the names anyway so a future extra/keep cannot --require
+  // into process.execPath.
+  for (const k of NODE_RUNTIME_KEYS) delete out[k];
+  return out;
+};
 
 // What the canary environment SELECTED as the scanner, named exactly. When `DCG_WRAP_BIN` is
 // set this IS the literal path `dcg-ctx-wrap` will exec; when it is not, the only true
@@ -567,8 +591,8 @@ const canarySweep = (settingsPath, fail) => {
     // dropped. The first is measured, the second is ours.
     //
     // LIVE_WRAPPER, not WRAPPER, is still the right VALUE: the binary the hook in this
-    // settings file execs. Node-runtime selectors from the document are stripped in
-    // sweepEnv — they must not reach process.execPath.
+    // settings file execs. Declared Node-runtime keys are refused before this spawn;
+    // sweepEnv still strips them from this certifier's own Node child.
     env: sweepEnv(settingsPath, fail),
   });
   process.stdout.write(r.stdout || "");
@@ -692,10 +716,7 @@ const canaryScanner = (settingsPath, fail) => {
 const verify = (settingsPath, fail) => {
   // Pin check FIRST, so a missing declaration never prints a canary-1 green and then refuses.
   // canaryEnv repeats it so a future caller that skips verify still cannot spawn a substitute.
-  const declared = configEnv(settingsPath, fail);
-  declaredEnv = declared;
-  const missing = missingPins(declared);
-  if (missing.length) fail(refuseUnestablished(settingsPath, missing));
+  refuseIfEnvUnusable(settingsPath, fail);
   canaryMatcher(settingsPath, fail);
   canarySweep(settingsPath, fail);
   canaryScanner(settingsPath, fail);
@@ -721,13 +742,7 @@ const greenLine = () =>
 // this file's env block (this tool does not rewrite env). verify() reads the file it is
 // handed again so a future split of those two objects cannot skip this.
 {
-  const declared = configEnv(SETTINGS, (why) => { console.error(why); process.exit(1); });
-  declaredEnv = declared;
-  const missing = missingPins(declared);
-  if (missing.length) {
-    console.error(refuseUnestablished(SETTINGS, missing));
-    process.exit(1);
-  }
+  refuseIfEnvUnusable(SETTINGS, (why) => { console.error(why); process.exit(1); });
 }
 
 if (targets.length === 0) {
