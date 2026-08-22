@@ -128,9 +128,15 @@ node apply-wi2096-matcher.mjs             # candidate → canary ×3 → backup 
 ```
 
 The applier will **refuse to certify** unless the settings document's `env` block
-declares `PATH`, `PYTHONPATH`, `PYTHONHOME` and `PYTHONSTARTUP` (empty string
-counts). It does not invent a PATH floor and does not inherit the calling
-shell. It also refuses if that block declares Node-runtime or native-preload
+declares `PATH`, `PYTHONPATH`, `PYTHONHOME` and `PYTHONSTARTUP`. An empty string
+counts as a declaration for the last three, where it means "unset" and still
+dominates ambient. It does **not** count for `PATH`: an empty `PATH` resolves no
+interpreter at all, and `dcg-ctx-wrap` starts `#!/usr/bin/env python3`, so the
+control would be dark rather than certified. Every component of all four must be
+an absolute path -- a trailing or doubled delimiter is an empty component and
+means the current directory. A declared `DCG_WRAP_BIN` must be absolute too: it
+names the file the green line calls the scanner. It does not invent a PATH floor
+and does not inherit the calling shell. It also refuses if that block declares Node-runtime or native-preload
 selectors (`NODE_OPTIONS`, `NODE_PATH`, `NODE_REPL_EXTERNAL_MODULE`, `LD_PRELOAD`,
 `LD_LIBRARY_PATH`, `DYLD_*`): the harness would overlay those onto the live hook,
 and a canary that stripped them would be certifying a different process. A green

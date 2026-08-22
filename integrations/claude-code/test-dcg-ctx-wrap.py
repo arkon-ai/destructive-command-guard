@@ -248,11 +248,14 @@ def main():
                 env=dict(os.environ, DCG_WRAP_BIN=envelope), timeout=20,
             )
             try:
-                out = json.loads(proc.stdout)
+                out = _with_exit(json.loads(proc.stdout), proc.returncode)
             except ValueError:
                 out = {}
-            check(f"scanner returning {label} DENIES",
-                  out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+            # denied(), not a bare document read: tests 5d, 9 and 10 built their own
+            # subprocess call and asserted the envelope alone, so a deny emitted on an exit
+            # status the host DISCARDS certified green. G-15 measured it on the branch that
+            # test 9 calls "the one that mattered most": deny envelope + sys.exit(1) -> 0 FAILs.
+            check(f"scanner returning {label} DENIES", denied(out))
 
         # 5e. A genuine `{"continue": true}` allow from the scanner still passes through.
         allower = os.path.join(tmp, "allower")
@@ -267,7 +270,7 @@ def main():
             env=dict(os.environ, DCG_WRAP_BIN=allower), timeout=20,
         )
         check("a genuine continue:true allow is passed through",
-              json.loads(proc.stdout).get("continue") is True)
+              allowed(_with_exit(json.loads(proc.stdout), proc.returncode)))
 
         # 5f. IDENTIFICATION IS PART OF THE FAIL-CLOSED CONTRACT.
         #     Every rule below is conditioned on the call having been IDENTIFIED as
@@ -343,9 +346,17 @@ def main():
 
         # The token \u-escaped so it is not literally in the bytes, in a document deep
         # enough that the parse never resolves the escape.
-        out, seen = run_raw('{"tool_name": "' + PLUGIN + 'ctx_ex\\u0065cute", "tool_input": '
-                            '{"pad": ' + "[" * 200000 + "]" * 200000 + "}}", tmp)
-        check("a \\u-escaped guarded token in unparseable stdin is denied", denied(out))
+        # THREE different \\u spellings of the same token, not one. A single case can be
+        # satisfied by a rewrite of that exact escape: G-14 measured the mutant
+        #     decoded = raw.replace("\\\\u0065", "e")
+        # keeping this suite at 0 FAILs while every OTHER encoding of the token became
+        # unattributable and fell through to allow() - the identification bypass reopened on
+        # the raw-bytes path this block exists to close, with no signal. Escaping the FIRST
+        # character is what kills that mutant.
+        for spelling in ('ctx_ex\\u0065cute', '\\u0063tx_execute', 'ctx_execut\\u0065'):
+            out, seen = run_raw('{"tool_name": "' + PLUGIN + spelling + '", "tool_input": '
+                                '{"pad": ' + "[" * 200000 + "]" * 200000 + "}}", tmp)
+            check("a "+spelling+" guarded token in unparseable stdin is denied", denied(out))
 
         # ---- and the ALLOW side, which the refusal above must not swallow ----
         # These are why the check reads the RAW BYTES rather than simply denying whatever
@@ -400,9 +411,8 @@ def main():
                               "tool_input": {"code": "cat /tmp/probe.env"}}),
             capture_output=True, text=True, env=env, timeout=20,
         )
-        out = json.loads(proc.stdout)
-        check("missing scanner binary DENIES (does not fail open)",
-              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+        out = _with_exit(json.loads(proc.stdout), proc.returncode)
+        check("missing scanner binary DENIES (does not fail open)", denied(out))
 
         # 10. SCANNER PRODUCES NO DECISION. subprocess.run does not raise on a non-zero
         #     child exit, so a crash used to be forwarded as whatever was on stdout.
@@ -424,11 +434,10 @@ def main():
                 env=dict(os.environ, DCG_WRAP_BIN=broken), timeout=20,
             )
             try:
-                out = json.loads(proc.stdout)
+                out = _with_exit(json.loads(proc.stdout), proc.returncode)
             except ValueError:
                 out = {}
-            check(f"scanner that {label} DENIES",
-                  out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+            check(f"scanner that {label} DENIES", denied(out))
 
         # 11. A parseable decision passes through with its exit status intact — dcg-wrap
         #     signals a block with exit 2 and rewriting that would mask its DENY.
@@ -449,8 +458,7 @@ def main():
         )
         check("exit-2 deny is passed through unchanged", proc.returncode == 2)
         check("exit-2 deny keeps its decision",
-              json.loads(proc.stdout).get(
-                  "hookSpecificOutput", {}).get("permissionDecision") == "deny")
+              denied(_with_exit(json.loads(proc.stdout), proc.returncode)))
 
 
         # 12. HOW THE REAL SCANNER SPEAKS — pinned against dcg's measured behaviour, not

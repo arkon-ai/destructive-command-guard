@@ -43,12 +43,30 @@ function sweep(exitCode) {
 //   scanner -> denies with dcg's own text          (a live control)
 //   adapter -> denies with a `dcg-ctx-wrap: ` reason (the control DARK, saying the right word)
 //   allow   -> does not deny a known-dangerous fixture at all
+// A stub that DISCRIMINATES instead of answering on startup. Canary 3 now sends a benign
+// fixture as well as the dangerous one, so a canned deny fails the negative control - which is
+// correct, and is exactly the always-deny scanner S-1 is about. These stubs must therefore read
+// the payload and object only to the dangerous one, i.e. behave like a scanner rather than like
+// a rubber stamp.
+//
+// The rule is ALLOW ONLY THE BENIGN FIXTURE, not DENY ONLY THE DANGEROUS ONE. The real
+// coverage sweep (T7b) sends its OWN probe and expects a DENY for every ctx exec tool, so a
+// stub that allowed everything except `git reset --hard` made the sweep report the guardrail
+// as failing open. Measured, not reasoned: T7b printed `dcg-ctx-wrap returned ALLOW
+// (expected DENY) - guardrail fails open` three times under that rule.
+const readsStdin = (onBody) =>
+  'let b="";process.stdin.setEncoding("utf8");' +
+  'process.stdin.on("data",(d)=>{b+=d;});' +
+  'process.stdin.on("end",()=>{' + onBody + '});';
+const DENY_UNLESS_BENIGN =
+  'if (!/echo hello/.test(b)) { console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}})); }' +
+  ' else { console.log(JSON.stringify({continue:true})); }';
+
 function wrapper(kind) {
   const dir = mkdtempSync(path.join(tmp, `w-${kind}-`));
   const p = path.join(dir, "dcg-ctx-wrap");
   const bodies = {
-    scanner: 'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));',
+    scanner: readsStdin(DENY_UNLESS_BENIGN),
     adapter: 'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
       'permissionDecision:"deny",permissionDecisionReason:"dcg-ctx-wrap: scanner /nope could not be run"}}));',
     allow: 'console.log(JSON.stringify({continue:true}));',
@@ -61,12 +79,8 @@ function wrapper(kind) {
     // Records what canary 3 actually DELIVERS, then answers exactly as `scanner` does. The
     // record path is baked in at WRITE time, not passed in the environment: canaryEnv keeps
     // only CANARY_ENV_KEEP, so a stub cannot be told anything through env at all.
-    recording: 'const fs=require("node:fs");let b="";process.stdin.setEncoding("utf8");' +
-      'process.stdin.on("data",(d)=>{b+=d;});' +
-      'process.stdin.on("end",()=>{fs.writeFileSync(' + JSON.stringify(p + ".stdin") + ',b);' +
-      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));' +
-      '});',
+    recording: 'const fs=require("node:fs");' + readsStdin(
+      'fs.appendFileSync(' + JSON.stringify(p + ".stdin") + ',b);' + DENY_UNLESS_BENIGN),
     // Exits clean and says NOTHING. The delivery half of the predicate is about what ARRIVES,
     // so a silent command must fail even though its exit status is perfect.
     silent: 'process.exit(0);',
@@ -636,10 +650,13 @@ if (process.platform !== "win32") {
   writeFileSync(bin,
     `#!${process.execPath}\n` +
     "const leaked = !!process.env.DCG_WRAP_BIN;\n" +
-    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-    'permissionDecision:"deny",permissionDecisionReason: leaked ? ' +
-    '"dcg-ctx-wrap: DCG_WRAP_BIN LEAKED INTO THE CANARY" : ' +
-    '"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+    readsStdin(
+      'if (!/echo hello/.test(b)) {' +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason: leaked ? ' +
+      '"dcg-ctx-wrap: DCG_WRAP_BIN LEAKED INTO THE CANARY" : ' +
+      '"BLOCKED by dcg  Reason: git_reset_hard"}}));' +
+      '} else { console.log(JSON.stringify({continue:true})); }') + "\n");
   chmodSync(bin, 0o755);
 
   const s = settings([staleEntry(bin)]);
@@ -708,7 +725,8 @@ if (process.platform !== "win32") {
     return { ...e, ...over };
   };
 
-  // Denies EITHER WAY, so canary 3's own criterion is satisfied in every world and the single
+  // Denies THE DANGEROUS FIXTURE either way, allows the benign one so the negative control
+  // passes, and canary 3's criterion is satisfied in every world. The single
   // variable under test is WHICH `DCG_WRAP_BIN` arrived. A wrong answer comes back through the
   // reason and names itself, instead of surfacing as a bare non-zero that could be anything.
   const bin = path.join(d, "dcg-ctx-wrap");
@@ -716,10 +734,13 @@ if (process.platform !== "win32") {
     `#!${process.execPath}\n` +
     "const got = process.env.DCG_WRAP_BIN || '(unset)';\n" +
     `const want = ${JSON.stringify(CONFIG_PICK)};\n` +
-    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-    'permissionDecision:"deny",permissionDecisionReason: got === want ? ' +
-    '"BLOCKED by dcg  Reason: git_reset_hard" : ' +
-    '"dcg-ctx-wrap: CANARY SAW DCG_WRAP_BIN=" + got}}));\n');
+    readsStdin(
+      'if (!/echo hello/.test(b)) {' +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason: got === want ? ' +
+      '"BLOCKED by dcg  Reason: git_reset_hard" : ' +
+      '"dcg-ctx-wrap: CANARY SAW DCG_WRAP_BIN=" + got}}));' +
+      '} else { console.log(JSON.stringify({continue:true})); }') + "\n");
   chmodSync(bin, 0o755);
 
   // (a) THE R8 DEFECT, INVERTED INTO A PASSING TEST: the config block reaches canary 3.
@@ -870,7 +891,8 @@ if (process.platform !== "win32") {
     return { ...e, ...over };
   };
 
-  // Denies EITHER WAY, so canary 3's own criterion is satisfied in every world and the only
+  // Denies THE DANGEROUS FIXTURE either way, allows the benign one so the negative control
+  // passes, and canary 3's criterion is satisfied in every world. The only
   // variable under test is WHAT ARRIVED. Leaks come back through the reason and name themselves.
   const probe = path.join(d, "dcg-ctx-wrap");
   writeFileSync(probe,
@@ -879,10 +901,13 @@ if (process.platform !== "win32") {
     "'DCG_UNENUMERATED_SELECTOR'];\n" +
     "const leaked = watch.filter((k) => process.env[k]);\n" +
     `if ((process.env.PATH || '').includes(${JSON.stringify(hijackDir)})) leaked.push('PATH');\n` +
-    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-    'permissionDecision:"deny",permissionDecisionReason: leaked.length ? ' +
-    '"dcg-ctx-wrap: OPERATOR ENV LEAKED " + leaked.join(",") : ' +
-    '"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+    readsStdin(
+      'if (!/echo hello/.test(b)) {' +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason: leaked.length ? ' +
+      '"dcg-ctx-wrap: OPERATOR ENV LEAKED " + leaked.join(",") : ' +
+      '"BLOCKED by dcg  Reason: git_reset_hard"}}));' +
+      '} else { console.log(JSON.stringify({continue:true})); }') + "\n");
   chmodSync(probe, 0o755);
 
   // (a) NO interpreter/loader selector reaches the canary from the operator's shell — including
@@ -924,10 +949,13 @@ if (process.platform !== "win32") {
   writeFileSync(pathProbe,
     `#!${process.execPath}\n` +
     `const ok = process.env.PATH === ${JSON.stringify(wantPath)};\n` +
-    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-    'permissionDecision:"deny",permissionDecisionReason: ok ? ' +
-    '"BLOCKED by dcg  Reason: git_reset_hard" : ' +
-    '"dcg-ctx-wrap: CONFIG PATH DID NOT WIN, saw " + process.env.PATH}}));\n');
+    readsStdin(
+      'if (!/echo hello/.test(b)) {' +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason: ok ? ' +
+      '"BLOCKED by dcg  Reason: git_reset_hard" : ' +
+      '"dcg-ctx-wrap: CONFIG PATH DID NOT WIN, saw " + process.env.PATH}}));' +
+      '} else { console.log(JSON.stringify({continue:true})); }') + "\n");
   chmodSync(pathProbe, 0o755);
 
   const rC = spawnSync(process.execPath, [APPLY], {
@@ -963,8 +991,11 @@ if (process.platform !== "win32") {
   const interpWrap = path.join(mkdtempSync(path.join(tmp, "t4-iw-")), "dcg-ctx-wrap");
   writeFileSync(interpWrap,
     "#!/usr/bin/env dcgtestinterp\n" +
-    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-    'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+    readsStdin(
+      'if (!/echo hello/.test(b)) {' +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));' +
+      '} else { console.log(JSON.stringify({continue:true})); }') + "\n");
   chmodSync(interpWrap, 0o755);
 
   const sD = settings([staleEntry(interpWrap)]);
@@ -1020,8 +1051,11 @@ if (process.platform !== "win32") {
   const interpWrap = path.join(mkdtempSync(path.join(tmp, "t5-iw-")), "dcg-ctx-wrap");
   writeFileSync(interpWrap,
     "#!/usr/bin/env dcgtestinterp\n" +
-    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-    'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+    readsStdin(
+      'if (!/echo hello/.test(b)) {' +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));' +
+      '} else { console.log(JSON.stringify({continue:true})); }') + "\n");
   chmodSync(interpWrap, 0o755);
 
   const opEnv = (over) => {
@@ -1275,8 +1309,11 @@ if (process.platform !== "win32") {
   const rec = path.join(mkdtempSync(path.join(tmp, "t7-rec-")), "dcg-ctx-wrap");
   writeFileSync(rec,
     `#!${process.execPath}\n` +
-    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-    'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+    readsStdin(
+      'if (!/echo hello/.test(b)) {' +
+      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));' +
+      '} else { console.log(JSON.stringify({continue:true})); }') + "\n");
   chmodSync(rec, 0o755);
 
   const r = run(settings([staleEntry(rec)]), pinSweep, [], rec);
@@ -1330,8 +1367,11 @@ if (process.platform !== "win32") {
       `#!${process.execPath}\n` +
       `const fs = require("node:fs");\n` +
       `if (process.env.DCG_CTX_WRAP) fs.appendFileSync(${JSON.stringify(marker)}, "from-sweep\\n");\n` +
-      'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
-      'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));\n');
+      readsStdin(
+        'if (!/echo hello/.test(b)) {' +
+        'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+        'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}}));' +
+        '} else { console.log(JSON.stringify({continue:true})); }') + "\n");
     chmodSync(recB, 0o755);
     const rB = run(settings([bashEntry(), writeEntry(), staleEntry(recB)]), realSweep, [], recB);
     check("T7b: the real sweep spawned the pin (from-sweep, not canary 3)",
@@ -1396,6 +1436,12 @@ if (process.platform !== "win32") {
     ["PATH", "/usr/bin:/bin:", "trailing empty component"],
     ["PATH", "/usr/bin::/bin", "doubled delimiter"],
     ["PATH", "relbin:/usr/bin", "relative component"],
+    // PYTHONPATH is a LIST. These two cases are what distinguish the list rule from the
+    // single-value rule: the bare "lib" row below fails closed under BOTH, so on its own it
+    // could not tell them apart, and the mutant LIST_PINS = new Set(["PATH"]) kept the suite
+    // green while publishing PYTHONPATH=/usr/lib:lib at rc 0 (G-9).
+    ["PYTHONPATH", "/usr/lib:lib", "relative component in a list"],
+    ["PYTHONPATH", "/usr/lib:", "trailing empty component in a list"],
     ["PYTHONPATH", "lib", "relative value"],
     ["PYTHONHOME", "py", "relative value"],
     ["PYTHONSTARTUP", "start.py", "relative value"],
@@ -1463,6 +1509,186 @@ if (process.platform !== "win32") {
   run(s, sweep(0), ["--dry-run"]);
   check("M6: --dry-run still previews without publishing",
     readFileSync(s, "utf8") === before);
+}
+
+
+// ── A8 (O-1) — AN EMPTY `PATH` IS NOT A DECLARATION ───────────────────────────────────────
+//
+// "Empty string counts" is true for PYTHONPATH / PYTHONHOME / PYTHONSTARTUP, where CPython
+// reads empty as unset. For PATH it means NO INTERPRETER RESOLVES: dcg-ctx-wrap starts
+// `#!/usr/bin/env python3`, and `env -i PATH=""` on such a script cannot find python3 at all.
+// O-1 measured `PATH: ""` publishing at rc 0 with no warning — on the tool's own advice, since
+// the remediation text said empty counts with no exception for PATH.
+{
+  const s = settings([staleEntry()], { PATH: "" });
+  const before = readFileSync(s, "utf8");
+  const r = run(s, sweep(0));
+  check("A8: an empty PATH is refused", r.status !== 0);
+  check("A8: the refusal names PATH as the empty one",
+    new RegExp("REFUSING TO CERTIFY[^\n]*PATH[^\n]*empty string").test(r.out));
+  check("A8: an empty PATH does not publish", readFileSync(s, "utf8") === before);
+  // The other three keep the empty-is-a-declaration contract. This is the half of the design
+  // decision that was right, and it must not be broken by the half that was wrong.
+  const ok = settings([staleEntry()], { PYTHONPATH: "", PYTHONHOME: "", PYTHONSTARTUP: "" });
+  check("A8: empty PYTHONPATH / PYTHONHOME / PYTHONSTARTUP still certify",
+    run(ok, sweep(0)).status === 0);
+}
+
+// ── A3 (G-3) — A DECLARED `DCG_WRAP_BIN` MUST BE ABSOLUTE ─────────────────────────────────
+//
+// It is not a pin — it is not required — but when the document declares it, it names the file
+// the green line calls "the scanner behind it", and dcg-ctx-wrap execs it as a path. A relative
+// value resolves against whatever directory the process starts in: the operator's cwd here, the
+// session directory there. G-3 measured `DCG_WRAP_BIN=./dcg-wrap` publishing at rc 0 and being
+// printed in the certificate, while `PYTHONSTARTUP=start.py` was refused one name over.
+{
+  for (const bad of ["./dcg-wrap", "dcg-wrap", "../bin/dcg-wrap"]) {
+    const s = settings([staleEntry()], { DCG_WRAP_BIN: bad });
+    const before = readFileSync(s, "utf8");
+    const r = run(s, sweep(0));
+    check(`A3: DCG_WRAP_BIN=${bad} is refused`, r.status !== 0);
+    check(`A3: DCG_WRAP_BIN=${bad} refusal names the variable`,
+      new RegExp("REFUSING TO CERTIFY[^\n]*DCG_WRAP_BIN").test(r.out));
+    check(`A3: DCG_WRAP_BIN=${bad} does not publish`, readFileSync(s, "utf8") === before);
+  }
+  // Absent is fine — the wrapper resolves its own default — and so is an absolute value.
+  check("A3: an absent DCG_WRAP_BIN still certifies",
+    run(settings([staleEntry()]), sweep(0)).status === 0);
+}
+
+// ── A1 (G-1) — `~/` BINDS TO THE HOME THE SHELL ACTUALLY EXPANDS ──────────────────────────
+//
+// `declaredHome()` accepted USERPROFILE as a substitute for HOME. On Unix only HOME drives
+// tilde expansion, so IDENTITY joined the USERPROFILE value while the shell expanded `~` under
+// the AMBIENT HOME that CANARY_ENV_KEEP preserves. G-1 measured the consequence: rc 0, a
+// certificate naming a USERPROFILE `allow` stub, and the deny it reported arriving from a
+// different inode. The binary named was never run; the binary run was never named.
+{
+  const mkHome = (kind) => {
+    const h = mkdtempSync(path.join(tmp, "a1home-"));
+    const bin = path.join(h, ".local", "bin");
+    mkdirSync(bin, { recursive: true });
+    const w = path.join(bin, "dcg-ctx-wrap");
+    copyFileSync(wrapper(kind), w);
+    chmodSync(w, 0o755);
+    return h;
+  };
+  const TILDE = "~/.local/bin/dcg-ctx-wrap";
+
+  // USERPROFILE alone must NOT satisfy `~/`: nothing expands it on the shell that runs the hook.
+  const hU = mkHome("scanner");
+  const sU = settings([staleEntry(TILDE)], { USERPROFILE: hU });
+  const beforeU = readFileSync(sU, "utf8");
+  const rU = run(sU, sweep(0));
+  check("A1: a declared USERPROFILE alone does not satisfy `~/`", rU.status !== 0);
+  check("A1: refused as an unroutable command, not by some unrelated gate",
+    /NONE execs/.test(rU.out));
+  check("A1: USERPROFILE-only does not publish", readFileSync(sU, "utf8") === beforeU);
+
+  // A declared HOME that is relative, or that carries a shell metacharacter, is refused too:
+  // the JOINED result was never tested, only the segment after `~/`.
+  //
+  // DECLARED RESIDUAL, measured rather than argued. These two cases are pinned by
+  // `hookCommand` (`apply-wi2096-matcher.mjs`), which already refuses a resolved binary that
+  // is not `path.isAbsolute` - so removing the isAbsolute/SHELL_LITERAL guard from
+  // `soleArgv0` leaves this suite at 0 FAILs. That guard is defence in depth, keeping
+  // `soleArgv0` self-contained instead of relying on a caller two hops away, and NO test
+  // here can distinguish it through the applier's observable behaviour. Saying so beats
+  // manufacturing a control that only appears to cover it.
+  //
+  // The half that IS independently observable is USERPROFILE (above): reinstating it as a
+  // tilde HOME turns this suite red. Both cases below still assert WHICH refusal fired,
+  // because a bare `status !== 0` would pass off any unrelated gate - the shape T1 warns of.
+  for (const [bad, why] of [["relhome", "relative"], ["/tmp/$(id)h", "shell construct"]]) {
+    const sR = settings([staleEntry(TILDE)], { HOME: bad });
+    const beforeR = readFileSync(sR, "utf8");
+    const rR = run(sR, sweep(0));
+    check(`A1: a ${why} declared HOME is refused`, rR.status !== 0);
+    check(`A1: a ${why} declared HOME is refused AS UNROUTABLE, not by another gate`,
+      /NONE execs/.test(rR.out));
+    check(`A1: a ${why} declared HOME does not publish`,
+      readFileSync(sR, "utf8") === beforeR);
+  }
+
+  // A declared, absolute HOME is the one accepted form, and it certifies.
+  const hH = mkHome("scanner");
+  const rH = run(settings([staleEntry(TILDE)], { HOME: hH }), sweep(0), [],
+    path.join(hH, ".local", "bin", "dcg-ctx-wrap"));
+  check("A1: a declared absolute HOME certifies `~/`", rH.status === 0);
+}
+
+// ── A2 (G-2) — A NON-COMMAND SIBLING WIDENS ANOTHER CONTROL ───────────────────────────────
+//
+// The mixed gate compared routing commands against COMMAND hooks only, but the schema this file
+// quotes is `command | http | mcp_tool | prompt | agent`. A `prompt` sibling is in-schema and
+// was invisible to that count, so G-2 measured a wrapper hook beside a `prompt` hook publishing
+// at rc 0 and carrying that prompt — previously scoped to ctx_execute alone — onto all three
+// exec tools. That is verbatim the over-firing the gate was written for.
+{
+  for (const sibling of [
+    { type: "prompt", prompt: "decide" },
+    { type: "http", url: "https://example.invalid/hook" },
+    { type: "agent", agent: "reviewer" },
+  ]) {
+    const entry = { matcher: "mcp__context-mode__ctx_execute", hooks: [...hookFor(SCANNER), sibling] };
+    const s = settings([entry]);
+    const before = readFileSync(s, "utf8");
+    const r = run(s, sweep(0));
+    check(`A2: a '${sibling.type}' sibling refuses the rewrite`, r.status !== 0);
+    check(`A2: a '${sibling.type}' sibling is named as a mixed entry`,
+      /mixes a .* hook with another hook/.test(r.out));
+    check(`A2: a '${sibling.type}' sibling leaves the file alone`,
+      readFileSync(s, "utf8") === before);
+  }
+}
+
+// ── A7 (S-1) — CANARY 3 NEEDS A BENIGN NEGATIVE CONTROL ───────────────────────────────────
+//
+// Canary 3 proved a dangerous fixture is denied. On its own that cannot separate "this scanner
+// examined the payload and objected" from "this binary says no to everything". An
+// unconditional-deny scanner blocks 100% of benign ctx traffic — the three-tool outage the
+// adapter suite's test 12 header records as having happened once — and S-1 measured the applier
+// green-ticking exactly that: the suite's own canned-deny stub certified at rc 0.
+{
+  const d = mkdtempSync(path.join(tmp, "a7-"));
+  const always = path.join(d, "dcg-ctx-wrap");
+  writeFileSync(always, `#!${process.execPath}\n` +
+    'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+    'permissionDecision:"deny",permissionDecisionReason:"BLOCKED by dcg  Reason: everything"}}));\n');
+  chmodSync(always, 0o755);
+
+  const s = settings([staleEntry(always)]);
+  const before = readFileSync(s, "utf8");
+  const r = run(s, sweep(0), [], always);
+  check("A7: an always-deny scanner does not certify", r.status !== 0);
+  check("A7: the refusal names the benign fixture, not the dangerous one",
+    /denied a BENIGN fixture/.test(r.out));
+  check("A7: an always-deny scanner does not publish",
+    readFileSync(s, "utf8") === before);
+  // And the discriminating stub — deny the dangerous, allow the benign — still certifies, so
+  // this control refuses always-deny binaries rather than refusing strictness in general.
+  check("A7: a scanner that discriminates still certifies",
+    run(settings([staleEntry()]), sweep(0)).status === 0);
+}
+
+
+// -- M-a (C-1) -- THE REGEX AND THE OPERATOR TEXT MUST AGREE ABOUT `%` --------------------
+//
+// The previous fold closed G-2 in SHELL_LITERAL and left the operator-facing text still
+// listing `%` among the accepted characters. It failed CLOSED, so nothing broke - but the
+// danger is exact: the next edit that "aligns the regex with the message" restores G-2, where
+// `%` was live and an injected command executed on win32. Pin the AGREEMENT, not either side,
+// because either side alone can be edited into consistency the wrong way.
+{
+  const src = readFileSync(APPLY, "utf8");
+  const cls = /const SHELL_LITERAL = \/\^\[([^\]]*)\]\+\$\//.exec(src);
+  check("M-a: SHELL_LITERAL is still one character class", !!cls);
+  const line = /The path itself must also be a plain literal[^\n]*/.exec(src);
+  check("M-a: the operator text listing the accepted characters is still there", !!line);
+  const inRegex = !!cls && cls[1].includes("%");
+  const inText  = !!line && line[0].includes("%");
+  check("M-a: the regex and the operator text agree about `%`", inRegex === inText);
+  check("M-a: and neither of them admits it", inRegex === false);
 }
 
 rmSync(tmp, { recursive: true, force: true });

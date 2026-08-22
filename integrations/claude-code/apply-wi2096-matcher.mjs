@@ -200,8 +200,12 @@ const SHELL_LITERAL = /^[A-Za-z0-9_@+=:,.\/-]+$/;
 const declaredHome = () => {
   const block = cfg && cfg.env;
   if (!block || typeof block !== "object" || Array.isArray(block)) return "";
+  // USERPROFILE is NOT accepted here. On Unix only HOME drives tilde expansion, so a declared
+  // USERPROFILE gave IDENTITY one path while the shell expanded `~` under the AMBIENT HOME that
+  // CANARY_ENV_KEEP preserves. G-1 measured it: rc 0, a certificate naming the USERPROFILE
+  // `allow` stub, and the deny it reported coming from a different inode under ambient HOME.
+  // The binary named was never run and the binary run was never named.
   if (Object.prototype.hasOwnProperty.call(block, "HOME")) return String(block.HOME);
-  if (Object.prototype.hasOwnProperty.call(block, "USERPROFILE")) return String(block.USERPROFILE);
   return "";
 };
 const soleArgv0 = (command) => {
@@ -215,8 +219,12 @@ const soleArgv0 = (command) => {
   if (!SHELL_LITERAL.test(tok.startsWith("~/") ? tok.slice(2) : tok)) return "";
   if (tok.startsWith("~/")) {
     const h = declaredHome();
-    if (!h) return "";
-    return path.join(h, tok.slice(2));
+    // The JOINED result is what the shell execs, and only the segment after `~/` was ever
+    // tested. A declared HOME that is relative, or that carries a shell metacharacter, used
+    // to reach the command line unexamined. Fail closed on all three.
+    if (!h || !path.isAbsolute(h) || !SHELL_LITERAL.test(h)) return "";
+    const joined = path.join(h, tok.slice(2));
+    return SHELL_LITERAL.test(joined) ? joined : "";
   }
   return tok;
 };
@@ -320,15 +328,20 @@ if (hollow.length > 0) {
 // and the sibling started firing on tools it never handled (another wrapper, or a foreign
 // command). Walk every command hook. Mixed wrapper+other is a refuse — rewriting that
 // matcher would drag the other command onto the exec triple.
+// Counted against EVERY hook on the entry, not just the command ones. The schema this file
+// quotes at :120-121 is `command | http | mcp_tool | prompt | agent`, so a `prompt` sibling is
+// in-schema and was invisible to a count of command hooks. G-2 measured it: a wrapper hook
+// beside a `prompt` hook published at rc 0 and carried that prompt onto the exec triple - the
+// same over-firing this gate was written for, implemented for one hook type out of five.
 const mixed = ctxEntries.filter((e) => {
-  const nCmd = commandHooksOf(e).length;
+  const nAll = Array.isArray(e.hooks) ? e.hooks.length : 0;
   const nRoute = entryRoutingCommands(e).length;
-  return nRoute > 0 && nRoute < nCmd;
+  return nRoute > 0 && nRoute < nAll;
 });
 if (mixed.length) {
   console.error(
-    `a context-mode entry in ${SETTINGS} mixes a '${wrapperName}' hook with another command.\n` +
-    "Rewriting its matcher would make the other command fire on tools it never handled.\n" +
+    `a context-mode entry in ${SETTINGS} mixes a '${wrapperName}' hook with another hook.\n` +
+    "Rewriting its matcher would make that other hook fire on tools it never handled.\n" +
     "Give that other command its own matcher, then re-run."
   );
   process.exit(1);
@@ -364,9 +377,13 @@ if (ctxEntries.length > 0 && !LIVE_COMMAND) {
     "canaries run the binary: `> /dev/null` would leave the harness with no decision at all,\n" +
     "and `| sed s/deny/allow/` would turn a denial into an approval, both while the wrapper\n" +
     "itself behaved perfectly. If you need a wrapper script, point the hook AT that script.\n" +
-    "The path itself must also be a plain literal — letters, digits and _ @ % + = : , . / -.\n" +
-    "A leading `~/` is accepted only when HOME (or USERPROFILE) is declared in this file's\n" +
-    "env block, because the shell expands it under that HOME; otherwise use an absolute path.\n" +
+    "The path itself must also be a plain literal - letters, digits and _ @ + = : , . / -.\n" +
+    "`%` is NOT in that list: canary 3 delivers through a shell, which on win32 is cmd.exe, and\n" +
+    "cmd.exe expands %NAME% at delivery, so a `%` in an interior segment is a live construct.\n" +
+    "A leading `~/` is accepted only when HOME is declared in this file's env block, and only\n" +
+    "when that HOME is an absolute plain literal. The shell expands `~` under HOME alone, so a\n" +
+    "declared USERPROFILE would name one path here and expand to another there. Otherwise use\n" +
+    "an absolute path.\n" +
     "The whitelist covers the INTERIOR of the path, not just its last segment: a shell\n" +
     "construct in any earlier segment (for example\n" +
     "`/opt/$(...)/" + wrapperName + "`) is executed by the shell the moment this tool tests\n" +
@@ -391,6 +408,19 @@ if (ctxEntries.length === 0) {
 // Text only. It is handed to the scanner as DATA and never executed; it is here because it
 // is in dcg's default packs, so a working control must object to it.
 const DANGEROUS_FIXTURE = "git reset --hard origin/main";
+
+// The NEGATIVE control. Canary 3 proved a dangerous fixture is denied; on its own that cannot
+// tell "this scanner examined the payload and objected" from "this binary says no to
+// everything". An unconditional-deny scanner blocks 100% of benign ctx traffic - the total
+// three-tool outage test 12 of the adapter suite records as having already happened once - and
+// the applier would green-tick the configuration that causes it (S-1, measured: the suite own
+// canned-deny stub certified green).
+//
+// DELIBERATELY the most inert payload available: printing a literal string. The bar this has to
+// clear is that a LEGITIMATELY STRICT scanner must still certify, so the fixture must be one no
+// defensible pack denies. If some future pack denies `echo`, that is a finding about the pack,
+// and this canary saying so out loud is the correct outcome rather than a false alarm.
+const BENIGN_FIXTURE = "echo hello";
 
 // ── The three canaries. Both the already-current and the patch path run all three. ──
 
@@ -522,9 +552,12 @@ const refuseUnestablished = (_settingsPath, missing) =>
   "systemd unit or cron — not this process). Inventing PATH=/usr/bin:/bin printed green over\n" +
   "a dark control (WI-2096 R10). Inheriting this process printed green the other way (R9).\n" +
   "Declared:\n" + pinLines(declaredEnv, missing) + "\n" +
-  "Add the missing names to the env block of the settings file (empty string counts — it\n" +
-  "dominates ambient). The harness overlays that block onto every hook, so canary and hook\n" +
-  "then read the same four names. Re-run after that. " + SETTINGS + " was NOT modified.";
+  "Add the missing names to the env block of the settings file. An empty string counts as a\n" +
+  "declaration for PYTHONPATH, PYTHONHOME and PYTHONSTARTUP, and dominates ambient. It does NOT\n" +
+  "count for PATH: an empty PATH resolves no interpreter, and dcg-ctx-wrap starts\n" +
+  "#!/usr/bin/env python3 - declare the absolute directories it lives in. The harness overlays\n" +
+  "that block onto every hook, so canary and hook then read the same four names. Re-run after\n" +
+  "that. " + SETTINGS + " was NOT modified.";
 
 // Names the harness would overlay onto the live hook, and that this certifier cannot run
 // as the same object. Declaring any of them is a substitute; refuse rather than strip.
@@ -572,6 +605,48 @@ Declared:
 ${pinLines(declared, [])}
 ${SETTINGS} was NOT modified.`;
 
+// PATH is the ONE exception to "empty string counts". For PYTHONPATH / PYTHONHOME /
+// PYTHONSTARTUP an empty value means unset and CPython treats it as nothing. For PATH it means
+// NO INTERPRETER RESOLVES: dcg-ctx-wrap is #!/usr/bin/env python3, and `env -i PATH=""` on such
+// a script gives "env: 'python3': No such file or directory". O-1 measured PATH:"" publishing at
+// rc 0 with no warning of any kind - and the harm lands BEFORE this tool runs, because the
+// operator writes that value on this tool's own advice and the file is live to the harness the
+// moment it is saved.
+const NON_EMPTY_PINS = new Set(["PATH"]);
+const emptyPins = (declared) =>
+  HOOK_ENV_PINS.filter((k) => NON_EMPTY_PINS.has(k) && String(declared[k] ?? "") === "");
+
+const refuseEmptyPins = (keys, declared) =>
+  `REFUSING TO CERTIFY - ${SETTINGS} env block declares ${keys.join(", ")} as an empty string.
+An empty value is a legal declaration for PYTHONPATH, PYTHONHOME and PYTHONSTARTUP, where it
+means "unset" and CPython reads it as nothing. PATH is not one of those: dcg-ctx-wrap starts
+#!/usr/bin/env python3, so an empty PATH resolves no interpreter and the control is dark for
+every hook the harness runs - not certified, not refused, just silently absent.
+Declare the absolute directories the interpreter lives in. Re-run after that.
+${SETTINGS} was NOT modified.`;
+
+// DCG_WRAP_BIN is not a PIN - it is not required - but when the document declares it, it is the
+// single file the green line calls "the scanner behind it", and dcg-ctx-wrap execs it as a path
+// (dcg-ctx-wrap:124-127, :406-412). A relative value resolves against THIS process's cwd here and
+// against the session directory there. PYTHONSTARTUP, one file the interpreter loads, is already
+// forced absolute; this is the same rule on the name the certificate is actually about. G-3
+// measured `DCG_WRAP_BIN=./dcg-wrap` publishing at rc 0 and printing in the certificate.
+const WRAP_BIN = "DCG_WRAP_BIN";
+const relativeWrapBin = (declared) => {
+  if (!Object.prototype.hasOwnProperty.call(declared, WRAP_BIN)) return false;
+  const v = String(declared[WRAP_BIN]);
+  return v !== "" && !path.isAbsolute(v);
+};
+
+const refuseRelativeWrapBin = (declared) =>
+  `REFUSING TO CERTIFY - ${SETTINGS} env block declares ${WRAP_BIN}=${declared[WRAP_BIN]}, which is
+not an absolute path. That name selects the scanner the green line reports as "the scanner
+behind it", and dcg-ctx-wrap execs it as a path. A relative value resolves against whatever
+directory the process happens to start in: this canary runs in the operator's cwd, the harness
+runs PreToolUse from the session directory, so the certificate would name one file and the hook
+would run another. Give it an absolute path, or remove it to use the wrapper's own default.
+${SETTINGS} was NOT modified.`;
+
 const refuseIfEnvUnusable = (settingsPath, fail) => {
   const declared = configEnv(settingsPath, fail);
   declaredEnv = declared;
@@ -581,6 +656,9 @@ const refuseIfEnvUnusable = (settingsPath, fail) => {
   if (substituted.length) fail(refuseSubstituted(substituted));
   const relative = relativePins(declared);
   if (relative.length) fail(refuseRelativePins(relative, declared));
+  const empties = emptyPins(declared);
+  if (empties.length) fail(refuseEmptyPins(empties, declared));
+  if (relativeWrapBin(declared)) fail(refuseRelativeWrapBin(declared));
   return declared;
 };
 
@@ -761,8 +839,39 @@ const canaryScanner = (settingsPath, fail) => {
       "That is the control being DARK while emitting the right word. Install/repair dcg-wrap."
     );
   }
+  // NEGATIVE CONTROL. Same binary, same env, same delivery - only the payload differs.
+  const rb = spawnSync(LIVE_COMMAND, {
+    shell: true,
+    input: JSON.stringify({
+      tool_name: "mcp__plugin_context-mode_context-mode__ctx_execute",
+      tool_input: { code: BENIGN_FIXTURE, language: "shell" },
+    }),
+    encoding: "utf8",
+    timeout: 30000,
+    env,
+  });
+  if (rb.error) {
+    fail(
+      `CANARY FAILED - the hook command could not be run for the benign fixture ` +
+      `(${rb.error.message}):\n  ${LIVE_COMMAND}` + ENV_REMEDY()
+    );
+  }
+  let outB = null;
+  try { outB = JSON.parse(rb.stdout || ""); } catch { outB = null; }
+  const hsoB = (outB && outB.hookSpecificOutput) || {};
+  if (hsoB.permissionDecision === "deny") {
+    fail(
+      "CANARY FAILED - the scanner denied a BENIGN fixture as well as a dangerous one.\n" +
+      `  benign fixture: ${BENIGN_FIXTURE}\n` +
+      `  reason: ${String(hsoB.permissionDecisionReason || "").slice(0, 200)}\n` +
+      "A binary that denies everything is not a scanner, and canary 3 cannot tell one from a\n" +
+      "working control by watching the dangerous fixture alone. Certifying it would green-tick\n" +
+      "a configuration that blocks 100% of benign ctx traffic - the three-tool outage the\n" +
+      "adapter suite already records once. Repair dcg-wrap, then re-run."
+    );
+  }
   console.log(
-    "canary 3: a known-dangerous fixture was denied BY THE SCANNER\n" +
+    "canary 3: a known-dangerous fixture was denied BY THE SCANNER, and a benign one was NOT\n" +
     `          scanner the canary invoked: ${scannerUsed}`
   );
 };
