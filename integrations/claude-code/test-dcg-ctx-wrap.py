@@ -196,6 +196,30 @@ def main():
         check("unrelated tool passes through", allowed(out) and seen is None)
         out, seen = run(PLUGIN + "ctx_execute", {"code": "   "}, tmp)
         check("blank code passes through", allowed(out) and seen is None)
+
+        # 5a. A BLANK KNOWN FIELD COMPOSED WITH A DANGEROUS SIBLING.
+        #
+        # Test 5 above pins a blank `code` with NO sibling; test 6 below pins an unknown
+        # `script` field when `code` is ABSENT. Nothing composed the two, and that gap admits
+        # an ALLOW on a guarded call: a one-line short-circuit
+        #
+        #     if isinstance(ti.get("code"), str) and not ti["code"].strip(): allow()
+        #
+        # inserted before collect_strings left this suite at rc 0 / 0 FAILs while the payload
+        # below returned {"continue": true} and dcg saw NOTHING. The shipped adapter is correct
+        # - collect_strings walks every value and joins the non-blank ones - but nothing here
+        # held it to that, which is the whole point of the pin.
+        #
+        # Both orderings, because a field-keyed short-circuit can key on either name, and the
+        # sibling assertion reads what dcg ACTUALLY RECEIVED rather than the decision alone.
+        for blank_key, sibling_key in (("code", "script"), ("command", "code"),
+                                       ("code", "commands")):
+            out, seen = run(PLUGIN + "ctx_execute",
+                            {blank_key: "   ",
+                             sibling_key: "git reset --hard origin/main"}, tmp)
+            check(f"blank {blank_key} beside a dangerous {sibling_key} is DENIED", denied(out))
+            check(f"blank {blank_key} beside a dangerous {sibling_key} reached dcg",
+                  seen is not None and "git reset --hard origin/main" in seen_command(seen))
         # An EMPTY payload on a guarded tool is a truncated or malformed invocation, not a
         # deliberate no-op, and the README decision table denies it. It used to be allowed.
         out, seen = run(PLUGIN + "ctx_execute", {}, tmp)
