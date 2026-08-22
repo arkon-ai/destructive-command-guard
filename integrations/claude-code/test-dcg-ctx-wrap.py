@@ -445,6 +445,15 @@ def main():
             ("exits 0 with unparseable stdout", "print('not json')", 0o755),
             ("exits non-zero with unparseable stdout",
              "import sys; print('boom'); sys.exit(1)", 0o755),
+            # THE MODE AXIS. Every fixture above is 0o755, and test 9 pins only the MISSING
+            # binary, so the scanner-failure handler was exercised on exactly one exception
+            # type. Splitting its single `except Exception` into
+            #     except FileNotFoundError: deny(...)   /   except Exception: allow()
+            # left this suite at rc 0 / 0 FAILs while a scanner that EXISTS at mode 0644 -
+            # a bad cp, a mode drift, a package shipping 0644 - turned every guarded ctx
+            # call into an ALLOW. This row is the difference between "the handler denies"
+            # and "the handler denies for the one reason anyone tested".
+            ("exists but is not executable", "print('never runs')", 0o644),
         ):
             broken = os.path.join(tmp, "broken")
             with open(broken, "w") as fh:
@@ -462,6 +471,27 @@ def main():
             except ValueError:
                 out = {}
             check(f"scanner that {label} DENIES", denied(out))
+
+        # 10a. THE SAME HANDLER, THE OTHER SHAPE THAT IS NOT FileNotFoundError: a scanner
+        #      path that resolves to a DIRECTORY. Raises IsADirectoryError (or
+        #      PermissionError, platform and mode dependent), never FileNotFoundError, so a
+        #      handler narrowed to the missing-binary case walks past it into allow().
+        scanner_dir = os.path.join(tmp, "scanner-is-a-directory")
+        os.makedirs(scanner_dir, exist_ok=True)
+        proc = subprocess.run(
+            [sys.executable, WRAP],
+            input=json.dumps({"tool_name": PLUGIN + "ctx_execute",
+                              "tool_input": {"code": "cat /tmp/probe.env"}}),
+            capture_output=True, text=True,
+            env=dict(os.environ, DCG_WRAP_BIN=scanner_dir), timeout=20,
+        )
+        try:
+            out = _with_exit(json.loads(proc.stdout), proc.returncode)
+        except ValueError:
+            out = {}
+        check("a scanner path that is a DIRECTORY denies", denied(out))
+        check("a scanner path that is a DIRECTORY is not quietly allowed",
+              out.get("continue") is not True)
 
         # 11. A parseable decision passes through with its exit status intact — dcg-wrap
         #     signals a block with exit 2 and rewriting that would mask its DENY.
