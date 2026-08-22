@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""
+dcg-ctx-wrap — Claude Code PreToolUse adapter for context-mode ctx_execute.
+
+context-mode's ctx_execute tool runs arbitrary shell/python/js/etc code in a
+sandbox. The DCG hook is wired only for Bash, so ctx_execute became a wide-open
+emission channel and let `infisical secrets --plain` through on 2026-05-15.
+
+This adapter:
+1. Reads Claude Code hook JSON from stdin.
+2. If tool_name CONTAINS one of CTX_TOOL_TOKENS, extracts every code-bearing field
+   and rewrites the payload as a synthetic Bash call so dcg's existing pattern
+   packs run against the code text verbatim.
+3. Pipes the rewritten payload to dcg-wrap, which runs dcg + Discord alerting.
+4. Emits dcg-wrap's decision back to Claude Code unchanged.
+
+Tool-name matching is an UNANCHORED SUBSTRING match, not exact membership and not
+endswith (transformate WI-2096): the harness renamed the tools from
+`mcp__context-mode__ctx_execute` to `mcp__plugin_context-mode_context-mode__ctx_execute`,
+and the exact-membership set silently fell through to fail_open() — a live guardrail
+bypass for months. A substring match survives the next prefix change instead of failing
+open, and unlike endswith it also covers the decorated names the unanchored settings
+matcher really does route here. The constant used to be named for suffixes; that name
+asserted a right-anchoring the code deliberately does not have, and that reading has
+already caused one reintroduction of the bypass, so it is now CTX_TOOL_TOKENS.
+
+For non-shell languages (javascript/python/etc), dcg's regex patterns scan
+the raw source — substrings like `infisical secrets --plain` will match
+whether they appear in `bash` or in a JS `execSync(...)` string. This is
+intentional: defends against the same leak vector in any wrapping language.
+
+DECISION CONTRACT — which way this adapter fails, and why it changed.
+
+The rule is: **once a call is identified as a guarded context-mode tool, it is
+never allowed through on the strength of an adapter or scanner failure.**
+
+  not our surface          -> ALLOW
+    * stdin is not parseable JSON AND its raw bytes name no guarded tool. We
+      cannot identify the call and nothing claims we should. The harness writes
+      this stdin; malformed input means the harness is broken, not that a caller
+      evaded us.
+    * tool_name is a string naming something other than a context-mode exec tool.
+    * the payload carried strings and every one of them is blank — there is
+      genuinely no code text to scan.
+    * THE SCANNER RAN AND SAID NOTHING: exit 0 with empty stdout. That is how dcg
+      spells "allow" — it emits an envelope only when it objects. Measured, not
+      assumed; reading it as "no decision" denied every benign guarded call.
+
+  unidentifiable, but the raw bytes name a guarded tool  -> DENY
+    * stdin does not parse at all.
+    * the top-level document is not a JSON object.
+    * tool_name is missing, empty, or not a string.
+
+  guarded, but we cannot render a verdict  -> DENY
+    * tool_input is not an object.
+    * the payload carries no string fields at all: an unrecognized shape, which
+      is exactly what a schema rename looks like from in here.
+    * dcg-wrap cannot be invoked, times out, or dies.
+    * dcg-wrap exits NON-ZERO having printed nothing — a crash, not a clean scan.
+    * dcg-wrap prints something that is not a recognisable decision, at any exit.
+    * any unexpected exception after the tool was identified as guarded.
+
+This REPLACES the previous blanket fail-open. That guarantee read "the adapter
+must never block real work because of its own bugs", which is a good principle
+applied to the wrong set: a missing scanner binary is not the adapter's bug, and
+once `is_ctx_tool()` is true this adapter is the ONLY path from the ctx tools
+into dcg — the Bash matcher does not fire for them. So an operational failure of
+the scanner silently reopened precisely the channel that leaked on 2026-05-15.
+Measured, not theorised: `DCG_WRAP_BIN=/nonexistent` previously emitted
+`{"continue": true}` and exit 0.
+
+IDENTIFICATION IS PART OF THAT CONTRACT.
+
+Every fail-closed rule above begins "once a call is IDENTIFIED as guarded". So an
+attacker never had to beat them — only to stop them applying. Two routes did
+exactly that, and both returned `{"continue": true}` with the scanner NEVER
+invoked, through the one path this contract blesses as ALLOW:
+
+  * `json.loads()` RECURSES. Nesting any field deep enough raises RecursionError,
+    which is an Exception, which the parse guard caught and turned into allow().
+    MAX_DEPTH does not help — it applies inside collect_strings, AFTER the parse.
+    Measured against this file's parent commit, a guarded ctx_execute carrying a
+    deep sibling field, scanner never run:
+        python 3.11.15 -> allowed from depth ~1100
+        python 3.12.3  -> allowed from depth ~10000   (TEAM-1's interpreter)
+        python 3.14.3  -> allowed from depth ~20000
+    The interpreter sets the price, not whether the door is open.
+  * a NON-STRING `tool_name` reached the same allow() via the old
+    `not isinstance(tool, str)` arm — on every interpreter, at any payload size,
+    and reachable without any adversary at all.
+
+The close: an identification failure is "not our surface" only if nothing in the
+raw stdin claims otherwise. The harness serialises tool_name with a standard JSON
+encoder, which leaves ASCII literal, so a guarded token is present VERBATIM in the
+bytes even when the document as a whole will not parse. If it is there, refuse.
+This is consulted ONLY on identification failure; it never overrides a successful
+identification, so a Bash call whose command text merely mentions a ctx tool name
+is still allowed by the normal path.
+
+Deliberately NOT done: scanning the raw text for nesting depth so the parse is
+never attempted at all. That would additionally close a parser CRASH, since a dead
+hook emits no denial — but no crash is reachable: json.loads raised RecursionError
+cleanly at 2e5, 1e6 and 5e6 levels on 3.12.3. Buying an undemonstrable case with a
+hand-rolled string-aware bracket scanner inside the control is a bad trade.
+
+The field-name keying is gone for the same reason the tool-name keying went in
+transformate WI-2096. Keying on `code` / `commands[].command` had identical drift
+semantics one layer down: rename the field and a guarded tool yields "no code"
+and sails through, with the suite green. Extraction now walks the whole
+tool_input and scans EVERY string it finds, so a renamed field is still read.
+Over-matching is deliberate and is not a defect: dcg scans text, and a path or a
+label that happens to be scanned costs nothing.
+
+Tracked under: transformate WI-117 SEC-V1 Phase 1; fail-closed contract and
+shape-drift extraction under transformate WI-2096.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+DCG_WRAP = os.environ.get(
+    "DCG_WRAP_BIN",
+    os.path.join(os.path.expanduser("~"), ".local/bin/dcg-wrap"),
+)
+# Substring match: covers the legacy `mcp__context-mode__*` names AND the live
+# plugin-prefixed `mcp__plugin_context-mode_context-mode__*` names, and any
+# future prefix. ctx_execute is a prefix of ctx_execute_file, so both are hit
+# by the first entry — listed separately for grep-ability.
+CTX_TOOL_TOKENS = (
+    "context-mode__ctx_execute",
+    "context-mode__ctx_execute_file",
+    "context-mode__ctx_batch_execute",
+)
+
+# Guard against a pathologically nested payload turning extraction into a hang.
+# Real ctx payloads are 2-3 levels deep (tool_input -> commands[] -> {command}).
+MAX_DEPTH = 12
+
+
+def allow():
+    """Emit a continue:true decision so Claude Code proceeds."""
+    print(json.dumps({"continue": True}))
+    sys.exit(0)
+
+
+def deny(reason):
+    """Emit a deny decision. Used whenever a GUARDED call cannot be verdicted."""
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "dcg-ctx-wrap: " + reason,
+        }
+    }))
+    sys.exit(0)
+
+
+class ShapeTooDeep(Exception):
+    """The payload nests deeper than we are willing to walk."""
+
+
+def is_hook_decision(obj):
+    """Is this actually a Claude Code hook decision, rather than merely valid JSON?
+
+    "Parses as a JSON object" is not the same as "carries a verdict". `dcg-wrap` emitting a
+    diagnostic envelope — `{"error": {...}}`, or a bare `{}` — used to be forwarded verbatim,
+    and because it contains no denial the host reads it as no objection. That is the fail-open
+    this adapter exists to close, arriving as well-formed JSON.
+    """
+    if not isinstance(obj, dict):
+        return False
+    if isinstance(obj.get("continue"), bool):
+        return True
+    hso = obj.get("hookSpecificOutput")
+    if isinstance(hso, dict):
+        # hookEventName is required, not decorative: the host keys on it, so an envelope
+        # without it may be ignored — and an ignored DENY is an allow. Safe to demand,
+        # measured: the real dcg emits hookEventName "PreToolUse" on every deny envelope.
+        if (hso.get("hookEventName") == "PreToolUse"
+                and hso.get("permissionDecision") in ("allow", "deny", "ask")):
+            return True
+    return False
+
+
+_U_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def raw_carries_guarded_token(raw):
+    """Do the RAW stdin bytes name a guarded context-mode tool?
+
+    Consulted ONLY when identification failed — never as an override of a successful one.
+    A Bash call whose command text merely mentions a ctx tool name parses fine, identifies
+    as Bash and is allowed by the normal path; this function never sees it.
+    """
+    if not isinstance(raw, str) or not raw:
+        return False
+    if any(s in raw for s in CTX_TOOL_TOKENS):
+        return True
+    # A hand-written document could \u-escape the token to hide it from the literal scan.
+    # Decoding is a linear regex pass with no recursion, which also makes it safe to run on
+    # the path where a RecursionError has just unwound.
+    if "\\u" in raw:
+        try:
+            decoded = _U_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), raw)
+        except Exception:
+            return False
+        return any(s in decoded for s in CTX_TOOL_TOKENS)
+    return False
+
+
+def unidentified(raw, why):
+    """Terminal decision for a call this adapter could not identify.
+
+    Identification failure is the cheapest way past a fail-closed contract, because every
+    rule in that contract is conditioned on the call having been identified first. So an
+    unidentifiable call is "not our surface" only while nothing in the bytes says otherwise.
+    """
+    if raw_carries_guarded_token(raw):
+        deny("%s, and stdin names a guarded context-mode tool — refusing a call that "
+             "cannot be identified" % why)
+    allow()
+
+
+def is_ctx_tool(tool):
+    # SUBSTRING membership, deliberately — NOT `tool.endswith(...)`.
+    #
+    # `endswith` was applied once and reverted, because it is a fail-open of exactly the
+    # WI-2096 shape. The settings.json matcher that routes calls here is UNANCHORED, so the
+    # harness sends names like `…__ctx_execute_v2` to this adapter — and under `endswith`
+    # they fall straight through to `allow()` with the scanner never invoked, while the host
+    # still believes the surface is guarded. Measured on all three of `…__ctx_execute_v2`,
+    # `…__ctx_execute2` and `…__ctx_batch_execute_v2`.
+    #
+    # The cost of substring matching is OVER-matching: a name that merely contains a guarded
+    # token gets scanned. That is the intended trade — dcg scans text, so a needless scan
+    # costs nothing, while a missed one is the incident this file exists to prevent.
+    return any(s in tool for s in CTX_TOOL_TOKENS)
+
+
+def collect_strings(value, depth=0):
+    """Every string VALUE anywhere in the tool input, in document order.
+
+    Deliberately shape-agnostic: it does NOT key on field names. Keying on
+    `code` / `commands[].command` reproduced the WI-2096 drift one layer down —
+    rename the field and a guarded call extracts nothing and fails open. Walking
+    the structure means a renamed field is still scanned.
+
+    WHAT THIS DOES NOT COLLECT, stated because the previous wording said "every
+    string" flatly and that is not what the walk does: dict KEYS are not
+    collected. A payload shaped {"commands": {"<command text>": {"label": "x"}}}
+    is verdicted on "x" alone. No context-mode shape ships executable text in a
+    key — `commands` is an array of {label, command} — so this is a bounded gap
+    in the drift-resistance claim rather than a live bypass, and it is carried as
+    a stated residual. Do not "fix" it by appending keys here: that was measured
+    and reverted, because it turns the no-strings-anywhere DENY into an ALLOW
+    (see the comment at the dict branch below).
+
+    dcg scans text and the collected pieces are joined with newlines into one
+    document. WHAT THAT EARNS, AND WHAT IT DOES NOT — stated exactly, because
+    the previous wording ("equivalent to scanning each piece") claimed more than
+    it holds and a docstring in a security control is a load-bearing artifact:
+
+      * An offending fragment wholly contained in ONE collected string still
+        matches, because that string reaches the scanner intact on its own line.
+      * A phrase SPLIT ACROSS SIBLING STRINGS does not match a line-oriented
+        pack. Measured with {"code": ["git","reset","--hard","origin/main"]}:
+        the scanner receives "git\nreset\n--hard\norigin/main" and the phrase
+        appears on no single line.
+
+    No path from a split phrase to execution has been demonstrated — the
+    context-mode runtime stringifies a list and runs the literal, which fails —
+    so this is a bounded gap in the joining claim, NOT a known bypass. It is
+    carried as a stated residual and must not be described as proven equivalence.
+    """
+    if depth > MAX_DEPTH:
+        # NOT `return []`. Silently yielding nothing below the ceiling means a payload with a
+        # benign shallow label and dangerous code nested deeper gets scanned as the benign
+        # fragment alone, and the guarded call proceeds — which is precisely the "every string
+        # is scanned" claim failing quietly. Raise, so the guarded path denies.
+        raise ShapeTooDeep("payload nests deeper than %d levels" % MAX_DEPTH)
+    if isinstance(value, str):
+        return [value]
+    out = []
+    if isinstance(value, dict):
+        # VALUES ONLY — and that is a KNOWN, BOUNDED GAP, not an oversight. See the
+        # "what this does not collect" paragraph in the docstring above.
+        #
+        # Collecting keys as well was tried and REVERTED, because it converts a
+        # fail-CLOSED path into a fail-OPEN one: a guarded payload with no strings
+        # anywhere (`{"timeout": 30}`) is a shape this adapter does not understand and
+        # therefore DENIES without calling dcg. Every dict carries its own key names, so
+        # scanning keys means that payload is scanned as the benign text "timeout" and
+        # ALLOWED. Measured — the suite's own test 7 flipped from deny to allow.
+        # Closing the key gap requires distinguishing key-strings from value-strings when
+        # deciding "is this shape intelligible", which is machinery, not a three-line fix.
+        for item in value.values():
+            out.extend(collect_strings(item, depth + 1))
+    elif isinstance(value, list):
+        for item in value:
+            out.extend(collect_strings(item, depth + 1))
+    return out
+
+
+def main():
+    # IDENTIFICATION, and it is fail-closed too — see the module docstring. A call we
+    # cannot identify is allowed only while the raw bytes make no claim on the guarded
+    # surface; `unidentified()` is what enforces that, and it never falls through.
+    # Read stdin as BYTES and decode with surrogateescape, so DECODING cannot raise at all.
+    # The str-level read fail-opened two measured ways, both with the scanner never invoked
+    # on a call the settings matcher had already selected as guarded: under a strict codec
+    # (`PYTHONIOENCODING=ascii`) a single 0xC3 byte in the payload raised UnicodeDecodeError,
+    # and a large payload under a memory cap raised MemoryError. Both landed in a bare
+    # `except Exception: allow()`. The bytes were there and made a claim; the adapter threw
+    # them away and allowed.
+    #
+    # A FAILED read is not an EMPTY one, and collapsing those two is what made this fail open.
+    # An empty stdin returns b"" *successfully* and still means "no call to attribute" — that
+    # path is unchanged. An exception means a call arrived whose content we destroyed, and on
+    # this surface that is refused rather than guessed at.
+    _stdin_bytes = getattr(sys.stdin, "buffer", None)
+    try:
+        raw = (_stdin_bytes.read().decode("utf-8", "surrogateescape")
+               if _stdin_bytes is not None else sys.stdin.read())
+    except Exception as exc:
+        deny("could not read the hook payload from stdin (%s) — refusing a call whose "
+             "content cannot be examined" % type(exc).__name__)
+
+    try:
+        inp = json.loads(raw)
+    except Exception as exc:
+        # Catches RecursionError from a deeply nested payload, which was the cheapest
+        # route past this adapter, as well as ordinary malformed input.
+        unidentified(raw, "stdin did not parse as JSON (%s)" % type(exc).__name__)
+    if not isinstance(inp, dict):
+        unidentified(raw, "stdin parsed to %s, not a hook object" % type(inp).__name__)
+
+    # `toolName` is consulted only when `tool_name` is ABSENT. A present-but-wrong-typed
+    # tool_name is a corrupt claim about the call, not an absence of one, so it must not be
+    # possible to park a guarded name in `tool_name` and a benign one in `toolName`.
+    #
+    # KEY MEMBERSHIP, not `.get()`. `.get("tool_name")` returns None for an ABSENT key and for
+    # an explicit JSON `null` alike, so `{"tool_name": null, "toolName": "Bash"}` fell straight
+    # through to the alias and identified as Bash — measured `{"continue": true}`, scanner
+    # never invoked. It still allowed with a guarded token planted in the payload text, because
+    # the raw-bytes tie-breaker below is deliberately skipped once identification "succeeds".
+    # A present-but-null tool_name is a corrupt claim about the call, which is precisely what
+    # the paragraph above says must not be possible: the suite pinned the LIST-typed case and
+    # passed, so the invariant read as covered while `null` walked through it.
+    #
+    # `tool_input` / `toolInput` below keeps `.get()` deliberately: the same null-vs-absent
+    # shape there was measured NOT to leak — the alias resolves to the only payload present
+    # and it IS scanned — so it is left exactly as it stands.
+    if "tool_name" in inp:
+        tool = inp["tool_name"]
+    else:
+        tool = inp.get("toolName")
+    if not isinstance(tool, str) or not tool:
+        unidentified(raw, "tool_name is %s, not a usable tool name" % type(tool).__name__)
+    if not is_ctx_tool(tool):
+        # Identification SUCCEEDED and the answer is "not ours". The raw-bytes check is
+        # deliberately NOT applied here: it is a tie-breaker for unidentifiable input, not
+        # a second opinion about a call we read correctly.
+        allow()
+
+    # ---- from here the call is GUARDED: no path out of this function allows it
+    # through because something failed. ----
+    # DO NOT "fix" this to match the key-membership check used for `tool_name` above.
+    #
+    # It looks like the same bug and it is not. That shape WAS filed here as a Major
+    # (`{"tool_input": null, "toolInput": {...}}` supposedly laundering a payload) and it was
+    # REFUTED WITH A MEASUREMENT: the alias resolves to the only payload actually present, and
+    # that payload IS scanned — 182 bytes reached the scanner. The `tool_name` case leaked
+    # because a wrong IDENTIFICATION skips the raw-token tie-breaker entirely; there is no
+    # equivalent here, because every path below this point is already on the guarded surface
+    # and none of them allows. Read the R5 adjudication's refutation before touching this.
+    ti = inp.get("tool_input")
+    if ti is None:
+        ti = inp.get("toolInput")
+    if ti is None:
+        # A guarded call with NO payload at all is a truncated or malformed invocation, not a
+        # deliberate no-op. Defaulting it to {} made those two indistinguishable and then let
+        # the empty case through.
+        deny("guarded tool %s carried no tool_input at all" % tool)
+    if not isinstance(ti, dict):
+        deny("guarded tool %s carried a non-object tool_input (%s)" % (tool, type(ti).__name__))
+    if not ti:
+        deny("guarded tool %s carried an empty tool_input" % tool)
+
+    try:
+        strings = collect_strings(ti)
+    except ShapeTooDeep as exc:
+        deny("guarded tool %s: %s — refusing rather than scanning part of it" % (tool, exc))
+    if not strings:
+        # Strings are the only thing this adapter can hand to the scanner. A payload with none
+        # anywhere is a shape it does not understand, which is exactly what a field rename
+        # looks like from in here.
+        deny(
+            "guarded tool %s carried no string fields — unrecognized payload shape, "
+            "refusing rather than scanning nothing" % tool
+        )
+
+    code = "\n".join(s for s in strings if s.strip())
+    if not code:
+        # Strings were present and every one was blank: genuinely nothing to scan.
+        allow()
+
+    language = ti.get("language")
+    synthetic = {
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": code,
+            "_dcg_source_tool": tool,
+            "_dcg_source_language": language if isinstance(language, str) else "",
+        },
+    }
+
+    try:
+        proc = subprocess.run(
+            [DCG_WRAP],
+            input=json.dumps(synthetic),
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except Exception as exc:
+        # Missing binary, timeout, permission error. This adapter is the ONLY
+        # path from the ctx tools into dcg, so allowing here reopens the channel.
+        deny("scanner %s could not be run (%s: %s)" % (DCG_WRAP, type(exc).__name__, exc))
+
+    # HOW THE REAL SCANNER SPEAKS. Measured against dcg on TEAM-1, not inferred from the
+    # test stub:
+    #     allow -> exit 0 and NOTHING on stdout. Silence IS the allow.
+    #     deny  -> a full hookSpecificOutput envelope, also exit 0. Never exit 2.
+    # So "produced no parseable decision" cannot mean DENY on its own. It did, and that
+    # denied every BENIGN guarded call: a total outage of all three ctx tools on any host
+    # running the real dcg. The suite stayed green throughout because the stub always
+    # prints a decision, which is a thing dcg only does when it objects.
+    stdout = proc.stdout or ""
+    decision = None
+    if stdout.strip():
+        try:
+            decision = json.loads(stdout)
+        except ValueError:
+            decision = None
+
+    if decision is None and not stdout.strip():
+        # Silence. Separate "scanned it and objected to nothing" from "never ran, or died
+        # mid-scan": the first exits 0, the second does not. A binary that cannot be
+        # executed at all never reaches here — subprocess raises and the handler above
+        # denies. RESIDUAL, stated because it cannot be closed from in here: a scanner that
+        # exits 0 having done nothing (a stub, a `true`, a shell wrapper whose exec failed
+        # silently) is indistinguishable on the wire from a clean scan. Catching that is
+        # install-time work — apply-wi2096-matcher.mjs canaries a known-dangerous fixture
+        # and requires the DENY to have come from the scanner rather than from this file.
+        if proc.returncode == 0:
+            allow()
+        deny("scanner exited %s with no output — a clean scan and a crash are not the "
+             "same thing" % proc.returncode)
+
+    if not is_hook_decision(decision):
+        sys.stderr.write(proc.stderr or "")
+        deny(
+            "scanner returned no recognisable decision (exit %s, %d bytes on stdout)"
+            % (proc.returncode, len(stdout))
+        )
+
+    # A recognised decision passes through untouched, but the exit status is NORMALISED.
+    # The host reads 2 as a blocking error and every OTHER non-zero as a non-blocking one,
+    # after which the tool proceeds — so forwarding a deny that happened to exit 3 would
+    # print the denial and run the call anyway. dcg itself denies with exit 0, so this is
+    # defence against a future scanner, not a description of the current one.
+    sys.stdout.write(stdout)
+    sys.stderr.write(proc.stderr or "")
+    sys.exit(2 if proc.returncode == 2 else 0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        # Reached only if something above raised outside its own handler. We do
+        # not know whether the call was guarded, but the only calls that get this
+        # far have already passed the is_ctx_tool() gate, so refuse.
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason":
+                    "dcg-ctx-wrap: unhandled %s — refusing a guarded call it could not verdict"
+                    % type(exc).__name__,
+            }
+        }))
+        sys.exit(0)
