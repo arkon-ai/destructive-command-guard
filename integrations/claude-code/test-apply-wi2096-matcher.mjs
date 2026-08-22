@@ -1410,18 +1410,24 @@ if (process.platform !== "win32") {
   copyFileSync(SCANNER, realBin);
   chmodSync(realBin, 0o755);
 
-  const evil = base + "/%PWNVAR%/w/dcg-ctx-wrap";
+  // `%` EXPANDS; `,` and `=` SPLIT the command token, which is worse - G-3 measured
+  // `<tmp>/inject.bat,/x/dcg-ctx-wrap` running inject.bat AND printing a green certificate
+  // at rc 0, where the `%` case had at least failed closed.
+  for (const [label, seg] of [["%", "%PWNVAR%"], [",", "hostname.exe,x"],
+                              ["=", "hostname.exe=junk"]]) {
+  const evil = base + "/" + seg + "/w/dcg-ctx-wrap";
   const s = settings([staleEntry(evil)]);
   const before = readFileSync(s, "utf8");
   const r = run(s, sweep(0), [], realBin);
 
-  check("M2: a `%` in a path SEGMENT is refused", r.status !== 0);
-  check("M2: settings were not published over a refused command",
+  check(`M2: a \`${label}\` in a path SEGMENT is refused`, r.status !== 0);
+  check(`M2: \`${label}\` - settings were not published over a refused command`,
     readFileSync(s, "utf8") === before);
   // Name WHICH refusal fired, for the same reason T1 does: an rc!=0 from an unrelated gate
   // would satisfy the two assertions above while testing nothing.
-  check("M2: refused as an unroutable command, not by some unrelated gate",
+  check(`M2: \`${label}\` - refused as unroutable, not by some unrelated gate`,
     /NONE execs/.test(r.out));
+  }
 }
 
 // ── M3 (G-3) — EVERY PIN COMPONENT MUST BE ABSOLUTE ───────────────────────────────────────
@@ -1662,7 +1668,7 @@ if (process.platform !== "win32") {
   const r = run(s, sweep(0), [], always);
   check("A7: an always-deny scanner does not certify", r.status !== 0);
   check("A7: the refusal names the benign fixture, not the dangerous one",
-    /denied a BENIGN fixture/.test(r.out));
+    /did not ALLOW a benign fixture/.test(r.out));
   check("A7: an always-deny scanner does not publish",
     readFileSync(s, "utf8") === before);
   // And the discriminating stub — deny the dangerous, allow the benign — still certifies, so
@@ -1671,6 +1677,47 @@ if (process.platform !== "win32") {
     run(settings([staleEntry()]), sweep(0)).status === 0);
 }
 
+
+// -- M3 (S-1) -- THE BENIGN CONTROL NEEDS AN AFFIRMATIVE ALLOW ---------------------------
+//
+// A7 closed the canned-deny shape and left the class open for every refusal NOT spelled
+// `deny`: S-1 measured `{"continue": false}`, a `permissionDecision` of `"ask"`, and a
+// CORRECT allow body delivered on exit 2 all certifying at rc 0 with the full green line.
+// Each blocks or interrupts 100% of benign ctx traffic in production. The control now reads
+// rb.status and requires `continue === true`.
+//
+// NOT tested here, because the adapter already converts them into its own `dcg-ctx-wrap: `
+// deny which canary 3 rejects as adapter-sourced: a silent exit 2, a crash, and malformed
+// output. Sol filed those three too; the adjudicator recorded that they are caught.
+{
+  const shapes = [
+    ["continue-false", 'console.log(JSON.stringify({continue:false}));', "blocks the call"],
+    ["ask", 'console.log(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",' +
+      'permissionDecision:"ask",permissionDecisionReason:"confirm"}}));', "interrupts the call"],
+    ["allow-on-exit-2", 'console.log(JSON.stringify({continue:true}));process.exit(2);',
+      "right body, blocking status"],
+  ];
+  for (const [name, benignBody, why] of shapes) {
+    const dd = mkdtempSync(path.join(tmp, `m3-${name}-`));
+    const w = path.join(dd, "dcg-ctx-wrap");
+    // Denies the dangerous fixture correctly, so canary 3 clears its FIRST criterion and the
+    // only thing under test is what the BENIGN payload comes back as.
+    writeFileSync(w, `#!${process.execPath}\n` + readsStdin(
+      'if (!/echo hello/.test(b)) { console.log(JSON.stringify({hookSpecificOutput:{' +
+      'hookEventName:"PreToolUse",permissionDecision:"deny",' +
+      'permissionDecisionReason:"BLOCKED by dcg  Reason: git_reset_hard"}})); }' +
+      `else { ${benignBody} }`) + "\n");
+    chmodSync(w, 0o755);
+    const sm = settings([staleEntry(w)]);
+    const before = readFileSync(sm, "utf8");
+    const rm = run(sm, sweep(0), [], w);
+    check(`M3: a benign ${name} scanner (${why}) does not certify`, rm.status !== 0);
+    check(`M3: a benign ${name} scanner is refused ON THE BENIGN FIXTURE`,
+      /did not ALLOW a benign fixture/.test(rm.out));
+    check(`M3: a benign ${name} scanner does not publish`,
+      readFileSync(sm, "utf8") === before);
+  }
+}
 
 // -- M-a (C-1) -- THE REGEX AND THE OPERATOR TEXT MUST AGREE ABOUT `%` --------------------
 //
@@ -1685,10 +1732,25 @@ if (process.platform !== "win32") {
   check("M-a: SHELL_LITERAL is still one character class", !!cls);
   const line = /The path itself must also be a plain literal[^\n]*/.exec(src);
   check("M-a: the operator text listing the accepted characters is still there", !!line);
-  const inRegex = !!cls && cls[1].includes("%");
-  const inText  = !!line && line[0].includes("%");
-  check("M-a: the regex and the operator text agree about `%`", inRegex === inText);
-  check("M-a: and neither of them admits it", inRegex === false);
+  // Escapes are unwrapped first: the class is written `\\/` for the slash, so a raw
+  // `.includes()` on the raw class would report a backslash that is not admitted.
+  const cleaned = !!cls ? cls[1].replace(/\\(.)/g, "$1") : "";
+  // The character list is the run of space-separated tokens after "digits and". Take the
+  // FIRST character of each token: the final one is `-.`, the list item plus the full stop,
+  // and the sentence also contains an English comma in "letters, digits" that is not a
+  // listed character at all.
+  const listed = !!line ? /digits and ([^\n]*)/.exec(line[0]) : null;
+  const chars = new Set((listed ? listed[1] : "").trim().split(/\s+/).map((t) => t[0]));
+  check("M-a: the operator text parses into a character list", chars.size >= 5);
+  // `%` splits nothing but EXPANDS; `,` and `=` split the command token; `\\` is a separator on
+  // cmd.exe and an escape in sh, so it must never be added to buy Windows-native paths - the
+  // forward-slash form is the remedy there.
+  for (const ch of ["%", ",", "=", "\\"]) {
+    const inRegex = cleaned.includes(ch);
+    const inText = chars.has(ch);
+    check(`M-a: the regex and the operator text agree about \`${ch}\``, inRegex === inText);
+    check(`M-a: and neither of them admits \`${ch}\``, inRegex === false);
+  }
 }
 
 rmSync(tmp, { recursive: true, force: true });

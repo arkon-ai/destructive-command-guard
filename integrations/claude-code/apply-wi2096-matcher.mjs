@@ -187,16 +187,27 @@ const runs = (e) => Array.isArray(e.hooks) && e.hooks.some(isCommandHook);
 // A leading `~/` is expanded by the shell under HOME. Module-load os.homedir() is not that
 // HOME: the harness overlays the settings `env` block, which may set HOME to something else.
 // Expanding with os.homedir() for identity while canary 3 / the harness expand under the
-// overlay is two inodes for one command. So `~/` is accepted only when HOME (or USERPROFILE)
-// is a key in this document's env block — the same establishment rule as PATH — and identity
-// uses that declared value. Otherwise the token is refused: use an absolute path.
-// `%` is NOT in this class. canaryScanner spawns with `shell: true`, which on win32 is
+// overlay is two inodes for one command. So `~/` is accepted only when HOME is a key in this
+// document's env block — the same establishment rule as PATH — and identity uses that
+// declared value. USERPROFILE is NOT accepted: only HOME drives tilde expansion on the shell
+// that runs the hook, so accepting it named one path here and expanded another there (G-1).
+// Otherwise the token is refused: use an absolute path.
+// `%`, `,` and `=` are NOT in this class. canaryScanner spawns with `shell: true`, which on
+// win32 is `cmd.exe /d /s /c`, and cmd.exe both EXPANDS `%NAME%` and SPLITS the command
+// token at `,` and `=`. G-3 measured the split end to end: a hook command
+// `<tmp>/inject.bat,/x/dcg-ctx-wrap` passed the basename and absolute-path gates as one
+// literal token, cmd.exe ran `inject.bat`, and the applier printed a full green certificate
+// naming the injected string as the wrapper the ctx calls reach. Worse than the `%` case,
+// which failed closed. `\\` is deliberately NOT added back to buy Windows-native paths: it is a
+// separator on cmd.exe and an escape in sh. Use the forward-slash form of the path.
+// The original `%` note, kept because it is the same class:
+// canaryScanner spawns with `shell: true`, which on win32 is
 // `cmd.exe /d /s /c`, and cmd.exe expands `%NAME%` at delivery. G-2 measured
 // `C:/%PWNVAR%/dcg-ctx-wrap` passing the basename and absolute-path gates as a literal
 // token and then executing an injected command. That is the same "metacharacter in an
 // interior path segment" shape this whitelist was introduced to close for `$()`, `|`
 // and redirects — reproduced for the other shell this same canary uses.
-const SHELL_LITERAL = /^[A-Za-z0-9_@+=:,.\/-]+$/;
+const SHELL_LITERAL = /^[A-Za-z0-9_@+:.\/-]+$/;
 const declaredHome = () => {
   const block = cfg && cfg.env;
   if (!block || typeof block !== "object" || Array.isArray(block)) return "";
@@ -377,9 +388,9 @@ if (ctxEntries.length > 0 && !LIVE_COMMAND) {
     "canaries run the binary: `> /dev/null` would leave the harness with no decision at all,\n" +
     "and `| sed s/deny/allow/` would turn a denial into an approval, both while the wrapper\n" +
     "itself behaved perfectly. If you need a wrapper script, point the hook AT that script.\n" +
-    "The path itself must also be a plain literal - letters, digits and _ @ + = : , . / -.\n" +
-    "`%` is NOT in that list: canary 3 delivers through a shell, which on win32 is cmd.exe, and\n" +
-    "cmd.exe expands %NAME% at delivery, so a `%` in an interior segment is a live construct.\n" +
+    "The path itself must also be a plain literal - letters, digits and _ @ + : . / -.\n" +
+    "`%`, `,` and `=` are NOT in that list: canary 3 delivers through a shell, which on win32\n" +
+    "is cmd.exe, and cmd.exe expands %NAME% and SPLITS the command token at `,` and `=`.\n" +
     "A leading `~/` is accepted only when HOME is declared in this file's env block, and only\n" +
     "when that HOME is an absolute plain literal. The shell expands `~` under HOME alone, so a\n" +
     "declared USERPROFILE would name one path here and expand to another there. Otherwise use\n" +
@@ -856,14 +867,33 @@ const canaryScanner = (settingsPath, fail) => {
       `(${rb.error.message}):\n  ${LIVE_COMMAND}` + ENV_REMEDY()
     );
   }
+  // An AFFIRMATIVE allow, not merely "did not say deny". S-1 measured three shapes that
+  // block or interrupt every benign ctx call and still certified at rc 0: a body of
+  // `{"continue": false}`, a `permissionDecision` of `"ask"`, and a correct allow body
+  // delivered on exit 2. Only the canned-deny stub was refused. Reading `rb.status` and
+  // requiring `continue === true` is what separates "this scanner passed the benign
+  // payload" from "this scanner said something canary 3 did not recognise".
+  //
+  // DESIGN DECISION, and it is the one the adjudicator left to this lane: the bar is exit 0
+  // PLUS an explicit recognised allow, and nothing about the REASON text. A legitimately
+  // strict scanner is free to be as strict as it likes on other payloads; what it may not
+  // do is fail to allow `echo hello`, because a scanner that blocks that blocks everything.
   let outB = null;
   try { outB = JSON.parse(rb.stdout || ""); } catch { outB = null; }
   const hsoB = (outB && outB.hookSpecificOutput) || {};
-  if (hsoB.permissionDecision === "deny") {
+  const benignAllowed = rb.status === 0 && !!outB && outB.continue === true &&
+    hsoB.permissionDecision !== "deny" && hsoB.permissionDecision !== "ask";
+  if (!benignAllowed) {
     fail(
-      "CANARY FAILED - the scanner denied a BENIGN fixture as well as a dangerous one.\n" +
+      "CANARY FAILED - the scanner did not ALLOW a benign fixture.\n" +
       `  benign fixture: ${BENIGN_FIXTURE}\n` +
+      `  exit status: ${rb.status === null ? "signal " + rb.signal : rb.status}\n` +
+      `  decision: ${hsoB.permissionDecision || (outB ? JSON.stringify(outB).slice(0, 120) : "unparseable")}\n` +
       `  reason: ${String(hsoB.permissionDecisionReason || "").slice(0, 200)}\n` +
+      "A benign call must come back as an explicit allow on exit 0. `continue: false`, an\n" +
+      "`ask`, or a correct allow body delivered on exit 2 each block or interrupt every\n" +
+      "benign ctx call in production, and each of the three certified green before this\n" +
+      "check read the exit status.\n" +
       "A binary that denies everything is not a scanner, and canary 3 cannot tell one from a\n" +
       "working control by watching the dangerous fixture alone. Certifying it would green-tick\n" +
       "a configuration that blocks 100% of benign ctx traffic - the three-tool outage the\n" +

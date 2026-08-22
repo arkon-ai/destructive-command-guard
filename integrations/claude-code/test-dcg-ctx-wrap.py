@@ -165,7 +165,7 @@ def main():
         for tool in ("ctx_execute", "ctx_execute_file"):
             out, seen = run(PLUGIN + tool, {"code": "cat /tmp/probe.env", "language": "shell"}, tmp)
             check(f"{tool}: plugin-prefixed name is guarded",
-                  out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+                  denied(out))
             check(f"{tool}: code reached dcg as tool_input.command",
                   "cat /tmp/probe.env" in seen_command(seen))
 
@@ -176,7 +176,7 @@ def main():
             {"label": "trigger", "command": "cat /tmp/probe.env"},
         ]}
         out, seen = run(PLUGIN + "ctx_batch_execute", batch, tmp)
-        check("batch: guarded", out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+        check("batch: guarded", denied(out))
         check("batch: non-first command reached dcg",
               "cat /tmp/probe.env" in seen_command(seen))
         check("batch: first command reached dcg too", "echo hello" in seen_command(seen))
@@ -184,12 +184,12 @@ def main():
         # 3. The legacy names still work — a stale caller must not go unguarded.
         out, _ = run(LEGACY + "ctx_execute", {"code": "cat /tmp/probe.env"}, tmp)
         check("legacy name still guarded",
-              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+              denied(out))
 
         # 4. A future rename must fail CLOSED on the suffix, not open.
         out, _ = run("mcp__someNewPrefix__context-mode__ctx_batch_execute", batch, tmp)
         check("unknown prefix + known suffix still guarded",
-              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+              denied(out))
 
         # 5. Unrelated tools and empty payloads pass through untouched.
         out, seen = run("Read", {"file_path": "/etc/hosts"}, tmp)
@@ -200,7 +200,7 @@ def main():
         # deliberate no-op, and the README decision table denies it. It used to be allowed.
         out, seen = run(PLUGIN + "ctx_execute", {}, tmp)
         check("empty tool_input is denied",
-              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+              denied(out))
         check("empty tool_input never reached dcg", seen is None)
 
         # 5b. A name carrying a guarded token plus TRAILING characters must still be guarded.
@@ -211,7 +211,7 @@ def main():
         for variant in ("ctx_execute_v2", "ctx_execute2", "ctx_batch_execute_v2"):
             out, seen = run(PLUGIN + variant, {"code": "cat /tmp/probe.env"}, tmp)
             check(f"{variant}: a decorated guarded name is still guarded",
-                  out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+                  denied(out))
             check(f"{variant}: its code reached dcg",
                   "cat /tmp/probe.env" in seen_command(seen))
 
@@ -225,7 +225,7 @@ def main():
         node["code"] = "cat /tmp/probe.env"
         out, seen = run(PLUGIN + "ctx_execute", deep, tmp)
         check("a payload nested past the extraction ceiling is denied",
-              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+              denied(out))
         check("an over-deep payload is never scanned in part", seen is None)
 
         # 5d. Valid JSON is not a decision. A diagnostic envelope carries no verdict, so
@@ -388,18 +388,18 @@ def main():
         check("renamed code field is still scanned",
               "cat /tmp/probe.env" in seen_command(seen))
         check("renamed code field is guarded",
-              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+              denied(out))
 
         # 7. A guarded payload with NO strings anywhere is a shape we do not understand.
         out, seen = run(PLUGIN + "ctx_execute", {"timeout": 30}, tmp)
         check("guarded call with no string fields is denied",
-              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+              denied(out))
         check("guarded call with no string fields never reached dcg", seen is None)
 
         # 8. A guarded call with a non-object tool_input is denied.
         out, _ = run(PLUGIN + "ctx_execute", ["cat /tmp/probe.env"], tmp)
         check("guarded call with non-object tool_input is denied",
-              out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+              denied(out))
 
         # 9. SCANNER UNAVAILABLE. This is the one that mattered most: dcg-ctx-wrap is the
         #    only path from the ctx tools into dcg, so allowing here reopens the 2026-05-15
@@ -578,6 +578,25 @@ def main():
         check("tool_name:null carrying a guarded token in the payload is DENIED", denied(out))
         check("tool_name:null carrying a guarded token is not quietly allowed",
               out.get("continue") is not True)
+
+        # ── EVERY falsy tool_name, not just null ──────────────────────────────────────
+        #
+        # The guard is `if not isinstance(tool, str) or not tool:`. The TYPE half was pinned
+        # by the list/dict/int cases above and the null case here; the EMPTINESS half was
+        # pinned by nothing. Deleting `or not tool` - a one-token edit - left this suite at
+        # rc 0 / 0 FAILs while `{"tool_name": "", "toolName": "Bash"}` carrying a guarded
+        # token returned {"continue": true}. `""` is a str, so the type half cannot see it.
+        # False and 0 are caught by the type half and are pinned here too, so an edit to
+        # EITHER half of the guard is caught by this block rather than by neither.
+        for label, falsy in (("empty string", ""), ("False", False), ("zero", 0)):
+            out, _ = run_raw(json.dumps({
+                "tool_name": falsy,
+                "toolName": "Bash",
+                "tool_input": {"command": PLUGIN + "ctx_execute git reset --hard origin/main"},
+            }), tmp)
+            check(f"tool_name:{label} carrying a guarded token is DENIED", denied(out))
+            check(f"tool_name:{label} carrying a guarded token is not quietly allowed",
+                  out.get("continue") is not True)
 
         # Control: the camelCase alias must still work when tool_name is GENUINELY absent,
         # or this fix would have closed the hole by breaking the feature.
