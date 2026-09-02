@@ -125,6 +125,18 @@ DCG_WRAP = os.environ.get(
     "DCG_WRAP_BIN",
     os.path.join(os.path.expanduser("~"), ".local/bin/dcg-wrap"),
 )
+# File-content verdicts for ctx_execute_file (transformate WI-3059). Invoked as
+# `dcg scan`, NEVER through dcg-wrap: wrap forwards the synthetic command text
+# into Discord, so feeding file bytes there would turn the guard into an
+# exfiltration channel for any path it was aimed at.
+DCG_BIN = os.environ.get(
+    "DCG_BIN",
+    os.path.join(os.path.expanduser("~"), ".local/bin/dcg"),
+)
+# Cap so a pathological multi-GB path cannot hang the hook budget.
+DCG_CTX_FILE_MAX_BYTES = int(os.environ.get("DCG_CTX_FILE_MAX_BYTES", str(2 * 1024 * 1024)))
+# Keys observed / expected for the referenced file on ctx_execute_file.
+FILE_PATH_KEYS = ("path", "file_path", "filepath", "file")
 # Substring match: covers the legacy `mcp__context-mode__*` names AND the live
 # plugin-prefixed `mcp__plugin_context-mode_context-mode__*` names, and any
 # future prefix. ctx_execute is a prefix of ctx_execute_file, so both are hit
@@ -304,6 +316,145 @@ def collect_strings(value, depth=0):
     return out
 
 
+def is_execute_file_tool(tool):
+    """True only for ctx_execute_file — not bare ctx_execute (prefix of the name)."""
+    return isinstance(tool, str) and "ctx_execute_file" in tool
+
+
+def extract_referenced_path(ti):
+    """First non-blank path-like string on a ctx_execute_file payload."""
+    if not isinstance(ti, dict):
+        return None
+    for key in FILE_PATH_KEYS:
+        value = ti.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _deny_findings_from_scan(report):
+    """Pull deny/error findings from a dcg scan JSON report.
+
+    Returns a list of (rule_id, line) only — NEVER the extracted command text.
+    That omission is the whole of WI-3059: the matched snippet must not leave
+    this function toward stdout, stderr, Discord, or a reason string.
+    """
+    if not isinstance(report, dict):
+        return []
+    out = []
+    for finding in report.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        decision = (finding.get("decision") or "").lower()
+        severity = (finding.get("severity") or "").lower()
+        if decision == "deny" or severity in ("error", "critical", "high"):
+            rule = finding.get("rule_id") or finding.get("ruleId") or "unknown-rule"
+            if not isinstance(rule, str) or not rule:
+                rule = "unknown-rule"
+            line = finding.get("line")
+            out.append((rule, line if isinstance(line, int) else None))
+    return out
+
+
+def scan_referenced_file(path, source_tool):
+    """Verdict the file at path via `dcg scan`. Never pipes contents to dcg-wrap.
+
+    Returns:
+      None  — allow / skip (missing file, empty findings, no deny)
+      str   — deny reason (rule ids + path only; no file body)
+    On scanner operational failure, calls deny() directly (fail-closed).
+    """
+    if not isinstance(path, str) or not path.strip():
+        return None
+    # Expand ~ only; scan exactly the path the payload claimed.
+    candidate = os.path.expanduser(path.strip())
+    try:
+        st = os.stat(candidate)
+    except OSError:
+        # Missing / unreadable: the sandbox will fail the tool on its own.
+        return None
+    if not os.path.isfile(candidate):
+        return None
+    if st.st_size > DCG_CTX_FILE_MAX_BYTES:
+        deny(
+            "guarded tool %s referenced a file larger than the content-scan cap "
+            "(%d bytes > %d) — refusing rather than skipping the scan"
+            % (source_tool, st.st_size, DCG_CTX_FILE_MAX_BYTES)
+        )
+
+    try:
+        proc = subprocess.run(
+            [
+                DCG_BIN, "scan",
+                "--paths", candidate,
+                "--format", "json",
+                "--redact", "aggressive",
+                "--fail-on", "error",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            env={k: v for k, v in os.environ.items()
+                 if k not in ("DCG_QUIET", "DCG_NO_COLOR", "DCG_VERBOSE")},
+        )
+    except Exception as exc:
+        deny(
+            "file content scanner %s could not be run for %s (%s: %s)"
+            % (DCG_BIN, source_tool, type(exc).__name__, exc)
+        )
+
+    stdout = (proc.stdout or "").strip()
+    report = None
+    if stdout:
+        try:
+            report = json.loads(stdout)
+        except ValueError:
+            report = None
+
+    if report is None:
+        if proc.returncode == 0 and not stdout:
+            return None
+        if proc.returncode == 0 and stdout:
+            deny(
+                "file content scanner returned non-JSON output for %s — refusing"
+                % source_tool
+            )
+        deny(
+            "file content scanner exited %s with no usable report for %s"
+            % (proc.returncode, source_tool)
+        )
+
+    hits = _deny_findings_from_scan(report)
+    if not hits:
+        return None
+
+    parts = []
+    for rule, line in hits[:8]:
+        if line is None:
+            parts.append(rule)
+        else:
+            parts.append("%s@line %d" % (rule, line))
+    more = "" if len(hits) <= 8 else " (+%d more)" % (len(hits) - 8)
+    return (
+        "referenced file content blocked for %s path=%s rules=%s%s — "
+        "file body withheld from alert path (transformate WI-3059)"
+        % (source_tool, path, ",".join(parts), more)
+    )
+
+
+def maybe_deny_on_referenced_file(tool, ti):
+    """If this is ctx_execute_file, scan the named file and deny on hits."""
+    if not is_execute_file_tool(tool):
+        return
+    path = extract_referenced_path(ti)
+    if not path:
+        return
+    reason = scan_referenced_file(path, tool)
+    if reason:
+        deny(reason)
+
+
+
 def main():
     # IDENTIFICATION, and it is fail-closed too — see the module docstring. A call we
     # cannot identify is allowed only while the raw bytes make no claim on the guarded
@@ -404,7 +555,10 @@ def main():
 
     code = "\n".join(s for s in strings if s.strip())
     if not code:
-        # Strings were present and every one was blank: genuinely nothing to scan.
+        # Strings were present and every one was blank: genuinely nothing in the
+        # payload to scan. Still verdict the referenced file on ctx_execute_file
+        # (transformate WI-3059) before allowing.
+        maybe_deny_on_referenced_file(tool, ti)
         allow()
 
     language = ti.get("language")
@@ -456,6 +610,9 @@ def main():
         # install-time work — apply-wi2096-matcher.mjs canaries a known-dangerous fixture
         # and requires the DENY to have come from the scanner rather than from this file.
         if proc.returncode == 0:
+            # Payload text was clean. Close the ctx_execute_file residual: scan
+            # the referenced file WITHOUT forwarding its body to dcg-wrap.
+            maybe_deny_on_referenced_file(tool, ti)
             allow()
         deny("scanner exited %s with no output — a clean scan and a crash are not the "
              "same thing" % proc.returncode)
@@ -472,6 +629,17 @@ def main():
     # after which the tool proceeds — so forwarding a deny that happened to exit 3 would
     # print the denial and run the call anyway. dcg itself denies with exit 0, so this is
     # defence against a future scanner, not a description of the current one.
+    #
+    # If the payload-text verdict did not already deny, still close WI-3059 for
+    # ctx_execute_file by scanning the referenced file off the alert path.
+    hso = decision.get("hookSpecificOutput") if isinstance(decision, dict) else None
+    payload_denied = (
+        isinstance(hso, dict)
+        and (hso.get("permissionDecision") or "").lower() == "deny"
+    )
+    if not payload_denied and decision.get("continue") is not False:
+        maybe_deny_on_referenced_file(tool, ti)
+
     sys.stdout.write(stdout)
     sys.stderr.write(proc.stderr or "")
     sys.exit(2 if proc.returncode == 2 else 0)
