@@ -619,6 +619,96 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Executing-position fixtures (transformate WI-3107)
+    //
+    // Git-verb rules must only match text in an executing position. Quoted
+    // argument content of a non-git command (an orca bus-message body) is
+    // content; a command substitution inside that content still executes.
+    // =========================================================================
+
+    const WI3107_ORCA_SEND: &str = "orca orchestration send --to run:run_adfc429b54a7 \
+         --from term_x --subject \"fold receipt\" --body \"wi112 foldr4: worked around \
+         git restore --worktree deny; branch reset; git restore -W never executed\"";
+
+    #[test]
+    fn test_wi3107_f1_bus_message_body_is_content() {
+        let pack = create_pack();
+
+        // Standalone shape: regression allow-pin.
+        assert_allows(&pack, WI3107_ORCA_SEND);
+
+        // Compound shapes (the measured incident class): another executable
+        // git span must not unlock matching inside the quoted body.
+        assert_allows(&pack, &format!("{WI3107_ORCA_SEND} && git status"));
+        assert_allows(&pack, &format!("git status && {WI3107_ORCA_SEND}"));
+        assert_allows(&pack, &format!("{WI3107_ORCA_SEND}; git rev-parse HEAD"));
+    }
+
+    #[test]
+    fn test_wi3107_f1b_nested_escaped_quotes_in_body_are_content() {
+        let pack = create_pack();
+
+        let send = "orca orchestration send --subject \"receipt\" --body \"outer text \
+             \\\"worked around git restore --worktree deny\\\" more text\"";
+        assert_allows(&pack, send);
+        assert_allows(&pack, &format!("{send} && git status"));
+    }
+
+    #[test]
+    fn test_wi3107_f2_same_text_as_real_command_blocks() {
+        let pack = create_pack();
+
+        assert_blocks_with_pattern(
+            &pack,
+            "git restore --worktree src/main.rs",
+            "restore-worktree",
+        );
+        assert_blocks_with_severity(&pack, "git restore --worktree src/main.rs", Severity::High);
+        assert_blocks_with_pattern(&pack, "git restore -W .", "restore-worktree");
+        assert_blocks_with_severity(&pack, "git restore -W .", Severity::High);
+    }
+
+    #[test]
+    fn test_wi3107_f3_command_substitution_in_body_blocks() {
+        let pack = create_pack();
+
+        let subst =
+            "orca orchestration send --subject x --body \"$(git restore --worktree src/lib.rs)\"";
+        let backtick =
+            "orca orchestration send --subject x --body \"`git restore --worktree src/lib.rs`\"";
+        assert_blocks_with_pattern(&pack, subst, "restore-worktree");
+        assert_blocks_with_pattern(&pack, backtick, "restore-worktree");
+
+        // The substitution executes regardless of what surrounds it.
+        assert_blocks_with_pattern(&pack, &format!("{subst} && git status"), "restore-worktree");
+        assert_blocks_with_pattern(
+            &pack,
+            &format!("git status && {backtick}"),
+            "restore-worktree",
+        );
+    }
+
+    #[test]
+    fn test_wi3107_executing_positions_stay_visible() {
+        let pack = create_pack();
+
+        // Argument executors and inline code keep their quoted text visible.
+        assert_blocks_with_pattern(
+            &pack,
+            "eval \"git restore -W .\" && git status",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(&pack, "bash -c \"git restore -W .\"", "restore-worktree");
+        assert_blocks_with_pattern(
+            &pack,
+            "echo \"git restore -W .\" | bash",
+            "restore-worktree",
+        );
+        // Quoted arguments of git itself are still scanned.
+        assert_blocks_with_pattern(&pack, "git restore -W \"src/main.rs\"", "restore-worktree");
+    }
+
     #[test]
     fn test_branch_force_medium() {
         // Branch force delete is Medium severity (recoverable via reflog)

@@ -1743,6 +1743,11 @@ fn evaluate_packs_with_allowlists(
             return EvaluationResult::allowed_due_to_budget();
         }
 
+        // Each pack scans its own (length-preserving) view of the command, so
+        // match spans below still map onto `command_for_packs`.
+        let scan_view = pack.scan_view(command_for_packs);
+        let pack_cmd = scan_view.as_ref();
+
         // Check safe patterns for this pack first.
         // If a safe pattern matches, skip this pack's destructive patterns only.
         // This prevents compound command bypass where one pack's safe pattern
@@ -1829,7 +1834,7 @@ fn evaluate_packs_with_allowlists(
             }
         } else {
             // Non-core.filesystem packs: check safe patterns before destructive
-            if pack.matches_safe_with_deadline(command_for_packs, deadline) {
+            if pack.matches_safe_with_deadline(pack_cmd, deadline) {
                 continue; // Safe pattern match - skip this pack's destructive patterns
             }
         }
@@ -1845,7 +1850,7 @@ fn evaluate_packs_with_allowlists(
 
             let matched_span = pattern
                 .regex
-                .find(command_for_packs)
+                .find(pack_cmd)
                 .map(|(start, end)| MatchSpan { start, end });
 
             if deadline_exceeded(deadline) {

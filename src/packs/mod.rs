@@ -536,6 +536,21 @@ impl Pack {
         false
     }
 
+    /// The view of `cmd` this pack's regexes should scan.
+    ///
+    /// Packs in [`EXECUTING_POSITION_PACKS`] get quoted data spans of
+    /// non-executing segments blanked out (see
+    /// [`mask_data_outside_executing_positions`]); every other pack scans
+    /// `cmd` unchanged. The view is length-preserving.
+    #[must_use]
+    pub fn scan_view<'a>(&self, cmd: &'a str) -> std::borrow::Cow<'a, str> {
+        if EXECUTING_POSITION_PACKS.contains(&self.id.as_str()) {
+            mask_data_outside_executing_positions(cmd, self.keywords)
+        } else {
+            std::borrow::Cow::Borrowed(cmd)
+        }
+    }
+
     /// Check if a command matches any destructive pattern.
     /// Returns the matched pattern's reason, name, severity, and explanation if found.
     #[must_use]
@@ -581,6 +596,9 @@ impl Pack {
         if !self.might_match(cmd) {
             return None;
         }
+
+        let view = self.scan_view(cmd);
+        let cmd = view.as_ref();
 
         // Check safe patterns first (whitelist)
         if self.matches_safe(cmd) {
@@ -1639,12 +1657,13 @@ impl PackRegistry {
     fn check_command_single(&self, cmd: &str, ordered_packs: &[String]) -> CheckResult {
         // Pre-compute candidate packs (might_match cache).
         // This avoids calling might_match twice per pack (once per pass).
-        let candidate_packs: Vec<(&String, &Pack)> = ordered_packs
+        // Each pack scans its own view of the command (see `Pack::scan_view`).
+        let candidate_packs: Vec<(&String, &Pack, std::borrow::Cow<'_, str>)> = ordered_packs
             .iter()
             .filter_map(|pack_id| {
                 let pack = self.get(pack_id)?;
                 if pack.might_match(cmd) {
-                    Some((pack_id, pack))
+                    Some((pack_id, pack, pack.scan_view(cmd)))
                 } else {
                     None
                 }
@@ -1654,16 +1673,16 @@ impl PackRegistry {
         // Pass 1: Check safe patterns across ALL candidate packs first.
         // If any pack's safe pattern matches, allow the command immediately.
         // This enables "safe" packs (like `safe.cleanup`) to whitelist commands across pack boundaries.
-        for (_pack_id, pack) in &candidate_packs {
-            if pack.matches_safe(cmd) {
+        for (_pack_id, pack, view) in &candidate_packs {
+            if pack.matches_safe(view) {
                 return CheckResult::allowed();
             }
         }
 
         // Pass 2: Check destructive patterns across all candidate packs.
         // The first matching destructive pattern determines the result.
-        for (pack_id, pack) in &candidate_packs {
-            if let Some(matched) = pack.matches_destructive(cmd) {
+        for (pack_id, pack, view) in &candidate_packs {
+            if let Some(matched) = pack.matches_destructive(view) {
                 return CheckResult::matched(
                     matched.reason,
                     pack_id,
@@ -2358,6 +2377,139 @@ pub fn split_command_segments(cmd: &str) -> Vec<&str> {
     }
 
     segments
+}
+
+/// Packs whose rules describe the verbs of one specific executable and must
+/// therefore only match text sitting in an executing position.
+///
+/// For these packs, quoted argument content of an unrelated command (an
+/// `orca … --body "…"` bus message, an `echo` string) is data, not a
+/// command, and is masked out of the text the pack regexes scan. Command
+/// substitutions, backticks and `-c` inline code inside such arguments stay
+/// visible because the shell executes them.
+const EXECUTING_POSITION_PACKS: &[&str] = &["core.git"];
+
+/// Command words that execute (part of) their arguments. A segment that
+/// mentions one of these keeps its quoted arguments visible to the pack
+/// regexes (`eval "git …"`, `xargs`, `sudo`, …).
+const ARGUMENT_EXECUTORS: &[&str] = &[
+    "eval", "exec", "source", "sh", "bash", "zsh", "dash", "ksh", "fish", "xargs", "sudo", "doas",
+    "su", "env", "command", "nohup", "time", "timeout", "nice", "ionice", "watch", "ssh", "chroot",
+    "nsenter", "flock", "find", "parallel",
+];
+
+/// Shell-sequence separator emitted as its own `Executed` span by the
+/// context classifier.
+fn is_segment_separator(text: &str) -> bool {
+    matches!(text, "|" | "||" | "&&" | ";" | "&")
+}
+
+/// True if any word of executable `text` is one of `commands` or a known
+/// argument executor. Leading `$(` / backtick sugar and path prefixes are
+/// ignored so `$(git …)` and `/usr/bin/git` still count.
+fn words_signal_execution(text: &str, commands: &[&str]) -> bool {
+    text.split_whitespace().any(|token| {
+        let token = token.trim_start_matches(['$', '(', '`']);
+        let base = token.rsplit('/').next().unwrap_or(token);
+        commands.contains(&base) || ARGUMENT_EXECUTORS.contains(&base)
+    })
+}
+
+#[derive(Default)]
+struct ExecutingSegment {
+    /// Byte ranges of quoted data spans (`Argument` / `Data`) in this segment.
+    data: Vec<std::ops::Range<usize>>,
+    /// Whether an executable span of this segment names one of the pack's
+    /// commands or an argument executor.
+    executing: bool,
+    /// Whether this segment is followed by a `|` pipe.
+    piped: bool,
+}
+
+/// Blank out quoted data spans that do not sit in an executing position for
+/// any of `commands`.
+///
+/// The command is classified with [`crate::context::classify_command`] and
+/// split into segments on `|`, `||`, `&&`, `;`, `&` and newlines. A segment
+/// is *executing* when one of its executable spans names one of `commands`
+/// (e.g. `git`) or an argument executor, or when it is piped into an
+/// executing segment. Quoted `Argument` / `Data` spans of every other
+/// segment are replaced with spaces. Masking is length-preserving so byte
+/// offsets of later regex matches still map onto the original text.
+///
+/// Returns `Cow::Borrowed` when nothing needs masking.
+#[must_use]
+pub fn mask_data_outside_executing_positions<'a>(
+    cmd: &'a str,
+    commands: &[&str],
+) -> std::borrow::Cow<'a, str> {
+    // Only quoted text is ever masked; skip the classifier when there is none.
+    if !cmd.bytes().any(|b| matches!(b, b'"' | b'\'')) {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+
+    let spans = crate::context::classify_command(cmd);
+    let mut segments: Vec<ExecutingSegment> = vec![ExecutingSegment::default()];
+
+    for span in spans.spans() {
+        let text = span.text(cmd);
+        match span.kind {
+            crate::context::SpanKind::Argument | crate::context::SpanKind::Data => {
+                if let Some(segment) = segments.last_mut() {
+                    segment.data.push(span.byte_range.clone());
+                }
+            }
+            crate::context::SpanKind::Executed if is_segment_separator(text) => {
+                if let Some(segment) = segments.last_mut() {
+                    segment.piped = text == "|";
+                }
+                segments.push(ExecutingSegment::default());
+            }
+            crate::context::SpanKind::Executed => {
+                // The classifier treats newlines as whitespace; they split
+                // command sequences just like `;`.
+                for (idx, piece) in text.split('\n').enumerate() {
+                    if idx > 0 {
+                        segments.push(ExecutingSegment::default());
+                    }
+                    if let Some(segment) = segments.last_mut() {
+                        segment.executing |= words_signal_execution(piece, commands);
+                    }
+                }
+            }
+            _ => {
+                // InlineCode / HeredocBody / Unknown / Comment: executed or
+                // conservatively treated as such.
+                if let Some(segment) = segments.last_mut() {
+                    segment.executing |= words_signal_execution(text, commands);
+                }
+            }
+        }
+    }
+
+    // `echo "…" | bash`: a segment piped into an executing one is executing.
+    for i in (0..segments.len().saturating_sub(1)).rev() {
+        if segments[i].piped && segments[i + 1].executing {
+            segments[i].executing = true;
+        }
+    }
+
+    let mut masked: Option<Vec<u8>> = None;
+    for segment in segments.iter().filter(|s| !s.executing) {
+        for range in &segment.data {
+            let out = masked.get_or_insert_with(|| cmd.as_bytes().to_vec());
+            if let Some(slice) = out.get_mut(range.clone()) {
+                slice.fill(b' ');
+            }
+        }
+    }
+
+    match masked {
+        Some(out) => {
+            String::from_utf8(out).map_or(std::borrow::Cow::Borrowed(cmd), std::borrow::Cow::Owned)
+        }
+        None => std::borrow::Cow::Borrowed(cmd),
+    }
 }
 
 /// Result of quick-reject check with the normalized command for reuse.
