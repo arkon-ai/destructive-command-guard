@@ -269,7 +269,9 @@ const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp-directory redirect (allowed without confirmation)",
     ),
 ];
-use crate::{normalize::NormalizeTokenKind, normalize::tokenize_for_normalization};
+use crate::{
+    normalize::NormalizeToken, normalize::NormalizeTokenKind, normalize::tokenize_for_normalization,
+};
 use std::ops::Range;
 
 const RM_RF_ROOT_HOME_NAME: &str = "rm-rf-root-home";
@@ -310,7 +312,67 @@ struct PathToken<'a> {
     unquoted: &'a str,
     quote: QuoteKind,
     range: Range<usize>,
+    origin: PathOrigin,
 }
+
+/// Where a `PathToken` came from: rm's argv verbatim, or a pure variable
+/// reference (`$B`, `"${W:?}"`) resolved to the value the same command text
+/// binds to it (WI-3172: classify by the executed command, not the argv
+/// substring).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathOrigin {
+    Argv,
+    Binding(BindingClass),
+}
+
+/// Classification of a `NAME=VALUE` binding found in the command text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingClass {
+    /// A literal in the TMPDIR safe set (`/tmp/`, `/var/tmp/`, `$TMPDIR/`,
+    /// `${TMPDIR}/`, `${TMPDIR:-/tmp}/`, `${TMPDIR:-/var/tmp}/`, no `..`
+    /// segment) or a `$(mktemp ...)` invocation that can only create under
+    /// that set.
+    Safe,
+    /// `$HOME`, `${HOME...}`, `$HOME/...` or unquoted `~` / `~/...`: expands
+    /// to the home directory.
+    Home,
+    /// Any other literal value; classified exactly as if it were typed in
+    /// argv (absolute => root-home tier, relative => general tier).
+    Literal,
+    /// Cannot be classified (other variables, other substitutions, backticks,
+    /// backslash escapes). The reference stays unresolved.
+    Unknown,
+}
+
+#[derive(Debug)]
+struct VarBinding<'a> {
+    name: &'a str,
+    value: &'a str,
+    quote: QuoteKind,
+    class: BindingClass,
+    /// Index of the assignment token; bindings before the `rm` token are the
+    /// ones the shell has executed when `rm` runs.
+    token_idx: usize,
+}
+
+/// Result of the binding pre-pass over the whole command.
+#[derive(Debug, Default)]
+struct BindingScan<'a> {
+    bindings: Vec<VarBinding<'a>>,
+    /// Names touched by something other than a plain top-level assignment
+    /// (`read X`, `X+=...`, `printf -v X`, an assignment inside `(...)`):
+    /// never resolved.
+    tainted: Vec<&'a str>,
+    /// `eval` / `source` / `.` anywhere: nothing is resolved.
+    taint_all: bool,
+}
+
+const ASSIGNMENT_KEYWORDS: &[&str] = &["export", "local", "declare", "readonly", "typeset"];
+/// Commands that can rebind a name without the name being visible to the
+/// taint scan: `eval`/`source`/`.` run arbitrary text, and `printf -v NAME`
+/// arrives here with ALL its arguments masked as data by
+/// `sanitize_for_pattern_matching` (printf is an all-args-data command).
+const TAINT_ALL_COMMANDS: &[&str] = &["eval", "source", ".", "printf"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RmFlagStyle {
@@ -391,7 +453,8 @@ pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
         };
 
         if text == "rm" {
-            return parse_rm_segment(command, &tokens, i + 1);
+            let scan = scan_var_bindings(command, &tokens);
+            return parse_rm_segment(command, &tokens, i, &scan);
         }
 
         // Skip to the next separator before scanning for another command word.
@@ -405,17 +468,18 @@ pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
 }
 
 #[allow(clippy::too_many_lines)]
-fn parse_rm_segment(
-    command: &str,
-    tokens: &[crate::normalize::NormalizeToken],
-    start_idx: usize,
+fn parse_rm_segment<'a>(
+    command: &'a str,
+    tokens: &[NormalizeToken],
+    rm_idx: usize,
+    scan: &BindingScan<'a>,
 ) -> RmParseDecision {
     let mut options_ended = false;
     let mut flags = RmFlagTracker::default();
 
-    let mut paths: Vec<PathToken<'_>> = Vec::new();
+    let mut paths: Vec<PathToken<'a>> = Vec::new();
 
-    for token in tokens.iter().skip(start_idx) {
+    for token in tokens.iter().skip(rm_idx + 1) {
         if token.kind == NormalizeTokenKind::Separator {
             break;
         }
@@ -473,11 +537,17 @@ fn parse_rm_segment(
 
         options_ended = true;
         let (quote, unquoted) = strip_outer_quotes(text);
-        paths.push(PathToken {
+        let argv = PathToken {
             unquoted,
             quote,
             range: token.byte_range.clone(),
-        });
+            origin: PathOrigin::Argv,
+        };
+        // A pure variable reference is classified by what the same command
+        // text binds it to, not by the `$NAME` substring. Unresolvable
+        // references stay as they are (the general tier's floor).
+        let resolved = resolve_var_target(&argv, scan, rm_idx).unwrap_or(argv);
+        paths.push(resolved);
     }
 
     let flag_state = flags.resolve();
@@ -485,8 +555,9 @@ fn parse_rm_segment(
         return RmParseDecision::NoMatch;
     };
 
+    // `--` only ends option parsing; it does not change what the paths after
+    // it are, so both the safe check and the root-home tier see through it.
     let safe_paths = !paths.is_empty()
-        && !flag_state.saw_terminator
         && paths
             .iter()
             .all(|path| path_is_safe_for_style(path, flag_state.style));
@@ -496,9 +567,8 @@ fn parse_rm_segment(
     }
 
     let first_path = paths.first();
-    let is_critical = flag_state.style == RmFlagStyle::Combined
-        && !flag_state.saw_terminator
-        && first_path.is_some_and(path_is_root_home);
+    let is_critical =
+        flag_state.style == RmFlagStyle::Combined && first_path.is_some_and(path_is_root_home);
 
     let (pattern_name, reason, severity) = if is_critical {
         (
@@ -543,6 +613,12 @@ fn strip_outer_quotes(token: &str) -> (QuoteKind, &str) {
 }
 
 fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
+    match path.origin {
+        PathOrigin::Binding(BindingClass::Safe) => return true,
+        PathOrigin::Binding(_) => return false,
+        PathOrigin::Argv => {}
+    }
+
     if path.quote == QuoteKind::Double && style != RmFlagStyle::Combined {
         return false;
     }
@@ -606,6 +682,13 @@ fn path_is_root_home(path: &PathToken<'_>) -> bool {
     // Check if the path is root or home, ignoring quotes for absolute paths.
     // Tilde expansion only happens if UNQUOTED, but / is absolute regardless.
 
+    match path.origin {
+        PathOrigin::Binding(BindingClass::Home) => return true,
+        PathOrigin::Binding(BindingClass::Safe | BindingClass::Unknown) => return false,
+        // A literal binding is classified exactly like the literal in argv.
+        PathOrigin::Binding(BindingClass::Literal) | PathOrigin::Argv => {}
+    }
+
     let text = path.unquoted;
 
     // Absolute paths starting with / are dangerous regardless of quotes
@@ -620,6 +703,398 @@ fn path_is_root_home(path: &PathToken<'_>) -> bool {
     }
 
     false
+}
+
+// ---------------------------------------------------------------------------
+// Variable-target resolution (WI-3172)
+//
+// `rm -rf "$B"` is classified by the value the SAME command text binds to
+// `B`, never by the `$B` substring. Bindings are `NAME=VALUE` words in a
+// segment that contains nothing else (optionally led by `export` & co), at
+// parenthesis depth 0. Anything that can mutate a name without being such a
+// segment (`read X`, `X+=`, `printf -v X`, a subshell assignment, `eval`)
+// taints it so it is never resolved. A name bound to a non-safe value
+// ANYWHERE in the command resolves to that value (deny); otherwise the last
+// safe binding before the `rm` wins (allow); no binding => unresolved.
+// ---------------------------------------------------------------------------
+
+fn is_valid_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `NAME=VALUE` => `(NAME, VALUE)` when NAME is a valid shell identifier.
+fn split_assignment(word: &str) -> Option<(&str, &str)> {
+    let (name, value) = word.split_once('=')?;
+    is_valid_var_name(name).then_some((name, value))
+}
+
+fn scan_var_bindings<'a>(command: &'a str, tokens: &[NormalizeToken]) -> BindingScan<'a> {
+    let mut scan = BindingScan::default();
+    let mut depth: usize = 0;
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i].kind == NormalizeTokenKind::Separator {
+            match tokens[i].text(command) {
+                Some("(") => depth += 1,
+                Some(")") => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        let seg_start = i;
+        let mut seg_end = i;
+        while seg_end < tokens.len() && tokens[seg_end].kind != NormalizeTokenKind::Separator {
+            seg_end += 1;
+        }
+
+        match parse_assignment_segment(command, tokens, seg_start, depth, &mut scan) {
+            Some(next) => i = next,
+            None => {
+                taint_segment_words(command, &tokens[seg_start..seg_end], &mut scan);
+                i = seg_end;
+            }
+        }
+    }
+    scan
+}
+
+/// Parse a pure-assignment segment starting at `start`. Returns the index of
+/// the token after the segment, or `None` when the segment is not purely
+/// assignments (the caller then taints the words instead).
+fn parse_assignment_segment<'a>(
+    command: &'a str,
+    tokens: &[NormalizeToken],
+    start: usize,
+    depth: usize,
+    scan: &mut BindingScan<'a>,
+) -> Option<usize> {
+    let mut i = start;
+    let mut pending: Vec<VarBinding<'a>> = Vec::new();
+    let mut first = true;
+    while i < tokens.len() && tokens[i].kind != NormalizeTokenKind::Separator {
+        let text = tokens[i].text(command)?;
+        if first && ASSIGNMENT_KEYWORDS.contains(&text) {
+            first = false;
+            i += 1;
+            continue;
+        }
+        first = false;
+        let (name, raw_value) = split_assignment(text)?;
+
+        // Unquoted command substitution: the tokenizer splits `NAME=$(` at
+        // the parenthesis, so the value continues until the matching `)`.
+        let opens_substitution = raw_value == "$"
+            && tokens.get(i + 1).is_some_and(|t| {
+                t.kind == NormalizeTokenKind::Separator && t.text(command) == Some("(")
+            });
+        if opens_substitution {
+            let mut j = i + 2;
+            let mut inner_depth = 0usize;
+            let mut inner_words: Vec<&str> = Vec::new();
+            let mut clean = true;
+            loop {
+                let tok = tokens.get(j)?;
+                if tok.kind == NormalizeTokenKind::Separator {
+                    match tok.text(command) {
+                        Some("(") => {
+                            inner_depth += 1;
+                            clean = false;
+                        }
+                        Some(")") => {
+                            if inner_depth == 0 {
+                                break;
+                            }
+                            inner_depth -= 1;
+                        }
+                        _ => clean = false,
+                    }
+                } else if let Some(word) = tok.text(command) {
+                    inner_words.push(word);
+                }
+                j += 1;
+            }
+            let class = if clean && mktemp_invocation_is_safe(&inner_words) {
+                BindingClass::Safe
+            } else {
+                BindingClass::Unknown
+            };
+            let value_start = tokens[i].byte_range.start + name.len() + 1;
+            let value = command.get(value_start..tokens[j].byte_range.end)?;
+            pending.push(VarBinding {
+                name,
+                value,
+                quote: QuoteKind::None,
+                class,
+                token_idx: i,
+            });
+            i = j + 1;
+            continue;
+        }
+
+        let (quote, value) = strip_outer_quotes(raw_value);
+        pending.push(VarBinding {
+            name,
+            value,
+            quote,
+            class: classify_binding_value(value, quote),
+            token_idx: i,
+        });
+        i += 1;
+    }
+
+    if depth == 0 {
+        scan.bindings.extend(pending);
+    } else {
+        // Subshell-scoped: invisible to the `rm`, but conservatively poison
+        // the name so an outer value can never be trusted.
+        scan.tainted.extend(pending.iter().map(|b| b.name));
+    }
+    Some(i)
+}
+
+/// Mark every identifier in a non-assignment segment as tainted unless it is
+/// a `$NAME` / `${NAME` reference.
+fn taint_segment_words<'a>(command: &'a str, words: &[NormalizeToken], scan: &mut BindingScan<'a>) {
+    for (n, token) in words.iter().enumerate() {
+        let Some(text) = token.text(command) else {
+            continue;
+        };
+        if n == 0 && TAINT_ALL_COMMANDS.contains(&text) {
+            scan.taint_all = true;
+        }
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        while start < bytes.len() {
+            if !(bytes[start].is_ascii_alphabetic() || bytes[start] == b'_') {
+                start += 1;
+                continue;
+            }
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            let is_reference = start > 0 && matches!(bytes[start - 1], b'$' | b'{');
+            if !is_reference {
+                scan.tainted.push(&text[start..end]);
+            }
+            start = end;
+        }
+    }
+}
+
+fn value_is_home(value: &str, quote: QuoteKind) -> bool {
+    if quote == QuoteKind::Single {
+        return false;
+    }
+    if let Some(rest) = value.strip_prefix("$HOME") {
+        return rest.is_empty() || rest.starts_with('/');
+    }
+    if value.starts_with("${HOME") {
+        return true;
+    }
+    quote == QuoteKind::None && value.starts_with('~')
+}
+
+fn classify_binding_value(value: &str, quote: QuoteKind) -> BindingClass {
+    if value.is_empty() {
+        return BindingClass::Unknown;
+    }
+    if value_is_home(value, quote) {
+        return BindingClass::Home;
+    }
+    if quote == QuoteKind::Single {
+        let literal_tmp = value
+            .strip_prefix("/tmp/")
+            .or_else(|| value.strip_prefix("/var/tmp/"))
+            .is_some_and(|rest| !has_dotdot_segment(rest));
+        return if literal_tmp {
+            BindingClass::Safe
+        } else {
+            BindingClass::Literal
+        };
+    }
+    if value.contains(['`', '\\']) {
+        return BindingClass::Unknown;
+    }
+    if let Some(inner) = value.strip_prefix("$(").and_then(|v| v.strip_suffix(')')) {
+        if inner.contains(['(', ')', '|', ';', '&', '<', '>']) {
+            return BindingClass::Unknown;
+        }
+        let words: Vec<&str> = inner.split_whitespace().collect();
+        return if mktemp_invocation_is_safe(&words) {
+            BindingClass::Safe
+        } else {
+            BindingClass::Unknown
+        };
+    }
+    // The only expansion a safe value may contain is a leading TMPDIR form;
+    // `/tmp/$X` is unknown here even though the argv literal is allowed.
+    if value.contains('$') {
+        let leading_tmpdir = value.starts_with("$TMPDIR/") || value.starts_with("${TMPDIR");
+        if !leading_tmpdir || value[1..].contains('$') {
+            return BindingClass::Unknown;
+        }
+    }
+    if path_is_safe_unquoted(value) {
+        return BindingClass::Safe;
+    }
+    BindingClass::Literal
+}
+
+/// A directory operand of `mktemp -p DIR` / `--tmpdir=DIR` that can only be
+/// inside the temp safe set.
+fn mktemp_dir_is_safe(dir: &str) -> bool {
+    let (quote, dir) = strip_outer_quotes(dir);
+    if dir.contains(['`', '\\']) {
+        return false;
+    }
+    let trimmed = dir.trim_end_matches('/');
+    if trimmed == "/tmp" || trimmed == "/var/tmp" {
+        return true;
+    }
+    if quote == QuoteKind::Single {
+        return dir
+            .strip_prefix("/tmp/")
+            .or_else(|| dir.strip_prefix("/var/tmp/"))
+            .is_some_and(|rest| !has_dotdot_segment(rest));
+    }
+    if matches!(
+        trimmed,
+        "$TMPDIR" | "${TMPDIR}" | "${TMPDIR:-/tmp}" | "${TMPDIR:-/var/tmp}"
+    ) {
+        return true;
+    }
+    path_is_safe_unquoted(dir)
+}
+
+/// `mktemp` with the documented flags whose result can only be under the
+/// temp safe set: slash-free templates go to `$TMPDIR`/`/tmp`; explicit
+/// directories or absolute templates must themselves be safe.
+fn mktemp_invocation_is_safe(words: &[&str]) -> bool {
+    let Some((first, rest)) = words.split_first() else {
+        return false;
+    };
+    if first.rsplit('/').next() != Some("mktemp") {
+        return false;
+    }
+    let mut saw_template = false;
+    let mut iter = rest.iter();
+    while let Some(word) = iter.next() {
+        let (_, bare) = strip_outer_quotes(word);
+        if let Some(long) = bare.strip_prefix("--") {
+            match long {
+                "directory" | "dry-run" | "quiet" | "tmpdir" => {}
+                "suffix" => {
+                    if iter.next().is_none() {
+                        return false;
+                    }
+                }
+                _ if long.starts_with("suffix=") => {}
+                _ => {
+                    let Some(dir) = long.strip_prefix("tmpdir=") else {
+                        return false;
+                    };
+                    if !mktemp_dir_is_safe(dir) {
+                        return false;
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(short) = bare.strip_prefix('-') {
+            if short.is_empty() {
+                return false;
+            }
+            if let Some(dir) = short.strip_prefix('p') {
+                let dir = if dir.is_empty() {
+                    match iter.next() {
+                        Some(next) => next,
+                        None => return false,
+                    }
+                } else {
+                    dir
+                };
+                if !mktemp_dir_is_safe(dir) {
+                    return false;
+                }
+                continue;
+            }
+            if !short.chars().all(|c| matches!(c, 'd' | 'u' | 'q' | 't')) {
+                return false;
+            }
+            continue;
+        }
+        // Template operand: at most one.
+        if saw_template {
+            return false;
+        }
+        saw_template = true;
+        if bare.contains(['`', '\\']) {
+            return false;
+        }
+        let is_plain_name = !bare.contains(['/', '$']);
+        if !is_plain_name && !mktemp_dir_is_safe(word) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `$NAME`, `${NAME}`, `${NAME:?...}` or `${NAME?...}` (unquoted or
+/// double-quoted) => `NAME`. Single quotes do not expand; other parameter
+/// expansions (`${NAME:-/}`, `${NAME%/*}`) are not pure references.
+fn pure_var_name<'a>(path: &PathToken<'a>) -> Option<&'a str> {
+    if path.quote == QuoteKind::Single {
+        return None;
+    }
+    let body = path.unquoted.strip_prefix('$')?;
+    if let Some(inner) = body.strip_prefix('{') {
+        let inner = inner.strip_suffix('}')?;
+        let name_end = inner
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(inner.len());
+        let (name, rest) = inner.split_at(name_end);
+        if !is_valid_var_name(name) {
+            return None;
+        }
+        let abort_if_unset = rest.is_empty() || rest.starts_with(":?") || rest.starts_with('?');
+        return abort_if_unset.then_some(name);
+    }
+    is_valid_var_name(body).then_some(body)
+}
+
+fn resolve_var_target<'a>(
+    path: &PathToken<'a>,
+    scan: &BindingScan<'a>,
+    rm_idx: usize,
+) -> Option<PathToken<'a>> {
+    let name = pure_var_name(path)?;
+    if scan.taint_all || scan.tainted.contains(&name) {
+        return None;
+    }
+    let bindings: Vec<&VarBinding<'a>> = scan.bindings.iter().filter(|b| b.name == name).collect();
+    // Unsafe-binding check: a non-safe value anywhere in the command wins.
+    let unsafe_binding = bindings.iter().find(|b| b.class != BindingClass::Safe);
+    // Safe-binding check: otherwise the last safe binding before the rm.
+    let chosen = match unsafe_binding {
+        Some(binding) => *binding,
+        None => *bindings.iter().rfind(|b| b.token_idx < rm_idx)?,
+    };
+    if chosen.class == BindingClass::Unknown {
+        return None;
+    }
+    Some(PathToken {
+        unquoted: chosen.value,
+        quote: chosen.quote,
+        range: path.range.clone(),
+        origin: PathOrigin::Binding(chosen.class),
+    })
 }
 
 /// Create the core filesystem pack.
@@ -3184,5 +3659,206 @@ mod tests {
     #[test]
     fn test_rm_parser_option_terminator() {
         assert_rm_parser_no_match("rm -- -rf /tmp/safe");
+    }
+
+    // -----------------------------------------------------------------
+    // WI-3172: a pure variable target is classified by its binding in the
+    // executed command text. Every ALLOW is paired with a bypass fixture
+    // that still DENIES (see records/DESIGN.md (d)).
+    // -----------------------------------------------------------------
+
+    /// ALLOW fixtures A1-A9: safe binding before the rm.
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_rm_variable_target_safe_binding_allows() {
+        // A1: Helm case 2 with its real binding (a scratchpad worktree path).
+        assert_rm_parser_allows(r#"WT=/tmp/claude-1004/scratchpad/wt-3095; rm -rf "$WT""#);
+        // A2: Helm case 3 with its real binding (the lane's own mktemp dir).
+        assert_rm_parser_allows(r#"W=$(mktemp -d); rm -rf -- "${W:?}""#);
+        // A3: unquoted reference, literal /tmp path.
+        assert_rm_parser_allows("T=/tmp/build-cache; rm -rf $T");
+        // A4: braced reference, scratchpad path.
+        assert_rm_parser_allows("S=/tmp/claude-1004/scratchpad/x; rm -rf ${S}");
+        // A5: /var/tmp literal.
+        assert_rm_parser_allows(r#"D=/var/tmp/scratch; rm -rf "$D""#);
+        // A6: value itself in the TMPDIR safe set.
+        assert_rm_parser_allows(r#"D="$TMPDIR/scratch"; rm -rf "$D""#);
+        // A7: mktemp with an absolute template under /tmp, && separator.
+        assert_rm_parser_allows(r#"D=$(mktemp -d /tmp/wi.XXXXXX) && rm -rf "$D""#);
+        // A8: export-led binding.
+        assert_rm_parser_allows(r#"export W=/tmp/w1; rm -rf "$W""#);
+        // A9: double-quoted command substitution.
+        assert_rm_parser_allows(r#"B="$(mktemp -d)"; rm -rf "$B""#);
+        // Separate and long flag styles resolve the same way.
+        assert_rm_parser_allows(r#"D=/tmp/x; rm -r -f "$D""#);
+        assert_rm_parser_allows(r#"D=/tmp/x; rm --recursive --force "$D""#);
+    }
+
+    /// BYPASS fixtures X1-X8: a hostile binding is resolved and classified
+    /// exactly like the literal it expands to.
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_rm_variable_target_unsafe_binding_denies_critical() {
+        for cmd in [
+            // X1: root binding.
+            r#"B=/; rm -rf "$B""#,
+            // X2: home binding (tilde expands at assignment).
+            r#"B=~; rm -rf "$B""#,
+            // X3: home binding via $HOME.
+            r#"B=$HOME; rm -rf "$B""#,
+            r#"B="${HOME}"; rm -rf "$B""#,
+            // X4: system-path binding.
+            r#"B=/etc; rm -rf "$B""#,
+            // X5: Helm case 1 with its real binding: a path under /home stays
+            // denied, exactly as the literal `rm -rf /home/orca/...` is.
+            r#"B=/home/orca/dev/_data/aw2/r7-prerebase; rm -rf "$B"; mkdir -p "$B""#,
+            // X6: re-bound to root after a safe binding (last binding wins).
+            r#"B=/tmp/x; B=/; rm -rf "$B""#,
+            // X7: unsafe binding anywhere in the command wins.
+            r#"B=/; B=/tmp/x; rm -rf "$B""#,
+            r#"B=/tmp/x; rm -rf "$B"; B=/"#,
+            // X8: traversal binding.
+            r#"B=/tmp/../etc; rm -rf "$B""#,
+            // Bare /tmp itself is not in the safe set (mirrors `rm -rf /tmp`).
+            r#"B=/tmp; rm -rf "$B""#,
+            // `--` is transparent: the root-home tier still sees the target.
+            r#"B=/; rm -rf -- "${B:?}""#,
+        ] {
+            assert_rm_parser_denies(cmd, RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        }
+    }
+
+    /// Floor fixtures: unassigned, unclassifiable or non-pure references keep
+    /// today's behaviour (rm-rf-general High).
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_rm_variable_target_unresolved_keeps_floor() {
+        for cmd in [
+            // U1: the three Helm literals, unassigned (single- and double-quoted).
+            r"rm -rf '$B'",
+            r#"rm -rf "$B""#,
+            r"rm -rf '$WT'",
+            r#"rm -rf "$WT""#,
+            r"rm -rf -- '${W:?}'",
+            r#"rm -rf -- "${W:?}""#,
+            // X9: mktemp outside the temp safe set => unknown.
+            r#"B=$(mktemp -d /etc/x.XXXX); rm -rf "$B""#,
+            r#"B=$(mktemp -p /etc); rm -rf "$B""#,
+            // Binding to another variable or substitution => unknown.
+            r#"B=$X; rm -rf "$B""#,
+            r#"B=$(pwd); rm -rf "$B""#,
+            r#"B=/tmp/$X; rm -rf "$B""#,
+            // Binding of a different name.
+            r#"B=/tmp/x; rm -rf "$C""#,
+            // Safe binding only AFTER the rm.
+            r#"rm -rf "$B"; B=/tmp/x"#,
+            // U3: non-pure references are untouched.
+            r#"B=/tmp/x; rm -rf "${B:-/}""#,
+            r#"B=/tmp/x; rm -rf "${B%/*}""#,
+            r#"B=/tmp/x; rm -rf "$B/../../etc""#,
+            // Single quotes do not expand: '$B' is a relative literal.
+            "B=/tmp/x; rm -rf '$B'",
+            // A second, unsafe operand keeps the deny.
+            r#"B=/tmp/x; rm -rf "$B" ./build"#,
+            // Tainted names: mutated by something other than a plain assignment.
+            r#"B=/tmp/x; B+=/../..; rm -rf "$B""#,
+            r#"B=/tmp/x; read B; rm -rf "$B""#,
+            r#"B=/tmp/x; printf -v B /; rm -rf "$B""#,
+            r#"(B=/tmp/x); rm -rf "$B""#,
+            r#"B=/tmp/x; eval "B=/"; rm -rf "$B""#,
+            r#"B=/tmp/x; unset B; declare -n B=X; rm -rf "$B""#,
+            // Relative literal binding: general tier, like `rm -rf build`.
+            r#"B=build; rm -rf "$B""#,
+        ] {
+            assert_rm_parser_denies(cmd, RM_RF_GENERAL_NAME, Severity::High);
+        }
+        // A safe binding plus an unsafe operand keeps the general deny.
+        assert_rm_parser_denies(
+            r#"B=/tmp/x; rm -rf "$B" /etc"#,
+            RM_RF_GENERAL_NAME,
+            Severity::High,
+        );
+        // U2: prefix form is not a binding (bash expands $B first). The
+        // parser does not own a segment whose command word is an assignment
+        // (unchanged); the regex floor denies it end to end (see below).
+        assert_rm_parser_no_match(r#"B=/tmp/x rm -rf "$B""#);
+    }
+
+    /// `--` no longer hides the paths after it from classification.
+    #[test]
+    fn test_rm_parser_terminator_is_transparent() {
+        assert_rm_parser_allows("rm -rf -- /tmp/x");
+        assert_rm_parser_denies("rm -rf -- /", RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        assert_rm_parser_denies("rm -rf -- build", RM_RF_GENERAL_NAME, Severity::High);
+    }
+
+    /// The same fixtures through the full evaluator (normalization, masking,
+    /// quick-reject) prove the binding segment survives to the parser.
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_rm_variable_target_end_to_end() {
+        assert_allows_command(r#"WT=/tmp/claude-1004/scratchpad/wt-3095; rm -rf "$WT""#);
+        assert_allows_command(r#"W=$(mktemp -d); rm -rf -- "${W:?}""#);
+        assert_allows_command(r#"export W=/tmp/w1; rm -rf "$W""#);
+        assert_denies_with_rule(r#"B=/; rm -rf "$B""#, "core.filesystem:rm-rf-root-home");
+        assert_denies_with_rule(
+            r#"B=/home/orca/dev/_data/aw2/r7-prerebase; rm -rf "$B"; mkdir -p "$B""#,
+            "core.filesystem:rm-rf-root-home",
+        );
+        assert_denies_with_rule(
+            r#"B=/tmp/x; B=/; rm -rf "$B""#,
+            "core.filesystem:rm-rf-root-home",
+        );
+        assert_denies_with_rule(r#"rm -rf "$B""#, "core.filesystem:rm-rf-general");
+        assert_denies_with_rule(r#"B=/tmp/x rm -rf "$B""#, "core.filesystem:rm-rf-general");
+        // printf's arguments are masked as data before the parser sees them,
+        // so `-v B` is invisible: a printf segment must taint everything.
+        assert_denies_with_rule(
+            r#"B=/tmp/x; printf -v B /; rm -rf "$B""#,
+            "core.filesystem:rm-rf-general",
+        );
+        assert_denies_with_rule(
+            r#"B=/tmp/x; read B; rm -rf "$B""#,
+            "core.filesystem:rm-rf-general",
+        );
+    }
+
+    #[test]
+    fn test_mktemp_invocation_classification() {
+        for safe in [
+            "mktemp -d",
+            "mktemp",
+            "mktemp -du",
+            "mktemp -d -t wi.XXXXXX",
+            "mktemp -d /tmp/wi.XXXXXX",
+            "mktemp -d -p /tmp",
+            "mktemp -d -p /var/tmp/ x.XXXX",
+            "mktemp -d --tmpdir=/tmp/claude-1004/scratchpad",
+            "mktemp -d --tmpdir",
+            "mktemp --directory --suffix=.d",
+            "/usr/bin/mktemp -d \"$TMPDIR/x.XXXX\"",
+            "mktemp -p \"${TMPDIR:-/tmp}\"",
+        ] {
+            let words: Vec<&str> = safe.split_whitespace().collect();
+            assert!(mktemp_invocation_is_safe(&words), "expected safe: {safe}");
+        }
+        for unsafe_ in [
+            "mktemp -d /etc/x.XXXX",
+            "mktemp -p /etc",
+            "mktemp -p /tmp/../etc x.XXXX",
+            "mktemp --tmpdir=/home/u x.XXXX",
+            "mktemp -d $DIR/x.XXXX",
+            "mktemp -d a.XXXX b.XXXX",
+            "mktemp -Z",
+            "mktemp --unknown",
+            "mktempx -d",
+            "",
+        ] {
+            let words: Vec<&str> = unsafe_.split_whitespace().collect();
+            assert!(
+                !mktemp_invocation_is_safe(&words),
+                "expected unsafe: {unsafe_}"
+            );
+        }
     }
 }
