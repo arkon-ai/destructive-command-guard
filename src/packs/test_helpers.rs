@@ -490,7 +490,7 @@ pub fn assert_patterns_compile(pack: &Pack) {
 
     // Destructive patterns
     for pattern in &pack.destructive_patterns {
-        let _ = pattern.regex.as_str();
+        let _ = pattern.raw_regex.as_str();
     }
 }
 

@@ -790,7 +790,7 @@ fn test_audit_backtracking_requirements() {
 
         // Check destructive patterns
         for p in &pack.destructive_patterns {
-            let pattern_str = p.regex.as_str();
+            let pattern_str = p.raw_regex.as_str();
             let name = p.name.unwrap_or("UNNAMED");
             if needs_backtracking_engine(pattern_str) {
                 if !pack_expected.contains(name) {

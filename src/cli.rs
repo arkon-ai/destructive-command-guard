@@ -2614,7 +2614,8 @@ fn print_pack_patterns_plain(info: &PackInfo, expand: bool, max_patterns: usize)
         .map(|pattern| {
             let name = pattern.name.unwrap_or("unnamed");
             let severity_label = pattern.severity.label();
-            let regex = crate::highlight::format_regex_pattern(pattern.regex.as_str(), use_color);
+            let regex =
+                crate::highlight::format_regex_pattern(pattern.raw_regex.as_str(), use_color);
             format!("{name} [{severity_label}]: {regex}")
         })
         .collect();
@@ -2810,7 +2811,7 @@ fn pack_info(
                     .iter()
                     .map(|p| DestructivePatternJson {
                         name: p.name.unwrap_or("unnamed").to_string(),
-                        regex: p.regex.as_str().to_string(),
+                        regex: p.raw_regex.as_str().to_string(),
                         severity: p.severity.label().to_string(),
                         reason: p.reason.to_string(),
                         explanation: p.explanation.map(String::from),
@@ -2870,7 +2871,8 @@ fn pack_info(
         for pattern in &pack.destructive_patterns {
             let name = pattern.name.unwrap_or("unnamed");
             let severity_label = pattern.severity.label().to_uppercase();
-            let regex = crate::highlight::format_regex_pattern(pattern.regex.as_str(), use_color);
+            let regex =
+                crate::highlight::format_regex_pattern(pattern.raw_regex.as_str(), use_color);
             println!("  - {name} [{severity_label}] : {regex}");
             println!("    Reason: {}", pattern.reason);
             if let Some(explanation) = pattern.explanation {
@@ -13250,7 +13252,7 @@ fn dev_validate_pack(
             }
 
             for destructive in &p.destructive_patterns {
-                match fancy_regex::Regex::new(destructive.regex.as_str()) {
+                match fancy_regex::Regex::new(destructive.raw_regex.as_str()) {
                     Ok(re) => {
                         if let Err(e) = re.is_match("test") {
                             pattern_errors.push(format!(
@@ -13456,7 +13458,7 @@ fn dev_benchmark(config: &Config, pack_id: &str, iterations: usize, commands: Op
                         let _ = safe.regex.is_match(cmd);
                     }
                     for destructive in &pack.destructive_patterns {
-                        let _ = destructive.regex.is_match(cmd);
+                        let _ = destructive.is_match(cmd);
                     }
                 }
             }

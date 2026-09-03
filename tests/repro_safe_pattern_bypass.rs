@@ -106,8 +106,8 @@ fn debug_compound_command_spans() {
 
     // Check if the pack's regex matches
     for dp in &fs_pack.destructive_patterns {
-        let matches_orig = dp.regex.find(cmd).is_some();
-        let matches_norm = dp.regex.find(normalized.as_ref()).is_some();
+        let matches_orig = dp.find(cmd).is_some();
+        let matches_norm = dp.find(normalized.as_ref()).is_some();
         if matches_orig || matches_norm {
             eprintln!(
                 "  Pattern {:?} matches: orig={} norm={}",

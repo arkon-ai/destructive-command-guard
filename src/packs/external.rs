@@ -560,7 +560,7 @@ impl ExternalPack {
                 };
 
                 DestructivePattern {
-                    regex: LazyCompiledRegex::new(Box::leak(p.pattern.into_boxed_str())),
+                    raw_regex: LazyCompiledRegex::new(Box::leak(p.pattern.into_boxed_str())),
                     reason,
                     name: Some(name),
                     severity: p.severity.into(),

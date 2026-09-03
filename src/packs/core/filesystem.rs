@@ -1062,59 +1062,441 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     ]
 }
 
-/// Command words that execute a quoted string (or piped text) as shell code
-/// on THIS host. A quoted `>` in a pipeline that contains one of these is a
-/// real local redirect and gets no quoted-text shield.
+/// Command words that execute a quoted string (or piped text) as code on
+/// THIS host without going through the classifier's `-c`/`-e` InlineCode
+/// route. Any live (unquoted) occurrence of one of these in a segment means
+/// a quoted `>` in that segment is a real local redirect and gets no
+/// quoted-text shield. Shells are listed explicitly (no `*sh` suffix
+/// heuristic: `ssh` ends in `sh` and is handled by the loopback check).
 const REDIRECT_LOCAL_EXECUTORS: &[&str] = &[
-    "bash", "sh", "zsh", "ksh", "dash", "fish", "eval", "exec", "xargs", "env", "timeout", "sudo",
-    "doas", "su", "nohup", "nice", "time", "command", "watch",
+    // shells
+    "bash",
+    "sh",
+    "zsh",
+    "ksh",
+    "dash",
+    "fish",
+    "ash",
+    "csh",
+    "tcsh",
+    "rbash",
+    "mksh",
+    "pdksh",
+    "yash",
+    "busybox", // shell builtins that run text
+    "eval",
+    "exec",
+    "source",
+    ".", // programs that run a string / stdin through a local shell
+    "xargs",
+    "su",
+    "runuser",
+    "watch",
+    "script",
+    "expect",
+    "tclsh",
+    "wish",
+    "osascript",
+    "screen",
+    "tmux",
+    "nsenter",
+    "unshare",
+    "chroot",
+    "parallel",
+    "at",
+    "batch",
+    "crontab",
+    "systemd-run",
+    "find",
+    "flock",
+    "strace",
+    "ltrace", // interpreters whose program text can open files
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "perl",
+    "python",
+    "python2",
+    "python3",
+    "ruby",
+    "node",
+    "nodejs",
+    "deno",
+    "bun",
+    "lua",
+    "php",
 ];
 
-/// First command word of a pipeline stage (skips `VAR=value` prefixes, strips
-/// surrounding quotes and any directory prefix).
-fn stage_command_word(stage: &str) -> Option<&str> {
-    stage
-        .split_whitespace()
-        .find(|tok| {
-            let name = tok.split('=').next().unwrap_or("");
-            !(tok.contains('=')
-                && !name.is_empty()
-                && name.chars().all(|c| c.is_alphanumeric() || c == '_'))
-        })
-        .map(|tok| {
-            let tok = tok.trim_matches(|c| c == '"' || c == '\'');
-            tok.rsplit('/').next().unwrap_or(tok)
-        })
+/// Wrappers that exec their ARGUMENT VECTOR directly (no shell), so the
+/// inner command word decides: `sudo echo "use > ~/file"` is content,
+/// `sudo sh -c '> /etc/passwd'` is local execution (the `sh` word is live).
+/// `sudo`/`doas` with a shell-mode flag (`-s`, `-i`) and `env -S` run text
+/// through a shell and count as executors themselves.
+const REDIRECT_TRANSPARENT_WRAPPERS: &[&str] = &[
+    "sudo", "doas", "env", "timeout", "nohup", "nice", "ionice", "time", "command", "setsid",
+    "stdbuf",
+];
+
+/// Remote-shell clients: their quoted payload runs on the DESTINATION host,
+/// which is content unless the destination is this host (loopback, the
+/// machine's own name, or a substitution that could name it).
+const REDIRECT_REMOTE_SHELLS: &[&str] = &["ssh", "scp", "sftp"];
+
+/// A whitespace/metacharacter-delimited word of a segment. `live` is true
+/// when the word starts outside quotes (or inside a `$(...)`/backtick
+/// substitution, which the shell runs locally even inside double quotes);
+/// a word that starts with a quote character is quoted content.
+struct SegmentWord<'a> {
+    text: &'a str,
+    live: bool,
+    /// Byte offset just past the word within the segment.
+    end: usize,
 }
 
-/// True when any stage of this `|`-pipeline is a local shell-string executor.
-fn pipeline_has_local_executor(segment: &str) -> bool {
-    let is_executor = |stage: &str| {
-        stage_command_word(stage).is_some_and(|word| REDIRECT_LOCAL_EXECUTORS.contains(&word))
-    };
+/// Split a segment into words. Unquoted whitespace and the metacharacters
+/// `| & ; ( ) { }` and backtick end a word, so `"> ~/x"|bash`, `(sh -c`
+/// and `{ sh -c` all surface their command words. Quoted runs stay one
+/// word (they are content, never a command word) except that a `$(` inside
+/// double quotes opens a live substitution.
+fn segment_words(segment: &str) -> Vec<SegmentWord<'_>> {
     let bytes = segment.as_bytes();
-    let (mut in_single, mut in_double) = (false, false);
-    let mut stage_start = 0usize;
+    let mut words = Vec::new();
+    let (mut in_single, mut in_double, mut in_backtick) = (false, false, false);
+    let mut subst_depth = 0usize;
+    let mut word_start: Option<(usize, bool)> = None;
     let mut i = 0usize;
+    fn end_word<'a>(
+        segment: &'a str,
+        start: &mut Option<(usize, bool)>,
+        at: usize,
+        words: &mut Vec<SegmentWord<'a>>,
+    ) {
+        if let Some((s, live)) = start.take()
+            && at > s
+        {
+            words.push(SegmentWord {
+                text: &segment[s..at],
+                live,
+                end: at,
+            });
+        }
+    }
     while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if !in_single => {
-                i += 2;
-                continue;
+        let b = bytes[i];
+        let live = (!in_single && !in_double) || subst_depth > 0 || in_backtick;
+        if b == b'\\' && !in_single {
+            if word_start.is_none() {
+                word_start = Some((i, live));
             }
+            i += 2;
+            continue;
+        }
+        if !in_single && b == b'$' && bytes.get(i + 1) == Some(&b'(') {
+            end_word(segment, &mut word_start, i, &mut words);
+            subst_depth += 1;
+            i += 2;
+            continue;
+        }
+        if !in_single && b == b'`' {
+            end_word(segment, &mut word_start, i, &mut words);
+            in_backtick = !in_backtick;
+            i += 1;
+            continue;
+        }
+        if live {
+            match b {
+                b' ' | b'\t' | b'\n' | b'\r' | b'|' | b'&' | b';' | b'(' | b'{' | b'}' => {
+                    end_word(segment, &mut word_start, i, &mut words);
+                    i += 1;
+                    continue;
+                }
+                b')' => {
+                    end_word(segment, &mut word_start, i, &mut words);
+                    subst_depth = subst_depth.saturating_sub(1);
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if word_start.is_none() {
+            // A word beginning with a quote is quoted content.
+            word_start = Some((i, live && b != b'\'' && b != b'"'));
+        }
+        match b {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
-            b'|' if !in_single && !in_double => {
-                if is_executor(&segment[stage_start..i]) {
-                    return true;
-                }
-                stage_start = i + 1;
-            }
             _ => {}
         }
         i += 1;
     }
-    is_executor(&segment[stage_start.min(segment.len())..])
+    end_word(segment, &mut word_start, bytes.len(), &mut words);
+    words
+}
+
+/// Reduce a word to its command name: strip shell sugar (`!`, `$`, quotes),
+/// then any directory prefix. `!sh` / `$HOME/bin/sh` / `"sh"` → `sh`.
+fn command_name(word: &str) -> &str {
+    let word = word.trim_matches(|c: char| matches!(c, '!' | '$' | '"' | '\'' | ';' | ')'));
+    word.rsplit(['/', '\\']).next().unwrap_or(word)
+}
+
+/// Bare short-flag cluster (`-s`, `-Es`) containing one of `letters`.
+fn short_flag_has(word: &str, letters: &[u8]) -> bool {
+    word.len() > 1
+        && word.starts_with('-')
+        && !word.starts_with("--")
+        && word.bytes().skip(1).any(|b| letters.contains(&b))
+}
+
+/// Loopback / self-referencing destination for ssh/scp/sftp. Any
+/// substitution in the host position is treated as local (fail closed).
+fn ssh_host_is_local(host: &str) -> bool {
+    let host = host.trim_matches(|c| c == '"' || c == '\'');
+    let host = host
+        .strip_prefix("ssh://")
+        .or_else(|| host.strip_prefix("sftp://"))
+        .unwrap_or(host);
+    // user@host, [v6]:port, host:port (ssh:// form)
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else if host.matches(':').count() == 1 {
+        host.split(':').next().unwrap_or(host)
+    } else {
+        host
+    };
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return false;
+    }
+    if host.starts_with('$') || host.starts_with('`') || host.contains("$(") || host.contains("${")
+    {
+        return true;
+    }
+    let lower = host.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "localhost"
+            | "localhost.localdomain"
+            | "localhost4"
+            | "localhost6"
+            | "ip6-localhost"
+            | "ip6-loopback"
+            | "0.0.0.0"
+            | "::"
+            | "::1"
+    ) || lower.starts_with("127.")
+        || lower.starts_with("localhost.")
+    {
+        return true;
+    }
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        let v4_mapped = match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+            std::net::IpAddr::V4(_) => None,
+        };
+        if ip.is_loopback()
+            || ip.is_unspecified()
+            || v4_mapped.is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        {
+            return true;
+        }
+    }
+    // Numeric / octal / hex disguises of 127.0.0.1 (`2130706433`, `0x7f000001`,
+    // `0177.0.0.1`): no real remote host looks like this.
+    if lower.bytes().all(|b| b.is_ascii_digit())
+        || (lower.starts_with('0')
+            && lower
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b'x' || b == b'.'))
+    {
+        return true;
+    }
+    let Some(own) = local_hostname() else {
+        return false;
+    };
+    let own = own.to_ascii_lowercase();
+    if own.is_empty() {
+        return false;
+    }
+    lower == own || lower.split('.').next() == own.split('.').next()
+}
+
+/// This host's name, read once from the kernel (not from the environment).
+fn local_hostname() -> Option<&'static str> {
+    static HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| {
+            ["/proc/sys/kernel/hostname", "/etc/hostname"]
+                .iter()
+                .find_map(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
+/// Whitespace-separated shell operands of `text`: quoted runs, `$(...)`
+/// and backtick substitutions stay inside one operand so a destination like
+/// `user@$(hostname)` or `"$HOSTNAME"` is seen whole.
+fn shell_operands(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut ops = Vec::new();
+    let (mut in_single, mut in_double, mut in_backtick) = (false, false, false);
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let nested = in_single || in_double || in_backtick || depth > 0;
+        if b == b'\\' && !in_single {
+            start.get_or_insert(i);
+            i += 2;
+            continue;
+        }
+        if !nested && b.is_ascii_whitespace() {
+            if let Some(s) = start.take() {
+                ops.push(&text[s..i]);
+            }
+            i += 1;
+            continue;
+        }
+        start.get_or_insert(i);
+        if !in_single && b == b'$' && bytes.get(i + 1) == Some(&b'(') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        match b {
+            b'`' if !in_single => in_backtick = !in_backtick,
+            b')' if !in_single && depth > 0 => depth -= 1,
+            b'\'' if !in_double && !in_backtick && depth == 0 => in_single = !in_single,
+            b'"' if !in_single && !in_backtick && depth == 0 => in_double = !in_double,
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some(s) = start {
+        ops.push(&text[s..]);
+    }
+    ops
+}
+
+/// Whether the `ssh`/`scp`/`sftp` invocation whose argument text is `rest`
+/// targets this host. Option arguments are consumed per client so a port or
+/// login name is never mistaken for the destination; `-o Host=`/`HostName=`
+/// naming a local address counts too.
+fn remote_shell_targets_local(client: &str, rest: &str) -> bool {
+    let takes_arg: &[u8] = match client {
+        "scp" => b"cFiJloPSD",
+        "sftp" => b"BbcDFiJloPRSsX",
+        _ => b"bcDEeFIiJLlmOopQRSWwB",
+    };
+    let ops = shell_operands(rest);
+    let mut idx = 0usize;
+    while idx < ops.len() {
+        let word = ops[idx];
+        idx += 1;
+        if word == "--" {
+            continue;
+        }
+        if let Some(cluster) = word
+            .strip_prefix('-')
+            .filter(|c| !c.is_empty() && !c.starts_with('-'))
+        {
+            let mut value: Option<&str> = None;
+            let mut is_o = false;
+            for (pos, letter) in cluster.bytes().enumerate() {
+                if takes_arg.contains(&letter) {
+                    is_o = letter == b'o';
+                    value = if pos + 1 < cluster.len() {
+                        Some(&cluster[pos + 1..])
+                    } else {
+                        let v = ops.get(idx).copied();
+                        idx += 1;
+                        v
+                    };
+                    break;
+                }
+            }
+            if is_o && let Some(v) = value {
+                let v = v.trim_matches(|c| c == '"' || c == '\'');
+                let (key, host) = v
+                    .split_once('=')
+                    .or_else(|| v.split_once(char::is_whitespace))
+                    .unwrap_or((v, ""));
+                if (key.eq_ignore_ascii_case("host") || key.eq_ignore_ascii_case("hostname"))
+                    && ssh_host_is_local(host.trim())
+                {
+                    return true;
+                }
+            }
+            continue;
+        }
+        if word.starts_with("--") {
+            continue;
+        }
+        if client == "ssh" {
+            // First non-option operand is the destination.
+            return ssh_host_is_local(word);
+        }
+        // scp/sftp: any `host:path` operand names a host.
+        let unq = word.trim_matches(|c| c == '"' || c == '\'');
+        let host_part = if let Some(rest) = unq.strip_prefix('[') {
+            rest.split(']').next()
+        } else if unq.starts_with("ssh://") || unq.starts_with("sftp://") {
+            Some(unq)
+        } else {
+            unq.split_once(':').map(|(h, _)| h)
+        };
+        if host_part.is_some_and(ssh_host_is_local) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when any live word of this segment shows that its quoted text runs
+/// on THIS host: a local executor (`sh`, `eval`, `script`, `... | bash`,
+/// `(sh -c ...)`, `$(sh -c ...)`), a shell-mode wrapper (`sudo -s`,
+/// `env -S`), or a remote-shell client pointed at this machine.
+fn segment_is_locally_executed(segment: &str) -> bool {
+    let words = segment_words(segment);
+    for (i, word) in words.iter().enumerate() {
+        if !word.live {
+            continue;
+        }
+        let name = command_name(word.text);
+        if REDIRECT_LOCAL_EXECUTORS.contains(&name) {
+            return true;
+        }
+        if REDIRECT_TRANSPARENT_WRAPPERS.contains(&name) {
+            let rest = &words[i + 1..];
+            let shell_mode = match name {
+                "sudo" | "doas" => rest.iter().any(|w| {
+                    w.live
+                        && (matches!(w.text, "--shell" | "--login")
+                            || short_flag_has(w.text, b"si"))
+                }),
+                "env" => rest.iter().any(|w| {
+                    w.live && (w.text == "--split-string" || short_flag_has(w.text, b"S"))
+                }),
+                _ => false,
+            };
+            if shell_mode {
+                return true;
+            }
+            continue;
+        }
+        if REDIRECT_REMOTE_SHELLS.contains(&name)
+            && remote_shell_targets_local(name, &segment[word.end..])
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Scan view for `redirect-truncate-root-home`: a redirect operator is only a
@@ -1124,9 +1506,12 @@ fn pipeline_has_local_executor(segment: &str) -> bool {
 /// `--body`/`--subject`/`-m` message text, quoted echo prose) are blanked to
 /// a space so the regex cannot match them. Everything else is untouched:
 /// quoted TARGETS after an unquoted operator stay visible, `InlineCode`
-/// spans (`bash -c '...'`) stay visible, and any pipeline whose stage command
-/// word is a local string executor (`eval`, `xargs`, `env`, `timeout`,
-/// `sudo`, `... | bash`) is left completely unmasked. Byte length is
+/// spans (`bash -c '...'`) stay visible, and any segment that runs its
+/// quoted text on THIS host (`segment_is_locally_executed`: a live local
+/// executor word such as `eval`, `xargs`, `script -c`, `su -c`, `... | bash`,
+/// `(sh -c ...)`, `$(sh -c ...)`; a shell-mode wrapper such as `sudo -s`;
+/// or `ssh`/`scp`/`sftp` pointed at loopback, this machine's own name, or
+/// a substituted host) is left completely unmasked. Byte length is
 /// preserved so match spans still index the original text.
 fn redirect_unquoted_scan_view(cmd: &str) -> std::borrow::Cow<'_, str> {
     if !cmd.bytes().any(|b| matches!(b, b'\'' | b'"')) {
@@ -1136,10 +1521,15 @@ fn redirect_unquoted_scan_view(cmd: &str) -> std::borrow::Cow<'_, str> {
     let base = cmd.as_ptr() as usize;
     let mut out: Option<Vec<u8>> = None;
     for segment in crate::packs::split_command_segments(cmd) {
-        if pipeline_has_local_executor(segment) {
+        if segment_is_locally_executed(segment) {
             continue;
         }
-        let seg_start = segment.as_ptr() as usize - base;
+        // Every segment is a subslice of `cmd` (split_command_segments only
+        // trims), so the offset cannot underflow; leave the segment unmasked
+        // (regex sees everything) rather than panic if it ever did.
+        let Some(seg_start) = (segment.as_ptr() as usize).checked_sub(base) else {
+            continue;
+        };
         let seg_end = seg_start + segment.len();
         for span in spans.spans() {
             if !matches!(span.kind, SpanKind::Data | SpanKind::Argument) {
@@ -1761,8 +2151,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // when the OPERATOR is unquoted on the local command line;
         // `ssh host 'date > ~/stamp'` and
         // `send --body "wrote date > ~/stamp"` are content, not a local
-        // truncate. Local executors (`bash -c`, `eval`, `xargs`, `env`,
-        // `timeout`, `sudo`, `... | sh`) keep the full text visible.
+        // truncate. Local executors (`bash -c`, `eval`, `xargs`, `script -c`,
+        // `su -c`, `sudo -s`, `(sh -c ...)`, `... | sh`) and ssh/scp/sftp
+        // pointed at THIS host (loopback, own hostname, substituted host)
+        // keep the full text visible (fold r2, strict r1 Majors 1-3).
         DestructivePattern {
             scan_view: Some(redirect_unquoted_scan_view),
             ..destructive_pattern!(
@@ -2963,6 +3355,239 @@ mod tests {
         ] {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
+    }
+
+    // ---------- WI-3135 fold r2: strict r1 Majors 1-3 + follow-ups ----------
+
+    #[test]
+    fn redirect_truncate_paren_or_sugar_prefixed_local_shell_still_blocks_wi3135_fold() {
+        // Major 1: shell sugar in front of the executor word must not hide
+        // it from the shield (`(sh`, `{ sh`, `! bash`, `$(sh`, backticks).
+        let pack = create_pack();
+        for cmd in [
+            "(sh -c '> /etc/passwd')",
+            "{ sh -c '> /etc/passwd'; }",
+            "! bash -c '> /etc/passwd'",
+            "$(sh -c '> /etc/passwd')",
+            "echo `sh -c '> /etc/passwd'`",
+            "echo \"$(sh -c '> /etc/passwd')\"",
+            "true && (sh -c '> ~/.bashrc')",
+            "echo '> /etc/passwd' | (sh)",
+            "echo \"> ~/x\"|bash",
+            "FOO=1 sh -c '> /etc/passwd'",
+            "!sh -c '> /etc/passwd'",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_string_running_wrappers_still_block_wi3135_fold() {
+        // Major 2: programs that run a string (or stdin) through a local
+        // shell / interpreter outside the classifier's -c InlineCode route.
+        let pack = create_pack();
+        for cmd in [
+            "script -qc '> /etc/passwd' /dev/null",
+            "script -c '> /etc/passwd' /dev/null",
+            "script -ec \"> ~/x\" /dev/null",
+            "su -c '> /etc/passwd'",
+            "su root -c '> /etc/passwd'",
+            "runuser -u x -c '> /etc/passwd'",
+            "doas -s '> /etc/passwd'",
+            "sudo -s '> /etc/passwd'",
+            "sudo -i '> /etc/passwd'",
+            "sudo -u root -Es '> /etc/passwd'",
+            "expect -c 'spawn sh -c \"> /etc/passwd\"'",
+            "tclsh run.tcl '> /etc/passwd'",
+            "osascript -e 'do shell script \"> /etc/passwd\"'",
+            "screen -X stuff '> /etc/passwd'",
+            // tmux types the text into a live local shell; Enter runs it.
+            "tmux send-keys '> /etc/passwd' Enter",
+            "tmux run-shell '> /etc/passwd'",
+            "nsenter -t 1 -m -- '> /etc/passwd'",
+            "unshare -r '> /etc/passwd'",
+            "chroot /mnt '> /etc/passwd'",
+            "parallel '> /etc/passwd' ::: x",
+            "env -S '> /etc/passwd'",
+            "echo '> /etc/passwd' | at now",
+            "echo '> /etc/passwd' | batch",
+            "systemd-run --shell '> /etc/passwd'",
+            "xargs -I {} sh -c '> /etc/passwd'",
+            "find . -exec sh -c '> /etc/passwd' \\;",
+            "find . -execdir '> /etc/passwd' \\;",
+            "flock /tmp/l -c '> /etc/passwd'",
+            "watch '> ~/x'",
+            "awk 'BEGIN { print \"x\" > \"/etc/passwd\" }'",
+            "python3 run.py '> /etc/passwd'",
+            "busybox sh -c '> /etc/passwd'",
+            "sudo /bin/sh -c '> /etc/passwd'",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_loopback_ssh_is_local_wi3135_fold() {
+        // Major 3: ssh/scp/sftp whose destination is THIS host run the
+        // payload locally; the quoted `>` is a real truncate.
+        let pack = create_pack();
+        let mut cmds = vec![
+            "ssh localhost 'date > ~/.ssh/authorized_keys'".to_string(),
+            "ssh 127.0.0.1 \"date > ~/.ssh/authorized_keys\"".to_string(),
+            "ssh ::1 \"date > ~/.ssh/authorized_keys\"".to_string(),
+            "ssh -p 2222 root@localhost 'date > ~/x'".to_string(),
+            "ssh -p2222 -l root localhost 'date > ~/x'".to_string(),
+            "ssh -vp 2222 localhost 'date > ~/x'".to_string(),
+            "ssh root@[::1] 'date > ~/x'".to_string(),
+            "ssh ssh://root@localhost:22 'date > ~/x'".to_string(),
+            "ssh localhost.localdomain 'date > ~/x'".to_string(),
+            "ssh ip6-localhost 'date > ~/x'".to_string(),
+            "ssh 127.1 'date > ~/x'".to_string(),
+            "ssh 0.0.0.0 'date > ~/x'".to_string(),
+            "ssh ::ffff:127.0.0.1 'date > ~/x'".to_string(),
+            "ssh 2130706433 'date > ~/x'".to_string(),
+            "ssh 0x7f000001 'date > ~/x'".to_string(),
+            "ssh -o Host=localhost bogus 'date > ~/x'".to_string(),
+            "ssh -oHostName=127.0.0.1 bogus 'date > ~/x'".to_string(),
+            "ssh -o \"HostName localhost\" bogus 'date > ~/x'".to_string(),
+            "ssh $(hostname) 'date > ~/x'".to_string(),
+            "ssh \"$(hostname -f)\" 'date > ~/x'".to_string(),
+            "ssh user@$(uname -n) 'date > ~/x'".to_string(),
+            "ssh `hostname -s` 'date > ~/x'".to_string(),
+            "ssh \"$HOSTNAME\" 'date > ~/x'".to_string(),
+            "ssh $HOSTNAME 'date > ~/x'".to_string(),
+            "ssh ${HOSTNAME} 'date > ~/x'".to_string(),
+            "timeout 30 ssh localhost 'date -u > ~/offload/stamp'".to_string(),
+            "sudo ssh -i key localhost 'date > ~/x'".to_string(),
+            "scp localhost:x /tmp && ssh localhost 'date > ~/x'".to_string(),
+        ];
+        if let Some(own) = local_hostname() {
+            cmds.push(format!("ssh {own} 'date > ~/x'"));
+            cmds.push(format!("ssh admin@{own} 'date > ~/x'"));
+            if let Some(short) = own.split('.').next() {
+                cmds.push(format!("ssh {short}.example.internal 'date > ~/x'"));
+            }
+        }
+        for cmd in &cmds {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+        // Loopback without a redirect: no rule, no panic.
+        for cmd in [
+            "scp file localhost:~/.ssh/x",
+            "ssh localhost",
+            "ssh",
+            "ssh -p",
+            "sftp -P 22 localhost",
+            "ssh -o",
+            "ssh -o Host=",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_genuine_remote_payload_stays_content_wi3135_fold() {
+        // A1/A2/A5-class: a real remote host keeps the quoted payload as
+        // content, including when wrapped or given via -o Host.
+        let pack = create_pack();
+        for cmd in [
+            "ssh orca@100.117.246.48 'date -u > ~/offload/stamp'",
+            "ssh user@host.example \"date > ~/stamp\"",
+            "ssh -p 2222 -l root 100.117.246.48 'date > ~/x'",
+            "ssh -o Host=100.117.246.48 deploy-box 'date > ~/x'",
+            "ssh -J jump.example user@host.example 'date > ~/x'",
+            "ssh root@[2001:db8::10] 'date > ~/x'",
+            "ssh -4 host.example 'date > ~/x'",
+            "ssh -- host.example 'date > ~/x'",
+            "timeout 30 ssh orca@100.117.246.48 'date -u > ~/offload/stamp'",
+            "scp file orca@100.117.246.48:~/x && ssh orca@100.117.246.48 'date > ~/x'",
+            "ssh host.example 'date > ~/stamp' | tee log",
+            "ssh host.example \"date > ~/stamp-$(date +%F)\"",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_transparent_wrapper_prose_is_content_wi3135_fold() {
+        // sol Minor: an argv-exec wrapper in front of a NON-executor command
+        // is that inner command; the quoted prose stays content.
+        let pack = create_pack();
+        for cmd in [
+            "sudo echo \"use > ~/file to truncate\"",
+            "env echo \"use > ~/file to truncate\"",
+            "timeout 5 echo \"use > ~/file to truncate\"",
+            "nohup orca send --body \"wrote date > ~/x\"",
+            "nice -n 10 printf \"%s\" \"> ~/x\"",
+            "sudo -u deploy orca send --body \"wrote date > ~/x\"",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+        // ... but never when a real executor follows the wrapper.
+        for cmd in [
+            "sudo sh -c '> /etc/passwd'",
+            "sudo -u root sh -c '> /etc/passwd'",
+            "env FOO=1 bash -c '> /etc/passwd'",
+            "timeout 5 eval '> /etc/passwd'",
+            "sudo echo '> /etc/passwd' | sh",
+            "nohup script -c '> /etc/passwd' /dev/null",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_adversarial_quoting_still_blocks_wi3135_fold() {
+        // opus: quote tricks around an UNQUOTED operator never mask it.
+        let pack = create_pack();
+        for cmd in [
+            "echo \"x\" >\"/etc/passwd\"",
+            "echo \"it's fine\" > /etc/passwd",
+            "echo \\' > /etc/passwd",
+            "echo a\\\"b > /etc/passwd",
+            "echo x 2> /etc/passwd",
+            "echo x &> /etc/passwd",
+            "echo \"done\" >| /etc/passwd",
+            "orca send --body \"wrote date > ~/x\" > ~/realfile",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_scan_view_helpers_wi3135_fold() {
+        let live: Vec<&str> = segment_words("(sh -c '> /etc/passwd')")
+            .into_iter()
+            .filter(|w| w.live)
+            .map(|w| w.text)
+            .collect();
+        assert_eq!(live, ["sh", "-c"]);
+        let live: Vec<&str> = segment_words("orca send --body \"sh > ~/x\" && x")
+            .into_iter()
+            .filter(|w| w.live)
+            .map(|w| w.text)
+            .collect();
+        assert_eq!(live, ["orca", "send", "--body", "x"]);
+        assert_eq!(
+            shell_operands("-p 2222 user@$(hostname -f) 'date > ~/x'"),
+            ["-p", "2222", "user@$(hostname -f)", "'date > ~/x'"]
+        );
+        assert!(ssh_host_is_local("localhost"));
+        assert!(ssh_host_is_local("root@127.0.0.1"));
+        assert!(ssh_host_is_local("[::1]:22"));
+        assert!(ssh_host_is_local("$(hostname)"));
+        assert!(!ssh_host_is_local("orca@100.117.246.48"));
+        assert!(!ssh_host_is_local("host.example"));
+        assert!(!ssh_host_is_local("2001:db8::10"));
+        assert!(!ssh_host_is_local(""));
+        assert!(segment_is_locally_executed("sudo -s '> x'"));
+        assert!(!segment_is_locally_executed("sudo echo '> x'"));
+        assert!(!segment_is_locally_executed("ssh host.example 'x'"));
+        assert!(segment_is_locally_executed("ssh localhost 'x'"));
     }
 
     #[test]

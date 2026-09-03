@@ -266,8 +266,10 @@ impl std::fmt::Debug for SafePattern {
 
 /// A destructive pattern that, when matched, blocks the command.
 pub struct DestructivePattern {
-    /// Lazily-compiled regex pattern.
-    pub regex: LazyCompiledRegex,
+    /// Lazily-compiled regex pattern. Named `raw_regex` because callers must
+    /// go through [`DestructivePattern::is_match`] / [`DestructivePattern::find`],
+    /// which honour `scan_view`; matching on this field directly bypasses it.
+    pub raw_regex: LazyCompiledRegex,
     /// Human-readable explanation of why this command is blocked.
     pub reason: &'static str,
     /// Optional pattern name for debugging and allowlisting.
@@ -293,8 +295,8 @@ impl DestructivePattern {
     #[must_use]
     pub fn is_match(&self, cmd: &str) -> bool {
         match self.scan_view {
-            Some(view) => self.regex.is_match(&view(cmd)),
-            None => self.regex.is_match(cmd),
+            Some(view) => self.raw_regex.is_match(&view(cmd)),
+            None => self.raw_regex.is_match(cmd),
         }
     }
 
@@ -302,8 +304,8 @@ impl DestructivePattern {
     #[must_use]
     pub fn find(&self, cmd: &str) -> Option<(usize, usize)> {
         match self.scan_view {
-            Some(view) => self.regex.find(&view(cmd)),
-            None => self.regex.find(cmd),
+            Some(view) => self.raw_regex.find(&view(cmd)),
+            None => self.raw_regex.find(cmd),
         }
     }
 }
@@ -311,7 +313,7 @@ impl DestructivePattern {
 impl std::fmt::Debug for DestructivePattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DestructivePattern")
-            .field("pattern", &self.regex.as_str())
+            .field("pattern", &self.raw_regex.as_str())
             .field("reason", &self.reason)
             .field("name", &self.name)
             .field("severity", &self.severity)
@@ -351,7 +353,7 @@ macro_rules! destructive_pattern {
     // Unnamed pattern, default severity (High)
     ($re:literal, $reason:literal) => {
         $crate::packs::DestructivePattern {
-            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            raw_regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
             reason: $reason,
             name: None,
             severity: $crate::packs::Severity::High,
@@ -363,7 +365,7 @@ macro_rules! destructive_pattern {
     // Named pattern, default severity (High)
     ($name:literal, $re:literal, $reason:literal) => {
         $crate::packs::DestructivePattern {
-            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            raw_regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
             reason: $reason,
             name: Some($name),
             severity: $crate::packs::Severity::High,
@@ -375,7 +377,7 @@ macro_rules! destructive_pattern {
     // Named pattern with explicit severity
     ($name:literal, $re:literal, $reason:literal, $severity:ident) => {
         $crate::packs::DestructivePattern {
-            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            raw_regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
             reason: $reason,
             name: Some($name),
             severity: $crate::packs::Severity::$severity,
@@ -387,7 +389,7 @@ macro_rules! destructive_pattern {
     // Named pattern with explicit severity and explanation
     ($name:literal, $re:literal, $reason:literal, $severity:ident, $explanation:literal) => {
         $crate::packs::DestructivePattern {
-            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            raw_regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
             reason: $reason,
             name: Some($name),
             severity: $crate::packs::Severity::$severity,
@@ -399,7 +401,7 @@ macro_rules! destructive_pattern {
     // Named pattern with explicit severity, explanation, and suggestions
     ($name:literal, $re:literal, $reason:literal, $severity:ident, $explanation:literal, $suggestions:expr) => {
         $crate::packs::DestructivePattern {
-            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            raw_regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
             reason: $reason,
             name: Some($name),
             severity: $crate::packs::Severity::$severity,
@@ -3603,7 +3605,7 @@ mod tests {
             for (idx, pattern) in pack.destructive_patterns.iter().enumerate() {
                 let pattern_name = pattern.name.unwrap_or("<unnamed>");
                 if let Err(e) =
-                    crate::packs::regex_engine::CompiledRegex::new(pattern.regex.as_str())
+                    crate::packs::regex_engine::CompiledRegex::new(pattern.raw_regex.as_str())
                 {
                     errors.push(format!(
                         "Pack '{}' destructive pattern '{}' (index {}) failed to compile: {}\n  Pattern: {}",
@@ -3611,7 +3613,7 @@ mod tests {
                         pattern_name,
                         idx,
                         e,
-                        pattern.regex.as_str()
+                        pattern.raw_regex.as_str()
                     ));
                 }
             }

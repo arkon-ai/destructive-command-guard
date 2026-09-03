@@ -2590,11 +2590,13 @@ impl LegacySafePattern for crate::packs::SafePattern {
 
 impl LegacyDestructivePattern for crate::packs::DestructivePattern {
     fn is_match(&self, cmd: &str) -> bool {
-        Self::is_match(self, cmd)
+        // The inherent, scan_view-honouring method (not this trait method).
+        crate::packs::DestructivePattern::is_match(self, cmd)
     }
 
     fn find_span(&self, cmd: &str) -> Option<MatchSpan> {
-        Self::find(self, cmd).map(|(start, end)| MatchSpan { start, end })
+        crate::packs::DestructivePattern::find(self, cmd)
+            .map(|(start, end)| MatchSpan { start, end })
     }
 
     fn reason(&self) -> &str {

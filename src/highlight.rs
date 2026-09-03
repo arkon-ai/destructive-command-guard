@@ -309,7 +309,7 @@ pub fn find_pattern_regex(pack_id: &str, pattern_name: &str) -> Option<String> {
     pack.destructive_patterns
         .iter()
         .find(|pattern| pattern.name == Some(pattern_name))
-        .map(|pattern| pattern.regex.as_str().to_string())
+        .map(|pattern| pattern.raw_regex.as_str().to_string())
 }
 
 #[cfg(feature = "rich-output")]
