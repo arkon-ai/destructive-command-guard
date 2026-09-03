@@ -854,6 +854,10 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         SafeFlagEntry::both("gh", "-t", "--title"),
         SafeFlagEntry::both("gh", "-b", "--body"),
         SafeFlagEntry::both("gh", "-m", "--message"),
+        // orca orchestration bus - message subject/body are content, not commands
+        // (transformate WI-3107: a bus message ABOUT `git restore` is data)
+        SafeFlagEntry::long_multi("orca", "--subject"),
+        SafeFlagEntry::long_multi("orca", "--body"),
         // curl - request data and headers are not executed
         SafeFlagEntry::both("curl", "-d", "--data"),
         SafeFlagEntry::both("curl", "-H", "--header"),
@@ -887,7 +891,7 @@ static SAFE_COMMANDS_MATCHER: LazyLock<AhoCorasick> = LazyLock::new(|| {
         // all_args_data commands
         "echo", "printf", // Commands from flag_data_pairs
         "git", "bd", "grep", "rg", "ag", "ack", "gh", "curl", "jq", "docker", "kubectl", "xargs",
-        "cargo", "npm",
+        "cargo", "npm", "orca",
         // Special built-in: `command -v/-V` queries mask their arguments
         "command",
     ];
@@ -2780,6 +2784,16 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_orca_bus_message_flags() {
+        // orca orchestration send --subject/--body carry message content (WI-3107)
+        assert!(SAFE_STRING_REGISTRY.is_flag_data("orca", "--subject"));
+        assert!(SAFE_STRING_REGISTRY.is_flag_data("orca", "--body"));
+        assert!(SAFE_STRING_REGISTRY.is_flag_data_multivalue("orca", "--subject"));
+        assert!(SAFE_STRING_REGISTRY.is_flag_data_multivalue("orca", "--body"));
+        assert!(!SAFE_STRING_REGISTRY.is_flag_data("orca", "--to"));
+    }
+
+    #[test]
     fn test_registry_data_flags_for_git() {
         let flags = SAFE_STRING_REGISTRY.data_flags_for_command("git");
         assert!(flags.contains(&"-m"));
@@ -2936,6 +2950,30 @@ mod tests {
         assert!(!sanitized.as_ref().contains("rm -rf"));
         assert!(sanitized.as_ref().contains("bd create"));
         assert!(sanitized.as_ref().contains("--description="));
+    }
+
+    #[test]
+    fn sanitize_strips_orca_subject_git_verb_text() {
+        // WI-3107 / Dell FOR-LEDGER 206: git text inside a quoted bus-message body
+        // of a non-git command is content, not an executed git verb.
+        let cmd = r#"orca orchestration send --to deck-main --subject "plan: git restore --worktree x then git filter-repo --invert-paths""#;
+        let sanitized = sanitize_for_pattern_matching(cmd);
+
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains("git restore"));
+        assert!(!sanitized.as_ref().contains("filter-repo"));
+        assert!(sanitized.as_ref().contains("orca orchestration send --to deck-main"));
+        assert!(sanitized.as_ref().contains("--subject"));
+    }
+
+    #[test]
+    fn sanitize_orca_subject_keeps_inline_code_visible() {
+        // Command substitution inside the subject still executes; it must stay visible.
+        let cmd = r#"orca orchestration send --subject "$(git restore --worktree x)""#;
+        let sanitized = sanitize_for_pattern_matching(cmd);
+
+        assert!(matches!(sanitized, std::borrow::Cow::Borrowed(_)));
+        assert!(sanitized.as_ref().contains("git restore"));
     }
 
     #[test]

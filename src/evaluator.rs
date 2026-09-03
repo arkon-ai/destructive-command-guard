@@ -3032,6 +3032,57 @@ mod tests {
     }
 
     #[test]
+    fn orca_send_subject_with_git_restore_text_is_allowed() {
+        let config = default_config();
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+
+        // transformate WI-3107 (Dell FOR-LEDGER 206): argv[0] is orca, not git.
+        // Git text inside the quoted --subject/--body is bus-message content.
+        let cmd = r#"orca orchestration send --to deck-main --subject "purge plan: git restore --worktree x; git filter-repo --invert-paths --path secrets""#;
+        let result = evaluate_command(cmd, &config, &["git"], &compiled, &allowlists);
+        assert!(result.is_allowed(), "bus message about git must be allowed: {result:?}");
+
+        let cmd = r#"orca orchestration send --subject "status" --body "next step is git restore --worktree .""#;
+        let result = evaluate_command(cmd, &config, &["git"], &compiled, &allowlists);
+        assert!(result.is_allowed(), "bus body about git must be allowed: {result:?}");
+    }
+
+    #[test]
+    fn git_restore_worktree_as_real_command_is_still_blocked() {
+        let config = default_config();
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+
+        // The same text as the executed command must still be denied.
+        let cmd = "git restore --worktree x";
+        let result = evaluate_command(cmd, &config, &["git"], &compiled, &allowlists);
+        assert!(result.is_denied(), "real git restore --worktree must be denied");
+
+        // Through a shell -c string the executed command is still git.
+        for cmd in [r#"bash -c "git restore --worktree x""#, r#"sh -c "git restore --worktree x""#] {
+            let result = evaluate_command(cmd, &config, &["git"], &compiled, &allowlists);
+            assert!(result.is_denied(), "{cmd} must be denied");
+        }
+
+        // Command substitution inside the bus-message subject executes git.
+        let cmd = r#"orca orchestration send --subject "$(git restore --worktree x)""#;
+        let result = evaluate_command(cmd, &config, &["git"], &compiled, &allowlists);
+        assert!(result.is_denied(), "inline code in --subject must be denied");
+    }
+
+    #[test]
+    fn echo_with_git_restore_text_is_allowed() {
+        let config = default_config();
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+
+        let cmd = r#"echo "git restore --worktree x""#;
+        let result = evaluate_command(cmd, &config, &["git"], &compiled, &allowlists);
+        assert!(result.is_allowed(), "echo args are data: {result:?}");
+    }
+
+    #[test]
     fn bd_notes_with_dangerous_text_is_allowed() {
         let config = default_config();
         let compiled = default_compiled_overrides();
