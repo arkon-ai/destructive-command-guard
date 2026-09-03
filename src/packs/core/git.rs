@@ -806,6 +806,138 @@ mod tests {
         );
     }
 
+    // Strict r2 Major (fold r3): GNU sed executes its script text (`e`,
+    // `s///e`), so sed is an argument executor. The guard cannot parse sed
+    // scripts, so a script that merely mentions the text is denied too
+    // (conservative, same treatment as awk).
+    #[test]
+    fn test_wi3107_fold3_sed_executes_script_text_blocks() {
+        let pack = create_pack();
+
+        assert_blocks_with_pattern(&pack, "sed 'e git restore -W .' <<< x", "restore-worktree");
+        assert_blocks_with_pattern(
+            &pack,
+            "printf 'x\\n' | sed 'e git restore -W .'",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "sed 's/.*/git restore -W ./e' <<< x",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(&pack, "gsed 'e git restore -W .' <<< x", "restore-worktree");
+        assert_blocks_with_pattern(
+            &pack,
+            "sed -f - <<< 'e git restore -W .'",
+            "restore-worktree",
+        );
+        // No `e` flag: still denied, sed is an executor and its script is opaque.
+        assert_blocks_with_pattern(
+            &pack,
+            "sed 's/git restore -W ./X/' <<< x",
+            "restore-worktree",
+        );
+    }
+
+    // Strict r2 Major (fold r3), the class: every program that executes
+    // text handed to it as a quoted argument or on stdin is an executor.
+    #[test]
+    fn test_wi3107_fold3_argument_executor_class_blocks() {
+        let pack = create_pack();
+
+        for cmd in [
+            "m4 'syscmd(git restore -W .)'",
+            "vim -c '!git restore -W .' f",
+            "nvim +'!git restore -W .'",
+            "git -c alias.x='!git restore -W .' x",
+            "git config alias.x '!git restore -W .'",
+            "tar -xf a.tar --to-command='git restore -W .'",
+            "rsync -e 'git restore -W .' a b",
+            "su -c 'git restore -W .' user",
+            "runuser -c 'git restore -W .' user",
+            "parallel 'git restore -W .' ::: x",
+            "printf '!git restore -W .\\nq\\n' | ed",
+            "ex -c '!git restore -W .' f",
+            "less +'!git restore -W .' f",
+            "man -P 'git restore -W .' ls",
+            "docker exec c sh -c \"git restore -W .\"",
+            "kubectl exec p -- sh -c \"git restore -W .\"",
+            "psql -c '\\! git restore -W .'",
+            "bash <<< \"git restore -W .\"",
+            "sh < <(echo \"git restore -W .\")",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "restore-worktree");
+        }
+    }
+
+    // Strict r2 sol-M1 / opus-m6 (fold r3): the executor test is anchored to
+    // the command word; an ordinary argument (`--to git`, `--subject
+    // publish`) never unmasks a bus-message body.
+    #[test]
+    fn test_wi3107_fold3_executor_signal_anchored_to_command_word() {
+        let pack = create_pack();
+
+        assert_allows(&pack, "orca send --to git --body \"git restore -W .\"");
+        assert_allows(
+            &pack,
+            "orca send --subject publish --body \"git restore -W .\"",
+        );
+        assert_allows(
+            &pack,
+            "orca send --to git --body \"git restore -W .\" && git status",
+        );
+        assert_allows(
+            &pack,
+            "orca send --subject refresh --body \"git restore -W .\"; git rev-parse HEAD",
+        );
+        assert_allows(&pack, WI3107_ORCA_SEND);
+
+        assert_blocks_with_pattern(&pack, "git restore -W .", "restore-worktree");
+        assert_blocks_with_pattern(
+            &pack,
+            "sudo bash -c \"git restore -W .\"",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "echo \"git restore -W .\" | bash",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "FOO=1 git restore -W \"src/main.rs\"",
+            "restore-worktree",
+        );
+    }
+
+    // Strict r2 sol-M2 / composer-m1 (fold r3): `<(`, `>(` and `eval` are
+    // signals only in executable spans; inside quoted content they are text.
+    #[test]
+    fn test_wi3107_fold3_global_signals_over_executable_spans_only() {
+        let pack = create_pack();
+
+        assert_allows(
+            &pack,
+            "orca send --body \"see <(cat x) and eval later: git restore -W .\"",
+        );
+        assert_allows(
+            &pack,
+            "orca send --body \"please eval the restore plan: git restore --worktree .\" && git status",
+        );
+
+        assert_blocks_with_pattern(
+            &pack,
+            "cat <(echo \"git restore -W .\") | sh",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(&pack, "eval \"git restore -W .\"", "restore-worktree");
+        assert_blocks_with_pattern(
+            &pack,
+            "X=\"git restore -W .\"; eval \"$X\"",
+            "restore-worktree",
+        );
+    }
+
     #[test]
     fn test_branch_force_medium() {
         // Branch force delete is Medium severity (recoverable via reflog)

@@ -1759,8 +1759,9 @@ fn evaluate_packs_with_allowlists(
                     continue; // Safe pattern match - skip this pack
                 }
                 Some(crate::packs::core::filesystem::RmParseDecision::NoMatch) | None => {
-                    // rm_parse didn't find rm command or wasn't computed, check safe patterns as fallback
-                    if pack.matches_safe_with_deadline(command_for_packs, deadline) {
+                    // rm_parse didn't find rm command or wasn't computed, check safe patterns as fallback.
+                    // Same view as the other two call sites below (strict r2 opus-m4).
+                    if pack.matches_safe_with_deadline(pack_cmd, deadline) {
                         continue;
                     }
                 }
@@ -2903,6 +2904,40 @@ mod tests {
         let result = evaluate_command("", &config, &[], &compiled, &allowlists);
         assert!(result.is_allowed());
         assert!(result.pattern_info.is_none());
+    }
+
+    // transformate WI-3107 fold r3: every per-pack call site in the
+    // evaluator loop scans the pack's executing-position view (strict r2
+    // opus-m4), so a masked body is content end to end and an executor's
+    // quoted script is not.
+    #[test]
+    fn test_wi3107_fold3_evaluator_uses_pack_view_end_to_end() {
+        let config = default_config();
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let keywords = ["git", "rm"];
+
+        let send = "orca send --to git --subject publish --body \"git restore -W .\" && git status";
+        let result = evaluate_command(send, &config, &keywords, &compiled, &allowlists);
+        assert!(result.is_allowed(), "{send}: {result:?}");
+
+        for cmd in [
+            "sed 'e git restore -W .' <<< x",
+            "printf 'x\\n' | sed 'e git restore -W .'",
+            "sed -f - <<< 'e git restore -W .'",
+            "vim -c '!git restore -W .' f",
+        ] {
+            let result = evaluate_command(cmd, &config, &keywords, &compiled, &allowlists);
+            assert!(result.is_denied(), "{cmd} must be denied");
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|p| p.pattern_name.as_deref()),
+                Some("restore-worktree"),
+                "{cmd}"
+            );
+        }
     }
 
     #[test]

@@ -1712,6 +1712,50 @@ pub fn is_non_executing_heredoc_command(cmd: &str) -> bool {
     NON_EXECUTING_HEREDOC_COMMANDS.contains(&cmd_name)
 }
 
+/// True when the command owning the heredoc / here-string at `heredoc_start`
+/// reads its *script* from stdin (`sed -f -`, `awk -f /dev/stdin`,
+/// `--file=-`), so the fed text is executed, not data (transformate WI-3107
+/// fold r3: the stdin route of the sed class).
+fn heredoc_target_reads_script_from_stdin(command: &str, heredoc_start: usize) -> bool {
+    let before = command[..heredoc_start].trim_end();
+    if before.is_empty() {
+        return false;
+    }
+    let tokens = tokenize_backwards(before);
+    let is_stdin = |t: &str| matches!(t, "-" | "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0");
+    let mut expect_file = false;
+    for token in tokens.iter().rev() {
+        let token = token.as_str();
+        if expect_file {
+            if is_stdin(token) {
+                return true;
+            }
+            expect_file = false;
+        }
+        if matches!(token, "-f" | "--file") {
+            expect_file = true;
+        } else if let Some(file) = token
+            .strip_prefix("--file=")
+            .or_else(|| token.strip_prefix("-f"))
+        {
+            if is_stdin(file) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether the heredoc / here-string at `heredoc_start` feeds a command that
+/// treats it as data: a non-executing target that is not reading its script
+/// from stdin.
+fn heredoc_target_is_data_sink(command: &str, heredoc_start: usize) -> bool {
+    extract_heredoc_target_command(command, heredoc_start)
+        .as_ref()
+        .is_some_and(|cmd| is_non_executing_heredoc_command(cmd))
+        && !heredoc_target_reads_script_from_stdin(command, heredoc_start)
+}
+
 /// Mask heredoc content when the target command doesn't execute it.
 ///
 /// This prevents false positives where dangerous patterns in DATA (not CODE)
@@ -1740,11 +1784,8 @@ pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
 
             // Check for <<< (here-string)
             if heredoc_start + 3 <= command.len() && bytes.get(heredoc_start + 2) == Some(&b'<') {
-                // Extract target command for here-string
-                let target_cmd = extract_heredoc_target_command(command, heredoc_start);
-                let should_mask_herestring = target_cmd
-                    .as_ref()
-                    .is_some_and(|cmd| is_non_executing_heredoc_command(cmd));
+                // Mask only when the target treats the here-string as data.
+                let should_mask_herestring = heredoc_target_is_data_sink(command, heredoc_start);
 
                 if should_mask_herestring {
                     // Mask here-string content for non-executing targets
@@ -1772,13 +1813,8 @@ pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
                 continue;
             }
 
-            // Extract target command (what receives the heredoc)
-            let target_cmd = extract_heredoc_target_command(command, heredoc_start);
-
-            // Check if target is non-executing
-            let should_mask = target_cmd
-                .as_ref()
-                .is_some_and(|cmd| is_non_executing_heredoc_command(cmd));
+            // Mask only when the target treats the heredoc body as data.
+            let should_mask = heredoc_target_is_data_sink(command, heredoc_start);
 
             if should_mask {
                 // Parse the heredoc delimiter
@@ -3823,6 +3859,37 @@ fi"#;
             extract_heredoc_target_command(grep_cmd, grep_start).as_deref(),
             Some("grep")
         );
+    }
+
+    // transformate WI-3107 fold r3: a non-executing stdin target that reads
+    // its script from stdin executes the heredoc / here-string.
+    #[test]
+    fn heredoc_script_from_stdin_is_not_masked() {
+        for cmd in [
+            "sed -f - <<< 'e rm -rf /'",
+            "sed --file=- <<< 'e rm -rf /'",
+            "sed -n -f /dev/stdin <<< 'e rm -rf /'",
+            "awk -f - <<EOF\nBEGIN{system(\"rm -rf /\")}\nEOF",
+            "gawk --file=/dev/stdin <<EOF\nBEGIN{system(\"rm -rf /\")}\nEOF",
+        ] {
+            let masked = mask_non_executing_heredocs(cmd);
+            assert!(
+                masked.contains("rm -rf /"),
+                "{cmd} must stay visible: {masked}"
+            );
+        }
+        // The same targets fed data are still masked.
+        for cmd in [
+            "sed 's/a/b/' <<< 'rm -rf /'",
+            "sed -f script.sed <<< 'rm -rf /'",
+            "awk '{print}' <<EOF\nrm -rf /\nEOF",
+        ] {
+            let masked = mask_non_executing_heredocs(cmd);
+            assert!(
+                !masked.contains("rm -rf /"),
+                "{cmd} must be masked: {masked}"
+            );
+        }
     }
 
     #[test]

@@ -544,6 +544,8 @@ impl Pack {
     /// `cmd` unchanged. The view is length-preserving.
     #[must_use]
     pub fn scan_view<'a>(&self, cmd: &'a str) -> std::borrow::Cow<'a, str> {
+        #[cfg(test)]
+        SCAN_VIEW_CALLS.with(|calls| calls.set(calls.get() + 1));
         if EXECUTING_POSITION_PACKS.contains(&self.id.as_str()) {
             mask_data_outside_executing_positions(cmd, self.keywords)
         } else {
@@ -2389,41 +2391,69 @@ pub fn split_command_segments(cmd: &str) -> Vec<&str> {
 /// visible because the shell executes them.
 const EXECUTING_POSITION_PACKS: &[&str] = &["core.git"];
 
-/// Command words that execute (part of) their arguments. A segment that
-/// mentions one of these keeps its quoted arguments visible to the pack
-/// regexes (`eval "git …"`, `xargs`, `sudo`, `awk 'BEGIN{system("…")}'`, …).
+#[cfg(test)]
+thread_local! {
+    /// Number of `Pack::scan_view` calls on this thread; the view must be
+    /// computed once per pack per command (strict r2 opus-m5).
+    static SCAN_VIEW_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Command words that execute (part of) their arguments or their stdin.
 ///
-/// Shells (`bash`, `zsh`, `sh`, …) are matched by [`is_shell_word`] rather
-/// than listed here so `busybox ash`, `rbash` and friends are covered too.
-/// Non-shell interpreters are listed because they run quoted program text
-/// outside the `-c` / `-e` inline-code route the classifier already tracks
-/// (strict r1 Major 2, transformate WI-3107 fold r2).
+/// A segment whose command word is one of these keeps its quoted arguments
+/// visible to the pack regexes (`eval "git …"`, `xargs`, `sudo`,
+/// `awk 'BEGIN{system("…")}'`, `sed 'e …'`, `vim -c '!…'`, …). Shells are
+/// matched by [`is_shell_word`].
+///
+/// Membership rule (transformate WI-3107 fold r3, strict r2 Major): a program
+/// is listed when it can execute text handed to it as a quoted argument or on
+/// stdin on this host — a sed `e` / `s///e` command, an editor or pager `!cmd`
+/// escape, a `--to-command=` / `-e` / `-c` hook, a container, namespace or
+/// privilege wrapper that runs its argv, an interpreter that runs program
+/// text. Programs that only read their arguments as data stay out. When in
+/// doubt the program is in: over-blocking is fail-closed, and a pack cannot
+/// parse the program's own script language to tell `s/git restore/X/` from
+/// `s/.*/git restore/e`.
 const ARGUMENT_EXECUTORS: &[&str] = &[
     // shell builtins / wrappers
     "eval",
     "exec",
     "source",
-    "xargs",
-    "sudo",
-    "doas",
-    "su",
-    "env",
     "command",
+    "builtin",
+    "xargs",
+    "parallel",
+    "sem",
+    "env",
     "nohup",
     "time",
     "timeout",
     "nice",
     "ionice",
     "watch",
-    "ssh",
+    "entr",
+    "flock",
     "chroot",
     "nsenter",
-    "flock",
+    "unshare",
+    "setsid",
+    "setpriv",
+    "capsh",
+    "taskset",
+    "chrt",
+    "stdbuf",
+    "unbuffer",
+    "rlwrap",
+    "firejail",
+    "bwrap",
+    "proot",
     "find",
-    "parallel",
     "busybox",
     "strace",
     "ltrace",
+    "valgrind",
+    "perf",
+    "hyperfine",
     "script",
     "screen",
     "tmux",
@@ -2431,7 +2461,85 @@ const ARGUMENT_EXECUTORS: &[&str] = &[
     "batch",
     "crontab",
     "systemd-run",
+    "systemd-nspawn",
+    "machinectl",
     "make",
+    "gmake",
+    "nix",
+    "nix-shell",
+    "npx",
+    "npm",
+    "pnpm",
+    "yarn",
+    // privilege wrappers
+    "sudo",
+    "doas",
+    "su",
+    "runuser",
+    "pkexec",
+    // remote / transport tools with a command or rsh hook
+    "ssh",
+    "scp",
+    "sftp",
+    "ftp",
+    "lftp",
+    "rsync",
+    "nc",
+    "ncat",
+    "netcat",
+    "socat",
+    "ansible",
+    "dbus-run-session",
+    // containers / orchestrators (run their argv)
+    "docker",
+    "podman",
+    "nerdctl",
+    "kubectl",
+    "oc",
+    "lxc",
+    "flatpak",
+    // archivers with an exec hook (--to-command, --checkpoint-action, --rsh-command, -TT)
+    "tar",
+    "gtar",
+    "bsdtar",
+    "cpio",
+    "zip",
+    // stream / text tools with an execute command (sed `e`, `s///e`; m4 syscmd)
+    "sed",
+    "gsed",
+    "m4",
+    "gm4",
+    // editors and pagers with a `!cmd` escape (-c '!…', +'!…', -P)
+    "ed",
+    "ex",
+    "vi",
+    "vim",
+    "view",
+    "vimdiff",
+    "gvim",
+    "nvim",
+    "emacs",
+    "less",
+    "more",
+    "most",
+    "man",
+    // database / debugger shells with a shell escape
+    "psql",
+    "mysql",
+    "mariadb",
+    "sqlite3",
+    "gdb",
+    "lldb",
+    // terminal emulators (-e / -- run a command)
+    "xterm",
+    "urxvt",
+    "alacritty",
+    "kitty",
+    "wezterm",
+    "konsole",
+    "gnome-terminal",
+    "tilix",
+    "st",
     // interpreters that execute quoted program text
     "awk",
     "gawk",
@@ -2441,16 +2549,63 @@ const ARGUMENT_EXECUTORS: &[&str] = &[
     "python",
     "python2",
     "python3",
+    "ipython",
     "ruby",
     "node",
     "nodejs",
     "deno",
     "bun",
     "lua",
+    "luajit",
     "php",
     "tclsh",
+    "wish",
     "expect",
     "osascript",
+    "Rscript",
+    "R",
+    "julia",
+    "ghc",
+    "runghc",
+    "scala",
+    "groovy",
+    "erl",
+    "elixir",
+    "iex",
+    "gnuplot",
+];
+
+/// Shell names. Anchored to an explicit list rather than a `*sh` suffix so
+/// ordinary words such as `publish`, `refresh` or `finish` are never taken
+/// for a shell (strict r2 opus-m6).
+const SHELL_WORDS: &[&str] = &[
+    "sh",
+    "bash",
+    "bash-static",
+    "zsh",
+    "dash",
+    "ksh",
+    "ksh93",
+    "mksh",
+    "pdksh",
+    "oksh",
+    "loksh",
+    "fish",
+    "csh",
+    "tcsh",
+    "ash",
+    "rbash",
+    "rksh",
+    "rzsh",
+    "yash",
+    "posh",
+    "elvish",
+    "nu",
+    "nushell",
+    "xonsh",
+    "osh",
+    "pwsh",
+    "powershell",
 ];
 
 /// Shell builtins that assign a value for later expansion (`export X=…`,
@@ -2458,12 +2613,16 @@ const ARGUMENT_EXECUTORS: &[&str] = &[
 /// execution, never content (strict r1 Major 1).
 const ASSIGNMENT_BUILTINS: &[&str] = &["export", "declare", "local", "readonly", "typeset"];
 
-/// True for any shell name: `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`,
-/// `ash`, `rbash`, `mksh`, `busybox`-style `*sh` words.
+/// True for a shell name (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, …).
 fn is_shell_word(base: &str) -> bool {
-    base.len() >= 2
-        && base.ends_with("sh")
-        && base.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    SHELL_WORDS.contains(&base)
+}
+
+/// True when `base` (a command word with its sugar and path stripped) is one
+/// of `commands`, an argument executor or a shell.
+fn is_executor_word(base: &str, commands: &[&str]) -> bool {
+    !base.is_empty()
+        && (commands.contains(&base) || ARGUMENT_EXECUTORS.contains(&base) || is_shell_word(base))
 }
 
 /// True for a `NAME=…` / `NAME+=…` shell assignment token. The value may be
@@ -2480,6 +2639,22 @@ fn is_assignment_token(token: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// True for a redirection operator standing alone (`<`, `<<<`, `2>`,
+/// `&>`), which consumes the next token as its operand.
+fn is_bare_redirect_operator(token: &str) -> bool {
+    let op = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    !op.is_empty()
+        && op.starts_with(['<', '>', '&'])
+        && op.bytes().all(|b| matches!(b, b'<' | b'>' | b'&' | b'|'))
+}
+
+/// True for a redirection with its operand attached (`2>/dev/null`,
+/// `<file`, `<<EOF`, `2>&1`).
+fn is_attached_redirect(token: &str) -> bool {
+    let op = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    op.starts_with(['<', '>']) || op.starts_with("&>")
+}
+
 /// Strip the shell sugar that can prefix / suffix an executable word:
 /// `$(git`, `` `git``, `>(bash)`, `<(sh)`, `(bash)`.
 fn executable_word_base(token: &str) -> &str {
@@ -2489,15 +2664,32 @@ fn executable_word_base(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
-/// Executing signals that cannot be confined to one segment: `eval`
-/// anywhere, a process substitution (`>(…)` / `<(…)`) anywhere. Either
+/// Executing signals that cannot be confined to one segment: `eval` or a
+/// process substitution (`>(…)` / `<(…)`) in an executable span. Either
 /// means the whole command must stay unmasked.
-fn command_has_global_execution_signal(cmd: &str) -> bool {
-    cmd.contains(">(")
-        || cmd.contains("<(")
-        || cmd
-            .split_whitespace()
-            .any(|token| executable_word_base(token) == "eval")
+///
+/// Only `Executed`, `InlineCode` and `Unknown` spans are inspected: the same
+/// text inside a quoted `Argument` / `Data` span is content (strict r2
+/// sol-M2 / composer-m1).
+fn spans_have_global_execution_signal(cmd: &str, spans: &crate::context::CommandSpans) -> bool {
+    use crate::context::SpanKind;
+    spans
+        .spans()
+        .iter()
+        .filter(|span| {
+            matches!(
+                span.kind,
+                SpanKind::Executed | SpanKind::InlineCode | SpanKind::Unknown
+            )
+        })
+        .any(|span| {
+            let text = span.text(cmd);
+            text.contains(">(")
+                || text.contains("<(")
+                || text
+                    .split_whitespace()
+                    .any(|token| executable_word_base(token) == "eval")
+        })
 }
 
 /// Shell-sequence separator emitted as its own `Executed` span by the
@@ -2506,93 +2698,170 @@ fn is_segment_separator(text: &str) -> bool {
     matches!(text, "|" | "||" | "&&" | ";" | "&")
 }
 
-/// True if any word of executable `text` is one of `commands`, a known
-/// argument executor or a shell. Leading `$(` / backtick / `>(` sugar and
-/// path prefixes are ignored so `$(git …)`, `>(bash)` and `/usr/bin/git`
-/// still count.
+/// True if any word of executed code `text` is one of `commands`, a known
+/// argument executor or a shell. Used for inline code (`bash -c '…'`) and
+/// heredoc bodies, where every word is in a command position. Leading
+/// `$(` / backtick / `>(` sugar and path prefixes are ignored so
+/// `$(git …)`, `>(bash)` and `/usr/bin/git` still count.
 fn words_signal_execution(text: &str, commands: &[&str]) -> bool {
-    text.split_whitespace().any(|token| {
-        let base = executable_word_base(token);
-        commands.contains(&base) || ARGUMENT_EXECUTORS.contains(&base) || is_shell_word(base)
-    })
+    text.split_whitespace()
+        .any(|token| is_executor_word(executable_word_base(token), commands))
 }
 
-/// True if any word of executable `text` stores a value for later
-/// expansion (`X=`, `export X=`, `declare -x X=`). The stored value is
-/// deferred execution, so the segment keeps its quoted text visible to the
-/// executing-position packs. A bare assignment is not by itself a signal
-/// for the keyword gate (`VAR='…'; echo "$VAR"` keeps the quick-reject fast
-/// path); its consumer (`$VAR` as a command word, `eval`) is.
-fn words_signal_deferred_assignment(text: &str) -> bool {
-    text.split_whitespace().any(|token| {
-        ASSIGNMENT_BUILTINS.contains(&executable_word_base(token)) || is_assignment_token(token)
-    })
+/// Per-segment state of the executing-position walk.
+///
+/// The executor test is anchored to the segment's COMMAND WORD: the first
+/// executable token after leading assignments and redirections. Ordinary
+/// arguments (`orca send --to git --subject publish`) never mark a segment
+/// executing (strict r2 sol-M1 / opus-m6). A command word that is itself an
+/// executor (`sudo`, `env`, `xargs`, `timeout`, a shell) makes the whole
+/// segment executing, so the words it runs need no separate test.
+#[derive(Default)]
+struct ExecutingSegment {
+    /// Byte ranges of quoted data spans (`Argument` / `Data`) in this segment.
+    data: Vec<std::ops::Range<usize>>,
+    /// The command word names one of the pack's commands, an argument
+    /// executor or a shell.
+    executor: bool,
+    /// A shell assignment (`X=…`, `export X=…`) precedes or is the command
+    /// word: its value is deferred execution.
+    deferred: bool,
+    /// The command word is a `$VAR` expansion of unknown content.
+    unknown_command_word: bool,
+    /// Whether this segment is followed by a `|` pipe.
+    piped: bool,
+    /// Whether the segment's command word has been seen yet.
+    has_command_word: bool,
+    /// The last executed token was `NAME=`; the next quoted span is its value.
+    awaiting_value: bool,
+    /// The last executed token was a bare redirection operator; the next
+    /// token (or quoted span) is its operand.
+    awaiting_operand: bool,
+}
+
+impl ExecutingSegment {
+    /// Quoted spans of this segment may be executed and must stay visible.
+    const fn is_executing(&self) -> bool {
+        self.executor || self.deferred
+    }
+
+    /// Feed one `Executed` piece (no separators, no newlines).
+    fn executed_piece(&mut self, piece: &str, commands: &[&str]) {
+        for token in piece.split_whitespace() {
+            self.awaiting_value = false;
+            if self.awaiting_operand {
+                self.awaiting_operand = false;
+                continue;
+            }
+            if self.has_command_word {
+                continue;
+            }
+            if is_bare_redirect_operator(token) {
+                self.awaiting_operand = true;
+                continue;
+            }
+            if is_attached_redirect(token) {
+                continue;
+            }
+            if is_assignment_token(token) {
+                self.deferred = true;
+                self.awaiting_value = token.ends_with('=');
+                continue;
+            }
+            let base = executable_word_base(token);
+            if base.is_empty() {
+                continue;
+            }
+            self.has_command_word = true;
+            if ASSIGNMENT_BUILTINS.contains(&base) {
+                self.deferred = true;
+            } else if token.starts_with('$') {
+                self.unknown_command_word = true;
+            } else if is_executor_word(base, commands) {
+                self.executor = true;
+            }
+        }
+        // `X= "cmd"` runs `cmd` with an empty `X`: the value is not pending.
+        if piece.ends_with(char::is_whitespace) {
+            self.awaiting_value = false;
+        }
+    }
+
+    /// Feed one quoted `Argument` / `Data` span.
+    fn quoted_span(&mut self, text: &str, commands: &[&str]) {
+        if self.awaiting_operand {
+            self.awaiting_operand = false;
+            return;
+        }
+        if self.awaiting_value {
+            self.awaiting_value = false;
+            return;
+        }
+        if self.has_command_word {
+            return;
+        }
+        // A quoted command word: `"git" restore …`, `'sed' 'e …'`, `"$X"`.
+        self.has_command_word = true;
+        let inner = text.trim_matches(['"', '\'']);
+        if inner.starts_with('$') {
+            self.unknown_command_word = true;
+        } else if is_executor_word(executable_word_base(inner), commands) {
+            self.executor = true;
+        }
+    }
+
+    /// Feed an `InlineCode` / `HeredocBody` / `Unknown` / `Comment` span:
+    /// executed (or conservatively treated as such), every word counts.
+    fn code_span(&mut self, text: &str, commands: &[&str]) {
+        self.awaiting_operand = false;
+        self.awaiting_value = false;
+        self.has_command_word = true;
+        self.executor |= words_signal_execution(text, commands);
+    }
 }
 
 /// True when `cmd` carries an executing signal the executable-span-only
 /// keyword gate cannot see through.
 ///
-/// Signals: an argument executor / interpreter / shell in an executable
-/// span, a variable used as the command word (the consumer of a deferred
+/// Signals: an argument executor / interpreter / shell as a command word, a
+/// variable used as the command word (the consumer of a deferred
 /// assignment), `eval`, or a process substitution. The quick-reject then
 /// falls back to scanning the full command so the executing-position
-/// masking (not the keyword gate) decides.
+/// masking (not the keyword gate) decides. A bare assignment is not by
+/// itself a signal (`VAR='…'; echo "$VAR"` keeps the fast path).
 #[must_use]
 pub fn command_forces_full_keyword_scan(cmd: &str) -> bool {
-    if command_has_global_execution_signal(cmd) {
+    use crate::context::SpanKind;
+    let spans = crate::context::classify_command(cmd);
+    if spans_have_global_execution_signal(cmd, &spans) {
         return true;
     }
-    let spans = crate::context::classify_command(cmd);
-    let mut at_command_word = true;
+    let mut segment = ExecutingSegment::default();
     for span in spans.spans() {
         let text = span.text(cmd);
         match span.kind {
-            crate::context::SpanKind::Executed => {
-                for token in text.split_whitespace() {
-                    if is_segment_separator(token) {
-                        at_command_word = true;
-                        continue;
+            SpanKind::Argument | SpanKind::Data => segment.quoted_span(text, &[]),
+            SpanKind::Executed if is_segment_separator(text) => {
+                segment = ExecutingSegment::default();
+            }
+            SpanKind::Executed => {
+                for (idx, piece) in text.split('\n').enumerate() {
+                    if idx > 0 {
+                        if segment.executor || segment.unknown_command_word {
+                            return true;
+                        }
+                        segment = ExecutingSegment::default();
                     }
-                    if words_signal_execution(token, &[]) {
-                        return true;
-                    }
-                    if at_command_word && token.starts_with('$') {
-                        return true;
-                    }
-                    at_command_word = false;
-                }
-                if text.contains('\n') {
-                    at_command_word = true;
+                    segment.executed_piece(piece, &[]);
                 }
             }
-            crate::context::SpanKind::Argument | crate::context::SpanKind::Data => {
-                if at_command_word && text.trim_start_matches(['"', '\'']).starts_with('$') {
-                    return true;
-                }
-                at_command_word = false;
-            }
-            _ => {
-                if words_signal_execution(text, &[]) {
-                    return true;
-                }
-                at_command_word = false;
-            }
+            _ => segment.code_span(text, &[]),
+        }
+        if segment.executor || segment.unknown_command_word {
+            return true;
         }
     }
     false
-}
-
-#[derive(Default)]
-struct ExecutingSegment {
-    /// Byte ranges of quoted data spans (`Argument` / `Data`) in this segment.
-    data: Vec<std::ops::Range<usize>>,
-    /// Whether an executable span of this segment names one of the pack's
-    /// commands or an argument executor.
-    executing: bool,
-    /// Whether this segment is followed by a `|` pipe.
-    piped: bool,
-    /// Whether the segment's command word has been seen yet.
-    has_command_word: bool,
 }
 
 /// Blank out quoted data spans that do not sit in an executing position for
@@ -2600,11 +2869,12 @@ struct ExecutingSegment {
 ///
 /// The command is classified with [`crate::context::classify_command`] and
 /// split into segments on `|`, `||`, `&&`, `;`, `&` and newlines. A segment
-/// is *executing* when one of its executable spans names one of `commands`
-/// (e.g. `git`) or an argument executor, or when it is piped into an
-/// executing segment. Quoted `Argument` / `Data` spans of every other
-/// segment are replaced with spaces. Masking is length-preserving so byte
-/// offsets of later regex matches still map onto the original text.
+/// is *executing* when its command word names one of `commands` (e.g.
+/// `git`), an argument executor or a shell, when an assignment precedes it,
+/// or when it is piped into an executing segment. Quoted `Argument` /
+/// `Data` spans of every other segment are replaced with spaces. Masking is
+/// length-preserving so byte offsets of later regex matches still map onto
+/// the original text.
 ///
 /// Returns `Cow::Borrowed` when nothing needs masking.
 #[must_use]
@@ -2612,43 +2882,38 @@ pub fn mask_data_outside_executing_positions<'a>(
     cmd: &'a str,
     commands: &[&str],
 ) -> std::borrow::Cow<'a, str> {
+    use crate::context::SpanKind;
+
     // Only quoted text is ever masked; skip the classifier when there is none.
     if !cmd.bytes().any(|b| matches!(b, b'"' | b'\'')) {
         return std::borrow::Cow::Borrowed(cmd);
     }
 
-    // `eval` or a process substitution anywhere: every quoted span may be
-    // executed, so nothing is masked (strict r1 Majors 1 and 3).
-    if command_has_global_execution_signal(cmd) {
+    let spans = crate::context::classify_command(cmd);
+
+    // `eval` or a process substitution in an executable span: every quoted
+    // span may be executed, so nothing is masked (strict r1 Majors 1 and 3).
+    if spans_have_global_execution_signal(cmd, &spans) {
         return std::borrow::Cow::Borrowed(cmd);
     }
 
-    let spans = crate::context::classify_command(cmd);
     let mut segments: Vec<ExecutingSegment> = vec![ExecutingSegment::default()];
 
     for span in spans.spans() {
         let text = span.text(cmd);
+        let Some(segment) = segments.last_mut() else {
+            break;
+        };
         match span.kind {
-            crate::context::SpanKind::Argument | crate::context::SpanKind::Data => {
-                if let Some(segment) = segments.last_mut() {
-                    // `"$X"` as the command word: deferred execution of an
-                    // unknown value, the whole command stays unmasked.
-                    if !segment.has_command_word
-                        && text.trim_start_matches(['"', '\'']).starts_with('$')
-                    {
-                        return std::borrow::Cow::Borrowed(cmd);
-                    }
-                    segment.has_command_word = true;
-                    segment.data.push(span.byte_range.clone());
-                }
+            SpanKind::Argument | SpanKind::Data => {
+                segment.data.push(span.byte_range.clone());
+                segment.quoted_span(text, commands);
             }
-            crate::context::SpanKind::Executed if is_segment_separator(text) => {
-                if let Some(segment) = segments.last_mut() {
-                    segment.piped = text == "|";
-                }
+            SpanKind::Executed if is_segment_separator(text) => {
+                segment.piped = text == "|";
                 segments.push(ExecutingSegment::default());
             }
-            crate::context::SpanKind::Executed => {
+            SpanKind::Executed => {
                 // The classifier treats newlines as whitespace; they split
                 // command sequences just like `;`.
                 for (idx, piece) in text.split('\n').enumerate() {
@@ -2656,42 +2921,29 @@ pub fn mask_data_outside_executing_positions<'a>(
                         segments.push(ExecutingSegment::default());
                     }
                     if let Some(segment) = segments.last_mut() {
-                        // A bare `$X` command word: deferred execution of
-                        // an unknown value, the whole command stays unmasked.
-                        if !segment.has_command_word
-                            && piece
-                                .split_whitespace()
-                                .next()
-                                .is_some_and(|w| w.starts_with('$'))
-                        {
-                            return std::borrow::Cow::Borrowed(cmd);
-                        }
-                        segment.has_command_word |= !piece.trim().is_empty();
-                        segment.executing |= words_signal_execution(piece, commands)
-                            || words_signal_deferred_assignment(piece);
+                        segment.executed_piece(piece, commands);
                     }
                 }
             }
-            _ => {
-                // InlineCode / HeredocBody / Unknown / Comment: executed or
-                // conservatively treated as such.
-                if let Some(segment) = segments.last_mut() {
-                    segment.has_command_word = true;
-                    segment.executing |= words_signal_execution(text, commands);
-                }
-            }
+            _ => segment.code_span(text, commands),
         }
+    }
+
+    // `$X` / `"$X"` as a command word: deferred execution of an unknown
+    // value, the whole command stays unmasked.
+    if segments.iter().any(|s| s.unknown_command_word) {
+        return std::borrow::Cow::Borrowed(cmd);
     }
 
     // `echo "…" | bash`: a segment piped into an executing one is executing.
     for i in (0..segments.len().saturating_sub(1)).rev() {
-        if segments[i].piped && segments[i + 1].executing {
-            segments[i].executing = true;
+        if segments[i].piped && segments[i + 1].is_executing() {
+            segments[i].executor = true;
         }
     }
 
     let mut masked: Option<Vec<u8>> = None;
-    for segment in segments.iter().filter(|s| !s.executing) {
+    for segment in segments.iter().filter(|s| !s.is_executing()) {
         for range in &segment.data {
             let out = masked.get_or_insert_with(|| cmd.as_bytes().to_vec());
             if let Some(slice) = out.get_mut(range.clone()) {
@@ -2895,6 +3147,99 @@ mod tests {
         );
         assert!(!masked.contains("restore"));
         assert!(masked.contains("git status"));
+    }
+
+    // transformate WI-3107 fold r3: sed and the executor class reach the
+    // packs; anchored executor signals keep plain content on the fast path.
+    #[test]
+    fn pack_aware_quick_reject_keeps_executor_class_and_anchors_signals() {
+        let keywords: Vec<&str> = vec!["git"];
+
+        for cmd in [
+            "printf 'x\\n' | sed 'e git restore -W .'",
+            "sed -f - <<< 'e git restore -W .'",
+            "m4 'syscmd(git restore -W .)'",
+            "vim -c '!git restore -W .' f",
+            "tar -xf a.tar --to-command='git restore -W .'",
+            "printf '!git restore -W .\\nq\\n' | ed",
+        ] {
+            assert!(
+                !pack_aware_quick_reject(cmd, &keywords),
+                "{cmd} must reach the packs"
+            );
+        }
+
+        // An argument that merely looks like a shell / executor is content.
+        assert!(pack_aware_quick_reject(
+            "orca send --subject publish --body \"git restore -W .\"",
+            &keywords
+        ));
+        // (`<(` inside content still trips the pre-existing redirect-byte
+        // fallback of the gate; the pack view masks it, see
+        // `mask_anchors_executor_signal_to_command_word`.)
+    }
+
+    #[test]
+    fn shell_words_are_an_explicit_list() {
+        for shell in [
+            "sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "rbash", "mksh",
+        ] {
+            assert!(is_shell_word(shell), "{shell}");
+        }
+        for word in ["publish", "refresh", "push", "finish", "ssh", "mesh", ""] {
+            assert!(!is_shell_word(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn mask_anchors_executor_signal_to_command_word() {
+        let git = &["git"];
+        for cmd in [
+            "orca send --to git --body \"git restore -W .\"",
+            "orca send --subject publish --body \"git restore -W .\"",
+            "orca send --body \"see <(cat x) and eval later: git restore -W .\"",
+        ] {
+            let masked = mask_data_outside_executing_positions(cmd, git);
+            assert!(
+                !masked.contains("restore"),
+                "{cmd} body must be masked: {masked}"
+            );
+        }
+        for cmd in [
+            "sed 'e git restore -W .' <<< x",
+            "sed -f - <<< 'e git restore -W .'",
+            "sudo bash -c \"git restore -W .\"",
+            "FOO=1 git restore -W \"src/main.rs\"",
+            "2>/dev/null git restore -W \"src/main.rs\"",
+            "\"git\" restore -W \"src/main.rs\"",
+            "printf '!git restore -W .' | ed",
+        ] {
+            let masked = mask_data_outside_executing_positions(cmd, git);
+            assert!(
+                masked.contains("restore"),
+                "{cmd} must stay visible: {masked}"
+            );
+        }
+    }
+
+    // Strict r2 opus-m5: the executing-position view is computed once per
+    // pack per command, on both the pack and the registry paths.
+    #[test]
+    fn scan_view_runs_once_per_pack_per_command() {
+        let pack = crate::packs::core::git::create_pack();
+        SCAN_VIEW_CALLS.with(|c| c.set(0));
+        assert!(pack.check("git restore -W \"src/main.rs\"").is_some());
+        assert_eq!(SCAN_VIEW_CALLS.with(std::cell::Cell::get), 1);
+
+        let mut enabled = HashSet::new();
+        enabled.insert("core.git".to_string());
+        SCAN_VIEW_CALLS.with(|c| c.set(0));
+        assert!(
+            REGISTRY
+                .check_command("git restore -W \"src/main.rs\"", &enabled)
+                .blocked
+        );
+        assert_eq!(SCAN_VIEW_CALLS.with(std::cell::Cell::get), 1);
     }
 
     #[test]
