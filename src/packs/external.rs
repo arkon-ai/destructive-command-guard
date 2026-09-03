@@ -566,6 +566,7 @@ impl ExternalPack {
                     severity: p.severity.into(),
                     explanation,
                     suggestions,
+                    scan_view: None,
                 }
             })
             .collect();

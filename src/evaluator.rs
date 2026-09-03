@@ -1844,7 +1844,6 @@ fn evaluate_packs_with_allowlists(
             // determines whether to deny, warn, or log based on severity and config.
 
             let matched_span = pattern
-                .regex
                 .find(command_for_packs)
                 .map(|(start, end)| MatchSpan { start, end });
 
@@ -2591,13 +2590,11 @@ impl LegacySafePattern for crate::packs::SafePattern {
 
 impl LegacyDestructivePattern for crate::packs::DestructivePattern {
     fn is_match(&self, cmd: &str) -> bool {
-        self.regex.is_match(cmd)
+        Self::is_match(self, cmd)
     }
 
     fn find_span(&self, cmd: &str) -> Option<MatchSpan> {
-        self.regex
-            .find(cmd)
-            .map(|(start, end)| MatchSpan { start, end })
+        Self::find(self, cmd).map(|(start, end)| MatchSpan { start, end })
     }
 
     fn reason(&self) -> &str {

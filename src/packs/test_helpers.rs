@@ -420,7 +420,7 @@ pub fn debug_match_info(pack: &Pack, command: &str) -> String {
     // Check destructive patterns
     info.push_str("  Destructive patterns:\n");
     for pattern in &pack.destructive_patterns {
-        let matches = pattern.regex.is_match(command);
+        let matches = pattern.is_match(command);
         let _ = writeln!(
             info,
             "    - {:?}: {} (severity: {:?})",

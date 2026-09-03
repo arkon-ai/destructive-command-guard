@@ -4,6 +4,7 @@
 //! - rm -rf outside temp directories (blocked)
 //! - rm -rf in /tmp, /var/tmp, $TMPDIR (allowed)
 
+use crate::context::SpanKind;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, Platform, SafePattern, Severity};
 use crate::{destructive_pattern, safe_pattern};
 
@@ -1061,6 +1062,108 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     ]
 }
 
+/// Command words that execute a quoted string (or piped text) as shell code
+/// on THIS host. A quoted `>` in a pipeline that contains one of these is a
+/// real local redirect and gets no quoted-text shield.
+const REDIRECT_LOCAL_EXECUTORS: &[&str] = &[
+    "bash", "sh", "zsh", "ksh", "dash", "fish", "eval", "exec", "xargs", "env", "timeout", "sudo",
+    "doas", "su", "nohup", "nice", "time", "command", "watch",
+];
+
+/// First command word of a pipeline stage (skips `VAR=value` prefixes, strips
+/// surrounding quotes and any directory prefix).
+fn stage_command_word(stage: &str) -> Option<&str> {
+    stage
+        .split_whitespace()
+        .find(|tok| {
+            let name = tok.split('=').next().unwrap_or("");
+            !(tok.contains('=')
+                && !name.is_empty()
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        })
+        .map(|tok| {
+            let tok = tok.trim_matches(|c| c == '"' || c == '\'');
+            tok.rsplit('/').next().unwrap_or(tok)
+        })
+}
+
+/// True when any stage of this `|`-pipeline is a local shell-string executor.
+fn pipeline_has_local_executor(segment: &str) -> bool {
+    let is_executor = |stage: &str| {
+        stage_command_word(stage).is_some_and(|word| REDIRECT_LOCAL_EXECUTORS.contains(&word))
+    };
+    let bytes = segment.as_bytes();
+    let (mut in_single, mut in_double) = (false, false);
+    let mut stage_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if !in_single => {
+                i += 2;
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'|' if !in_single && !in_double => {
+                if is_executor(&segment[stage_start..i]) {
+                    return true;
+                }
+                stage_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    is_executor(&segment[stage_start.min(segment.len())..])
+}
+
+/// Scan view for `redirect-truncate-root-home`: a redirect operator is only a
+/// redirect when it is UNQUOTED on the local command line. `>` bytes that sit
+/// inside quoted data of a non-executing position (single-quoted `Data`
+/// spans and plain double-quoted `Argument` spans — ssh/scp remote payloads,
+/// `--body`/`--subject`/`-m` message text, quoted echo prose) are blanked to
+/// a space so the regex cannot match them. Everything else is untouched:
+/// quoted TARGETS after an unquoted operator stay visible, `InlineCode`
+/// spans (`bash -c '...'`) stay visible, and any pipeline whose stage command
+/// word is a local string executor (`eval`, `xargs`, `env`, `timeout`,
+/// `sudo`, `... | bash`) is left completely unmasked. Byte length is
+/// preserved so match spans still index the original text.
+fn redirect_unquoted_scan_view(cmd: &str) -> std::borrow::Cow<'_, str> {
+    if !cmd.bytes().any(|b| matches!(b, b'\'' | b'"')) {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+    let spans = crate::context::classify_command(cmd);
+    let base = cmd.as_ptr() as usize;
+    let mut out: Option<Vec<u8>> = None;
+    for segment in crate::packs::split_command_segments(cmd) {
+        if pipeline_has_local_executor(segment) {
+            continue;
+        }
+        let seg_start = segment.as_ptr() as usize - base;
+        let seg_end = seg_start + segment.len();
+        for span in spans.spans() {
+            if !matches!(span.kind, SpanKind::Data | SpanKind::Argument) {
+                continue;
+            }
+            let start = span.byte_range.start.max(seg_start);
+            let end = span.byte_range.end.min(seg_end);
+            for idx in start..end {
+                if cmd.as_bytes()[idx] == b'>' {
+                    out.get_or_insert_with(|| cmd.as_bytes().to_vec())[idx] = b' ';
+                }
+            }
+        }
+    }
+    match out {
+        // Only ASCII `>` bytes were replaced by ASCII spaces, so the buffer is
+        // still valid UTF-8; fall back to the raw text (conservative: the
+        // regex sees everything) if that ever fails.
+        Some(bytes) => String::from_utf8(bytes)
+            .map_or(std::borrow::Cow::Borrowed(cmd), std::borrow::Cow::Owned),
+        None => std::borrow::Cow::Borrowed(cmd),
+    }
+}
+
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // Severity levels:
     // - Critical: Most dangerous, irreversible, high-confidence detections
@@ -1651,12 +1754,23 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      Bash quoting introducers `$'` (ANSI-C) and `$"`
         //      (locale-translated). Without this, an attacker could
         //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
-        destructive_pattern!(
-            "redirect-truncate-root-home",
-            r#"(?<![<>])(?:[12]?>\|?|&>)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
-            "shell redirect (>, >|, &>, 1>, 2>) to a sensitive system or home path truncates the file to zero bytes. EXTREMELY DANGEROUS.",
-            Critical,
-            "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
+        //
+        // Scan view (WI-3135): the regex runs on
+        // `redirect_unquoted_scan_view`, which blanks `>` bytes that sit
+        // inside quoted, non-executing text. A redirect is only a redirect
+        // when the OPERATOR is unquoted on the local command line;
+        // `ssh host 'date > ~/stamp'` and
+        // `send --body "wrote date > ~/stamp"` are content, not a local
+        // truncate. Local executors (`bash -c`, `eval`, `xargs`, `env`,
+        // `timeout`, `sudo`, `... | sh`) keep the full text visible.
+        DestructivePattern {
+            scan_view: Some(redirect_unquoted_scan_view),
+            ..destructive_pattern!(
+                "redirect-truncate-root-home",
+                r#"(?<![<>])(?:[12]?>\|?|&>)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+                "shell redirect (>, >|, &>, 1>, 2>) to a sensitive system or home path truncates the file to zero bytes. EXTREMELY DANGEROUS.",
+                Critical,
+                "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
              the target file with O_WRONLY|O_CREAT|O_TRUNC — the contents are destroyed \
              before any write happens. This applies equally to `>|` (force-overwrite), \
              `&>` (stdout+stderr to file), and numbered FD forms (`1>`, `2>`, `1>|`, \
@@ -1667,8 +1781,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Make a backup: `cp <file> <file>.bak && echo data > <file>`.\n\
              - For temp scratch: `> /tmp/<subdir>/scratch` is allowed.\n\
              - Read redirects (`< <file>`) are not affected — they don't truncate.",
-            REDIRECT_TRUNCATE_SUGGESTIONS
-        ),
+                REDIRECT_TRUNCATE_SUGGESTIONS
+            )
+        },
     ]
 }
 
@@ -2772,6 +2887,81 @@ mod tests {
             "echo x 2>> /etc/passwd",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    // ---------- WI-3135: quoted redirect text is content, not a redirect ----------
+    //
+    // The 14-case suite (SPEC-WI-3135-r2). D1-D7 are real shell redirects on
+    // the local command line (operator unquoted, or inside a LOCAL executor's
+    // quoted payload) and must keep denying with the same rule id and
+    // severity. A1-A7 carry the same text inside quoted data of a
+    // non-executing position (ssh remote payloads, --body/--subject/-m
+    // message arguments, quoted echo prose) or use append, and must allow.
+
+    #[test]
+    fn redirect_truncate_unquoted_operator_still_blocks_wi3135() {
+        let pack = create_pack();
+        for cmd in [
+            // D1: bare redirect to home.
+            "> ~/x",
+            // D2: unquoted redirect to a home secret.
+            "echo x > ~/.ssh/id_ed25519",
+            // D3: the incident's remote payload, run LOCALLY unquoted.
+            "date -u +%FT%TZ > ~/offload/wi112/WI112-R8-BUNDLE-STAMP",
+            // D4: unquoted redirect to /etc.
+            "echo x > /etc/passwd",
+            // D5: quoted TARGET, unquoted operator.
+            "echo x > \"/etc/passwd\"",
+            // D6: compound.
+            "true && > /etc/passwd",
+            // D7: LOCAL executor with a quoted payload.
+            "sudo bash -c '> /etc/passwd'",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_quoted_payload_or_message_body_is_allowed_wi3135() {
+        let pack = create_pack();
+        for cmd in [
+            // A1: incident I1 verbatim — ssh single-quoted remote payload.
+            "scp /home/brynn-bendixen/dev/_deck/wi112-b5feeaf.bundle /home/brynn-bendixen/dev/_deck/LAUNCH-BRIEF-wi112-r8.md orca@100.117.246.48:offload/wi112/ && ssh orca@100.117.246.48 'sha256sum ~/offload/wi112/wi112-b5feeaf.bundle && cp ~/offload/wi112/R7-EXCLUDED-FILES.txt ~/offload/wi112/R8-EXCLUDED-FILES.txt && wc -l ~/offload/wi112/R8-EXCLUDED-FILES.txt && date -u +%FT%TZ > ~/offload/wi112/WI112-R8-BUNDLE-STAMP'",
+            // A2: double-quoted remote payload.
+            "ssh orca@100.117.246.48 \"date -u +%FT%TZ > ~/offload/wi112/stamp\"",
+            // A3: incident I2 verbatim — prose message body.
+            "orca orchestration send --type status --subject \"deploy-wi2096 report\" --body \"Denial to report: at 10:04 dcg BLOCKED a compound scp+ssh command whose remote payload wrote date -u > ~/offload/wi112/stamp; worked around by splitting\"",
+            // A4: compound with a prose body.
+            "orca orchestration send --subject \"receipt\" --body \"remote wrote date > ~/offload/stamp\" && git status",
+            // A5: prose in a quoted echo argument.
+            "echo \"use > ~/file to truncate\"",
+            // A6: commit message.
+            "git commit -m \"fix: log redirect > ~/log was wrong\"",
+            // A7: append (existing carve-out).
+            "echo x >> ~/.bashrc",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_quoted_text_fed_to_local_executor_still_blocks_wi3135() {
+        // The quoted-text shield must not extend to local shell-string
+        // executors: these run the quoted text on THIS host.
+        let pack = create_pack();
+        for cmd in [
+            "bash -c \"> ~/x\"",
+            "sh -c '> /etc/passwd'",
+            "eval '> ~/.bashrc'",
+            "timeout 5 bash -c '> /etc/passwd'",
+            "env FOO=1 sh -c '> ~/x'",
+            "xargs -0 sh -c '> /etc/passwd'",
+            "echo \"> ~/x\" | bash",
+            "echo '> /etc/passwd' | sudo sh",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
     }
 

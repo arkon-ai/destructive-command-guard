@@ -13381,7 +13381,7 @@ fn dev_debug(config: &Config, command: &str, all_packs: bool) {
 
             // Check destructive patterns
             for destructive in &pack.destructive_patterns {
-                let matched = destructive.regex.is_match(command);
+                let matched = destructive.is_match(command);
                 if matched {
                     println!(
                         "    {} Destructive pattern '{}' -> {}",

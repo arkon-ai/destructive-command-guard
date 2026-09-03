@@ -281,6 +281,31 @@ pub struct DestructivePattern {
     /// Safer command alternatives to suggest when this pattern matches.
     /// Each suggestion includes the command, why it's safer, and which platforms it applies to.
     pub suggestions: &'static [PatternSuggestion],
+    /// Optional rule-scoped view of the command text that the regex is run
+    /// against instead of the raw text. Must preserve byte length so match
+    /// spans still index the original text. `None` (the default) means the
+    /// regex sees the text unchanged.
+    pub scan_view: Option<fn(&str) -> std::borrow::Cow<'_, str>>,
+}
+
+impl DestructivePattern {
+    /// Check whether this pattern matches, honouring its `scan_view`.
+    #[must_use]
+    pub fn is_match(&self, cmd: &str) -> bool {
+        match self.scan_view {
+            Some(view) => self.regex.is_match(&view(cmd)),
+            None => self.regex.is_match(cmd),
+        }
+    }
+
+    /// Find the first match span, honouring its `scan_view`.
+    #[must_use]
+    pub fn find(&self, cmd: &str) -> Option<(usize, usize)> {
+        match self.scan_view {
+            Some(view) => self.regex.find(&view(cmd)),
+            None => self.regex.find(cmd),
+        }
+    }
 }
 
 impl std::fmt::Debug for DestructivePattern {
@@ -292,6 +317,7 @@ impl std::fmt::Debug for DestructivePattern {
             .field("severity", &self.severity)
             .field("explanation", &self.explanation)
             .field("suggestions", &self.suggestions)
+            .field("scan_view", &self.scan_view.is_some())
             .finish()
     }
 }
@@ -331,6 +357,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::High,
             explanation: None,
             suggestions: &[],
+            scan_view: None,
         }
     };
     // Named pattern, default severity (High)
@@ -342,6 +369,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::High,
             explanation: None,
             suggestions: &[],
+            scan_view: None,
         }
     };
     // Named pattern with explicit severity
@@ -353,6 +381,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::$severity,
             explanation: None,
             suggestions: &[],
+            scan_view: None,
         }
     };
     // Named pattern with explicit severity and explanation
@@ -364,6 +393,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::$severity,
             explanation: Some($explanation),
             suggestions: &[],
+            scan_view: None,
         }
     };
     // Named pattern with explicit severity, explanation, and suggestions
@@ -375,6 +405,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::$severity,
             explanation: Some($explanation),
             suggestions: $suggestions,
+            scan_view: None,
         }
     };
 }
@@ -542,7 +573,7 @@ impl Pack {
     pub fn matches_destructive(&self, cmd: &str) -> Option<DestructiveMatch> {
         self.destructive_patterns
             .iter()
-            .find(|p| p.regex.is_match(cmd))
+            .find(|p| p.is_match(cmd))
             .map(|p| DestructiveMatch {
                 reason: p.reason,
                 name: p.name,

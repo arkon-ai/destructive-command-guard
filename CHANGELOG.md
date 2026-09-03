@@ -15,6 +15,7 @@ Post-v0.4.3 work on `main` that has not yet been tagged.
 
 ### Security Hardening
 
+- **`redirect-truncate-root-home` fires only on unquoted redirects** (`core.filesystem`): the rule now runs on a rule-scoped scan view that blanks `>` inside quoted, non-executing text, so `ssh host 'date > ~/stamp'` (remote payload) and `send --body "wrote date > ~/stamp"` (message body) are content, not a local truncate. Unquoted operators (`> ~/x`, `echo x > "/etc/passwd"`, `true && > /etc/passwd`) and quoted payloads of LOCAL executors (`sudo bash -c '> /etc/passwd'`, `eval`, `xargs`, `env`, `timeout`, `... | sh`) still deny at Critical. Engine support: `DestructivePattern::scan_view` (optional, `None` for every other pattern). No allowlist entries.
 - **Recursive-force-delete bypass family** (`core.filesystem`): closed seven sibling-bypass families an agent could use after `rm -rf` is blocked.
   - `find ... -delete` on sensitive paths (Critical/High) — closes the `find -delete` path-bypass plus compound, subshell, and path-prefix variants.
   - `unlink <sensitive>` (Critical/High) — POSIX unlink(2) primitive.
