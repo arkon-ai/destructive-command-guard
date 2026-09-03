@@ -51,7 +51,19 @@ const DRY = ARGV.includes("--dry-run");
 
 // The sweep spawns hooks, so it can hang. Unbounded, a hung sweep used to leave a patched
 // but unverified settings.json live while this process waited forever.
-const SWEEP_TIMEOUT_MS = Number(process.env.HOOK_SWEEP_TIMEOUT_MS || 120000);
+// Validated HERE, before anything is read: a non-numeric value used to reach spawnSync as NaN
+// and die with a bare RangeError after the settings file had already been read, and `0` silently
+// DISABLED the ceiling this variable exists to set (WI-3068 T10). Whole positive milliseconds only.
+const SWEEP_TIMEOUT_RAW = process.env.HOOK_SWEEP_TIMEOUT_MS || "120000";
+const SWEEP_TIMEOUT_MS = Number(SWEEP_TIMEOUT_RAW);
+if (!/^[0-9]+$/.test(String(SWEEP_TIMEOUT_RAW)) || SWEEP_TIMEOUT_MS < 1) {
+  console.error(
+    `REFUSING TO CERTIFY — HOOK_SWEEP_TIMEOUT_MS=${JSON.stringify(SWEEP_TIMEOUT_RAW)} ` +
+    "is not a positive whole number of milliseconds. Unset it for the default (120000), or give\n" +
+    "an integer >= 1. `0` is refused too: it would remove the ceiling on a hung sweep rather than set one. " +
+    SETTINGS + " was NOT modified.");
+  process.exit(1);
+}
 
 // Loose UNANCHORED match: hits the legacy `mcp__context-mode__*` names, the live
 // `mcp__plugin_context-mode_context-mode__*` names, and any future prefix.
@@ -105,7 +117,28 @@ try {
   console.error(`cannot read or parse ${SETTINGS}: ${err.message}`);
   process.exit(1);
 }
+// The parse guard above covers "does not parse". It did not cover "parses to the wrong SHAPE":
+// a document that is `null`, a `hooks` that is a string, a `PreToolUse` that is an object or an
+// entry that is `null` each threw a bare TypeError stack past every structured message in this
+// file (WI-3068 T9). Refuse them by name instead. Only the shapes this file dereferences are
+// checked; `env` is validated where it is consumed (declaredHome / configEnv).
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const describeShape = (v) => (v === null ? "null" : Array.isArray(v) ? "an array" : `a ${typeof v}`);
+const refuseShape = (what, expected) => {
+  console.error(`cannot use ${SETTINGS}: ${what} — expected ${expected}. It was NOT modified.`);
+  process.exit(1);
+};
+if (!isPlainObject(cfg)) refuseShape(`the document is ${describeShape(cfg)}`, "a JSON object");
+if (cfg.hooks !== undefined && !isPlainObject(cfg.hooks)) {
+  refuseShape(`\`hooks\` is ${describeShape(cfg.hooks)}`, "an object keyed by event name");
+}
+if (cfg.hooks && cfg.hooks.PreToolUse !== undefined && !Array.isArray(cfg.hooks.PreToolUse)) {
+  refuseShape(`\`hooks.PreToolUse\` is ${describeShape(cfg.hooks.PreToolUse)}`, "an array of matcher entries");
+}
 const pre = cfg.hooks?.PreToolUse || [];
+pre.forEach((e, i) => {
+  if (!isPlainObject(e)) refuseShape(`\`hooks.PreToolUse[${i}]\` is ${describeShape(e)}`, "an object with a `matcher`");
+});
 
 // Two DIFFERENT states used to collapse into one "already current — exit 0":
 //   (a) every context-mode matcher is already LOOSE  -> genuinely nothing to do;
@@ -223,18 +256,24 @@ const soleArgv0 = (command) => {
   const m = String(command).trim().match(/^"([^"]+)"$|^'([^']+)'$|^(\S+)$/);
   const tok = m ? (m[1] || m[2] || m[3] || "") : "";
   if (!tok) return "";
+  // `$HOME/` is the other spelling of `~/` and expands under the same variable on the shell that
+  // runs the hook, so it takes the same rule below (WI-3068 T2). Both are accepted only UNQUOTED:
+  // neither `~` nor `$HOME` expands inside single or double quotes, so a quoted form is the
+  // literal string the shell would try to exec, and that is refused rather than expanded.
+  const homePrefix = tok.startsWith("~/") ? "~/" : tok.startsWith("$HOME/") ? "$HOME/" : "";
+  if (homePrefix && !m[3]) return "";
   // Tested AS THE SHELL WILL SEE IT — before tilde expansion, because `~` is itself a shell
   // construct and the expanded form is not the string that gets executed. A quoted token is
   // tested on its CONTENTS: inside double quotes `$` and a backtick are still live, and
   // treating single quotes as safe would mean two rules where one fails closed.
-  if (!SHELL_LITERAL.test(tok.startsWith("~/") ? tok.slice(2) : tok)) return "";
-  if (tok.startsWith("~/")) {
+  if (!SHELL_LITERAL.test(homePrefix ? tok.slice(homePrefix.length) : tok)) return "";
+  if (homePrefix) {
     const h = declaredHome();
     // The JOINED result is what the shell execs, and only the segment after `~/` was ever
     // tested. A declared HOME that is relative, or that carries a shell metacharacter, used
     // to reach the command line unexamined. Fail closed on all three.
     if (!h || !path.isAbsolute(h) || !SHELL_LITERAL.test(h)) return "";
-    const joined = path.join(h, tok.slice(2));
+    const joined = path.join(h, tok.slice(homePrefix.length));
     return SHELL_LITERAL.test(joined) ? joined : "";
   }
   return tok;
@@ -314,8 +353,9 @@ if (ctxEntries.length > 0 && hollow.length === ctxEntries.length) {
 }
 if (hollow.length > 0) {
   console.warn(
-    `NOTE ${hollow.length} context-mode matcher(s) carry no usable hook command and will be ` +
-    "rewritten but remain inert; fix their hooks separately."
+    `NOTE ${hollow.length} context-mode matcher(s) carry no usable hook command. They are left ` +
+    "as they are (only entries that route to the wrapper are rewritten) and remain inert; fix\n" +
+    "their hooks separately."
   );
 }
 
@@ -391,10 +431,10 @@ if (ctxEntries.length > 0 && !LIVE_COMMAND) {
     "The path itself must also be a plain literal - letters, digits and _ @ + : . / -.\n" +
     "`%`, `,` and `=` are NOT in that list: canary 3 delivers through a shell, which on win32\n" +
     "is cmd.exe, and cmd.exe expands %NAME% and SPLITS the command token at `,` and `=`.\n" +
-    "A leading `~/` is accepted only when HOME is declared in this file's env block, and only\n" +
-    "when that HOME is an absolute plain literal. The shell expands `~` under HOME alone, so a\n" +
-    "declared USERPROFILE would name one path here and expand to another there. Otherwise use\n" +
-    "an absolute path.\n" +
+    "A leading `~/` or `$HOME/` (unquoted) is accepted only when HOME is declared in this file's\n" +
+    "env block, and only when that HOME is an absolute plain literal. The shell expands both\n" +
+    "under HOME alone, so a declared USERPROFILE would name one path here and expand to another\n" +
+    "there; a quoted `~/` or `$HOME/` is never expanded at all. Otherwise use an absolute path.\n" +
     "The whitelist covers the INTERIOR of the path, not just its last segment: a shell\n" +
     "construct in any earlier segment (for example\n" +
     "`/opt/$(...)/" + wrapperName + "`) is executed by the shell the moment this tool tests\n" +
@@ -944,11 +984,20 @@ if (targets.length === 0) {
   // exit 0 before any canary ran, so on the ordinary steady-state host the remediation tool
   // reported success having verified nothing executable at all — the same false-green class
   // the routing check was added to remove.
+  // A dry run stops HERE. It runs no canary, so it must not announce a verification it never
+  // performs (WI-3068 T8): the earlier line printed "verifying the control" and then exited.
+  if (DRY) {
+    console.log(
+      `dry-run: matcher text already current — ${ctxEntries.length} context-mode matcher(s) at ` +
+      "LOOSE. Nothing to rewrite; the canaries were NOT run, so this says nothing about whether\n" +
+      "the control works. Run without --dry-run to verify it."
+    );
+    process.exit(0);
+  }
   console.log(
     `matcher text already current — ${ctxEntries.length} context-mode matcher(s) at LOOSE; ` +
     "verifying the control actually works"
   );
-  if (DRY) process.exit(0);
   verify(SETTINGS, (why) => {
     console.error(`\n${why}`);
     process.exit(1);
@@ -960,7 +1009,13 @@ for (const e of targets) {
   console.log(`  ${e.matcher}\n→ ${LOOSE}   [${(e.hooks || []).map((h) => h.command).join(", ")}]`);
   if (!DRY) e.matcher = LOOSE;
 }
-if (DRY) process.exit(0);
+if (DRY) {
+  console.log(
+    `dry-run: ${targets.length} matcher(s) would be rewritten as above. Nothing was written and ` +
+    "the canaries were NOT run; a real run canaries the candidate before anything is published."
+  );
+  process.exit(0);
+}
 
 // CANARY THE CANDIDATE, THEN PUBLISH — in that order.
 //
@@ -1029,8 +1084,21 @@ process.on("exit", dropTmp);
 chmodSync(tmpPath, orig.mode & 0o7777);
 try {
   chownSync(tmpPath, orig.uid, orig.gid);
-} catch {
-  // Non-root run: the file is already ours, so there is nothing to restore.
+} catch (err) {
+  // Non-root run on our own file: nothing to restore, and chown of a file we own to ourselves
+  // does not fail. The case that MATTERS is the other one — the source is owned by someone
+  // else and this process cannot restore that — and swallowing it silently published a file
+  // whose owner had changed (WI-3068 T6). Ruled a distribution-integrity diagnostic, not a
+  // fail-open, so it is reported and the run continues rather than refused.
+  const me = typeof process.getuid === "function" ? process.getuid() : orig.uid;
+  const myGroup = typeof process.getgid === "function" ? process.getgid() : orig.gid;
+  if (orig.uid !== me || orig.gid !== myGroup) {
+    console.warn(
+      `NOTE could not restore owner ${orig.uid}:${orig.gid} on the candidate (${err.message}); ` +
+      `the published file will be owned by ${me}:${myGroup}. Fix ownership after publish if the ` +
+      "renderer needs it."
+    );
+  }
 }
 
 const abort = (why) => {

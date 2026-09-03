@@ -261,14 +261,20 @@ def collect_strings(value, depth=0):
     dcg scans text and the collected pieces are joined with newlines into one
     document. WHAT THAT EARNS, AND WHAT IT DOES NOT — stated exactly, because
     the previous wording ("equivalent to scanning each piece") claimed more than
-    it holds and a docstring in a security control is a load-bearing artifact:
+    it holds and a docstring in a security control is a load-bearing artifact.
+    Exactly TWO points have been measured, and nothing beyond them is claimed:
 
-      * An offending fragment wholly contained in ONE collected string still
-        matches, because that string reaches the scanner intact on its own line.
-      * A phrase SPLIT ACROSS SIBLING STRINGS does not match a line-oriented
-        pack. Measured with {"code": ["git","reset","--hard","origin/main"]}:
+      * MEASURED: an offending fragment wholly contained in ONE collected string
+        reached the scanner intact on its own line and was denied (the suite's
+        batch case: a dangerous `command` mid-array in `commands[]`).
+      * MEASURED: a phrase SPLIT ACROSS SIBLING STRINGS does not match a
+        line-oriented pack. With {"code": ["git","reset","--hard","origin/main"]}
         the scanner receives "git\nreset\n--hard\norigin/main" and the phrase
         appears on no single line.
+
+    That is the extent of what is known about joined-document coverage. Batch
+    coverage is NOT proven equivalent to scanning each piece for any pack, any
+    multi-line rule, or any shape other than those two; it is a STATED RESIDUAL.
 
     No path from a split phrase to execution has been demonstrated — the
     context-mode runtime stringifies a list and runs the literal, which fails —

@@ -186,9 +186,9 @@ def main():
         check("legacy name still guarded",
               denied(out))
 
-        # 4. A future rename must fail CLOSED on the suffix, not open.
+        # 4. A future rename must fail CLOSED on the token (substring, not suffix), not open.
         out, _ = run("mcp__someNewPrefix__context-mode__ctx_batch_execute", batch, tmp)
-        check("unknown prefix + known suffix still guarded",
+        check("unknown prefix + known token still guarded",
               denied(out))
 
         # 5. Unrelated tools and empty payloads pass through untouched.
