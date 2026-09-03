@@ -43,32 +43,98 @@ jobs:
           # Fetch enough history for git diff
           fetch-depth: 0
 
+      # Asset selection rule (transformate WI-3320): from the release JSON, pick the
+      # asset whose name matches the runner OS (`uname -s`, linux only) and CPU
+      # (`uname -m`, x86_64/amd64 accepted), skipping checksum/signature files;
+      # prefer an archive (.tar.gz/.tgz/.tar.xz/.zip) containing a `dcg` executable,
+      # else a bare binary. The result must pass `file` as an ELF 64-bit x86-64
+      # executable; on any mismatch (wrong arch, HTML error page, empty file) or
+      # missing asset we fall back to `cargo install destructive_command_guard`.
       - name: Download dcg binary
         run: |
+          set -uo pipefail
           if [ "$DCG_VERSION" = "latest" ]; then
             RELEASE_URL="https://api.github.com/repos/Dicklesworthstone/destructive_command_guard/releases/latest"
           else
             RELEASE_URL="https://api.github.com/repos/Dicklesworthstone/destructive_command_guard/releases/tags/$DCG_VERSION"
           fi
 
-          # Get download URL for Linux x86_64 binary
-          DOWNLOAD_URL=$(curl -sL "$RELEASE_URL" | \
-            jq -r '.assets[] | select(.name | contains("linux") and contains("x86_64")) | .browser_download_url' | \
-            head -1)
-
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
-            echo "::warning::No pre-built binary found, building from source..."
-            # Fallback: build from source
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-            source "$HOME/.cargo/env"
+          install_from_source() {
+            echo "::warning::$1 — building dcg from source with cargo install"
+            if ! command -v cargo >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              source "$HOME/.cargo/env"
+            fi
             cargo install destructive_command_guard --locked
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          else
-            echo "Downloading dcg from: $DOWNLOAD_URL"
-            curl -sL "$DOWNLOAD_URL" -o dcg
-            chmod +x dcg
-            sudo mv dcg /usr/local/bin/
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          }
+
+          OS=$(uname -s | tr 'A-Z' 'a-z')
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) ARCH_RE='(x86_64|amd64)' ;;
+            *) ARCH_RE="$ARCH" ;;
+          esac
+          if [ "$OS" != "linux" ]; then
+            install_from_source "unsupported runner OS '$OS'"
+            exit 0
           fi
+
+          # RELEASE_JSON_FILE lets the selection logic be tested against a fixture;
+          # it defaults to the live GitHub API query.
+          if [ -n "${RELEASE_JSON_FILE:-}" ]; then
+            RELEASE_JSON=$(cat "$RELEASE_JSON_FILE")
+          else
+            RELEASE_JSON=$(curl -sL "$RELEASE_URL")
+          fi
+
+          SELECTED=$(printf '%s' "$RELEASE_JSON" | jq -r --arg os "$OS" --arg arch "$ARCH_RE" '
+            [ .assets[]?
+              | select(.name | test("\\.(sha256|sha512|minisig|sig|asc|txt|md)$"; "i") | not)
+              | select(.name | ascii_downcase | contains($os))
+              | select(.name | test($arch; "i"))
+              | . + { rank: (if (.name | test("\\.(tar\\.gz|tgz|tar\\.xz|zip)$"; "i")) then 0 else 1 end) }
+            ]
+            | sort_by(.rank, .name) | .[0]
+            | select(. != null)
+            | "\(.name)\t\(.browser_download_url)"' 2>/dev/null || true)
+
+          if [ -z "$SELECTED" ]; then
+            install_from_source "no release asset matches $OS/$ARCH"
+            exit 0
+          fi
+          ASSET_NAME=${SELECTED%%$'\t'*}
+          DOWNLOAD_URL=${SELECTED#*$'\t'}
+          echo "Selected release asset: $ASSET_NAME"
+          echo "Downloading dcg from: $DOWNLOAD_URL"
+
+          WORK=$(mktemp -d)
+          if ! curl -sSL --fail "$DOWNLOAD_URL" -o "$WORK/$ASSET_NAME"; then
+            install_from_source "download of $ASSET_NAME failed"
+            exit 0
+          fi
+
+          BIN=""
+          case "$ASSET_NAME" in
+            *.tar.gz|*.tgz) tar -xzf "$WORK/$ASSET_NAME" -C "$WORK" 2>/dev/null || true ;;
+            *.tar.xz)       tar -xJf "$WORK/$ASSET_NAME" -C "$WORK" 2>/dev/null || true ;;
+            *.zip)          unzip -qo "$WORK/$ASSET_NAME" -d "$WORK" 2>/dev/null || true ;;
+            *)              BIN="$WORK/$ASSET_NAME" ;;
+          esac
+          if [ -z "$BIN" ]; then
+            BIN=$(find "$WORK" -type f -name dcg | head -1)
+          fi
+
+          # The binary must be an ELF 64-bit x86-64 executable for this runner.
+          FILE_TYPE=$( [ -n "$BIN" ] && [ -s "$BIN" ] && file -b "$BIN" || echo "missing or empty" )
+          echo "file check: $FILE_TYPE"
+          if ! printf '%s' "$FILE_TYPE" | grep -q 'ELF 64-bit.*x86-64'; then
+            install_from_source "asset $ASSET_NAME is not an x86-64 ELF binary ($FILE_TYPE)"
+            exit 0
+          fi
+
+          sudo install -m 0755 "$BIN" /usr/local/bin/dcg
+          rm -rf "$WORK"
 
       - name: Verify dcg installation
         run: dcg --version
