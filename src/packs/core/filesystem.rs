@@ -333,6 +333,13 @@ enum BindingClass {
     /// segment) or a `$(mktemp ...)` invocation that can only create under
     /// that set.
     Safe,
+    /// An absolute literal at depth >= 2 below a home directory
+    /// (`/home/<user>/<a>/<b>`, `/root/<a>/<b>`, `$HOME/<a>/<b>`,
+    /// `${HOME}/<a>/<b>`, unquoted `~/<a>/<b>`) with no `.`/`..` segment and
+    /// no further expansion. Not a root or home path (WI-3172 fold r2, item
+    /// 21a): resolves like `Safe`. Depth 0 (the home itself) and depth 1
+    /// (`~/dev`, `~/.ssh`) stay `Home` / `Literal`.
+    HomeDeep,
     /// `$HOME`, `${HOME...}`, `$HOME/...` or unquoted `~` / `~/...`: expands
     /// to the home directory.
     Home,
@@ -614,7 +621,7 @@ fn strip_outer_quotes(token: &str) -> (QuoteKind, &str) {
 
 fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
     match path.origin {
-        PathOrigin::Binding(BindingClass::Safe) => return true,
+        PathOrigin::Binding(BindingClass::Safe | BindingClass::HomeDeep) => return true,
         PathOrigin::Binding(_) => return false,
         PathOrigin::Argv => {}
     }
@@ -684,7 +691,9 @@ fn path_is_root_home(path: &PathToken<'_>) -> bool {
 
     match path.origin {
         PathOrigin::Binding(BindingClass::Home) => return true,
-        PathOrigin::Binding(BindingClass::Safe | BindingClass::Unknown) => return false,
+        PathOrigin::Binding(
+            BindingClass::Safe | BindingClass::HomeDeep | BindingClass::Unknown,
+        ) => return false,
         // A literal binding is classified exactly like the literal in argv.
         PathOrigin::Binding(BindingClass::Literal) | PathOrigin::Argv => {}
     }
@@ -901,9 +910,56 @@ fn value_is_home(value: &str, quote: QuoteKind) -> bool {
     quote == QuoteKind::None && value.starts_with('~')
 }
 
+/// Depth of a home-rooted binding value below its home root, or `None` when
+/// the value is not a clean home-rooted literal. `/home/orca` => 0,
+/// `/home/orca/dev` => 1, `/home/orca/dev/_data` => 2; likewise `/root/...`,
+/// `$HOME/...`, `${HOME}/...` and unquoted `~/...`. Any `.`/`..` segment,
+/// a further `$`, a backtick or a backslash disqualifies the value (WI-3172
+/// fold r2, item 21a).
+fn home_binding_depth(value: &str, quote: QuoteKind) -> Option<usize> {
+    if value.contains(['`', '\\']) {
+        return None;
+    }
+    let rest = if let Some(rest) = value.strip_prefix("/root") {
+        rest
+    } else if let Some(rest) = value.strip_prefix("/home/") {
+        // Skip the user segment: `/home` and `/home/` have no home root.
+        let user_end = rest.find('/').unwrap_or(rest.len());
+        let user = &rest[..user_end];
+        if user.is_empty() || user == "." || user == ".." || user.contains('$') {
+            return None;
+        }
+        &rest[user_end..]
+    } else if quote == QuoteKind::Single {
+        return None;
+    } else if let Some(rest) = value
+        .strip_prefix("${HOME}")
+        .or_else(|| value.strip_prefix("$HOME"))
+    {
+        rest
+    } else if quote == QuoteKind::None {
+        value.strip_prefix('~')?
+    } else {
+        return None;
+    };
+    if !(rest.is_empty() || rest.starts_with('/')) || rest.contains('$') {
+        return None;
+    }
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.iter().any(|s| *s == "." || *s == "..") {
+        return None;
+    }
+    Some(segments.len())
+}
+
 fn classify_binding_value(value: &str, quote: QuoteKind) -> BindingClass {
     if value.is_empty() {
         return BindingClass::Unknown;
+    }
+    // Depth >= 2 below a home root is not a root or home path (item 21a);
+    // depth 0 and 1 fall through to the Home / Literal (Critical) classes.
+    if home_binding_depth(value, quote).is_some_and(|depth| depth >= 2) {
+        return BindingClass::HomeDeep;
     }
     if value_is_home(value, quote) {
         return BindingClass::Home;
@@ -1080,7 +1136,9 @@ fn resolve_var_target<'a>(
     }
     let bindings: Vec<&VarBinding<'a>> = scan.bindings.iter().filter(|b| b.name == name).collect();
     // Unsafe-binding check: a non-safe value anywhere in the command wins.
-    let unsafe_binding = bindings.iter().find(|b| b.class != BindingClass::Safe);
+    let unsafe_binding = bindings
+        .iter()
+        .find(|b| !matches!(b.class, BindingClass::Safe | BindingClass::HomeDeep));
     // Safe-binding check: otherwise the last safe binding before the rm.
     let chosen = match unsafe_binding {
         Some(binding) => *binding,
@@ -3709,9 +3767,7 @@ mod tests {
             r#"B="${HOME}"; rm -rf "$B""#,
             // X4: system-path binding.
             r#"B=/etc; rm -rf "$B""#,
-            // X5: Helm case 1 with its real binding: a path under /home stays
-            // denied, exactly as the literal `rm -rf /home/orca/...` is.
-            r#"B=/home/orca/dev/_data/aw2/r7-prerebase; rm -rf "$B"; mkdir -p "$B""#,
+            // X5 (Helm case 1) moved to the fold-r2 ALLOW fixtures (item 21a).
             // X6: re-bound to root after a safe binding (last binding wins).
             r#"B=/tmp/x; B=/; rm -rf "$B""#,
             // X7: unsafe binding anywhere in the command wins.
@@ -3784,6 +3840,149 @@ mod tests {
         assert_rm_parser_no_match(r#"B=/tmp/x rm -rf "$B""#);
     }
 
+    /// Fold r2 (item 21a) ALLOW fixtures H1, H3-H6: a binding at depth >= 2
+    /// below a home root is not a home path.
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_rm_variable_target_home_deep_binding_allows() {
+        for cmd in [
+            // H1: Helm case 1 verbatim binding, double-quoted reference.
+            r#"B=/home/orca/dev/_data/aw2/r7-prerebase; rm -rf "$B"; mkdir -p "$B""#,
+            // H3: $HOME-rooted, depth 3.
+            r#"D=$HOME/dev/_data/x; rm -rf "$D""#,
+            // H4: unquoted tilde, depth 3.
+            r#"D=~/dev/_data/x; rm -rf "$D""#,
+            // H5: braced ${HOME}, depth 2.
+            r#"D=${HOME}/a/b; rm -rf "$D""#,
+            // H6: /root is a home too.
+            r#"D=/root/a/b; rm -rf "$D""#,
+            // Exactly depth 2 under /home, trailing slash, double-quoted value.
+            r#"D=/home/orca/dev/_data/; rm -rf "$D""#,
+            r#"D="/home/orca/dev/_data"; rm -rf "$D""#,
+            // Single-quoted absolute home path needs no expansion.
+            "D='/home/orca/dev/_data'; rm -rf \"$D\"",
+        ] {
+            assert_rm_parser_allows(cmd);
+        }
+    }
+
+    /// Fold r2 bypass pins B1-B9: home itself, depth-1 children, root,
+    /// traversal and re-binding stay Critical.
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_rm_variable_target_home_shallow_binding_denies_critical() {
+        for cmd in [
+            // B1: the home itself (depth 0).
+            r#"B=/home/orca; rm -rf "$B""#,
+            r#"B=/home/orca/; rm -rf "$B""#,
+            // B2: tilde.
+            r#"B=~; rm -rf "$B""#,
+            // B3: root.
+            r#"B=/; rm -rf "$B""#,
+            // B4: depth 1 under /home/<user>.
+            r#"B=/home/orca/dev; rm -rf "$B""#,
+            // B5: depth-1 dotdir.
+            r#"B=~/.ssh; rm -rf "$B""#,
+            // B6: depth 1 via $HOME.
+            r#"B=$HOME/dev; rm -rf "$B""#,
+            r#"B=${HOME}/dev; rm -rf "$B""#,
+            // B7: traversal inside a deep value.
+            r#"B=/home/orca/dev/../..; rm -rf "$B""#,
+            r#"B=$HOME/dev/_data/../..; rm -rf "$B""#,
+            r#"B=/home/orca/./dev; rm -rf "$B""#,
+            // B8: re-bound to root after a deep home binding.
+            r#"B=/home/orca/dev/_data; B=/; rm -rf "$B""#,
+            // B9: /root itself and its depth-1 child.
+            r#"B=/root; rm -rf "$B""#,
+            r#"B=/root/x; rm -rf "$B""#,
+            // /home and /home/ have no home root: plain absolute literals.
+            r#"B=/home; rm -rf "$B""#,
+            r#"B=/home/; rm -rf "$B""#,
+        ] {
+            assert_rm_parser_denies(cmd, RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        }
+        // B10: a variable inside the value is unknown => High floor.
+        assert_rm_parser_denies(
+            r#"B=/home/$U/dev/_data; rm -rf "$B""#,
+            RM_RF_GENERAL_NAME,
+            Severity::High,
+        );
+        // H2: single-quoted reference does not expand; relative literal.
+        assert_rm_parser_denies(
+            "B=/home/orca/dev/_data/aw2/r7-prerebase; rm -rf '$B'",
+            RM_RF_GENERAL_NAME,
+            Severity::High,
+        );
+        // Single-quoted `~/a/b` and `$HOME/a/b` values do not expand either.
+        assert_rm_parser_denies(
+            "B='~/dev/_data'; rm -rf \"$B\"",
+            RM_RF_GENERAL_NAME,
+            Severity::High,
+        );
+        assert_rm_parser_denies(
+            "B='$HOME/dev/_data'; rm -rf \"$B\"",
+            RM_RF_GENERAL_NAME,
+            Severity::High,
+        );
+        // The LITERAL argv form is unchanged by this fold: still Critical.
+        assert_rm_parser_denies(
+            "rm -rf /home/orca/dev/_data/aw2/r7-prerebase",
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+    }
+
+    /// The three Helm-body false positives (WI-3172) all pass at head.
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_helm_wi3172_three_false_positives_pass() {
+        // Case 1 (double-quoted; the body's single quotes are a transcription).
+        assert_allows_command(
+            r#"B=/home/orca/dev/_data/aw2/r7-prerebase; rm -rf "$B"; mkdir -p "$B""#,
+        );
+        // Case 2.
+        assert_allows_command(r#"WT=/tmp/claude-1004/scratchpad/wt-3095; rm -rf "$WT""#);
+        // Case 3.
+        assert_allows_command(r#"W=$(mktemp -d); rm -rf -- "${W:?}""#);
+        // Unbound, the same three references keep the floor.
+        assert_denies_with_rule(r#"rm -rf "$B""#, "core.filesystem:rm-rf-general");
+        assert_denies_with_rule(r#"rm -rf "$WT""#, "core.filesystem:rm-rf-general");
+        assert_denies_with_rule(r#"rm -rf -- "${W:?}""#, "core.filesystem:rm-rf-general");
+    }
+
+    #[test]
+    fn test_home_binding_depth() {
+        let n = QuoteKind::None;
+        assert_eq!(home_binding_depth("/home/orca", n), Some(0));
+        assert_eq!(home_binding_depth("/home/orca/", n), Some(0));
+        assert_eq!(home_binding_depth("/home/orca/dev", n), Some(1));
+        assert_eq!(home_binding_depth("/home/orca/dev/_data", n), Some(2));
+        assert_eq!(home_binding_depth("/root", n), Some(0));
+        assert_eq!(home_binding_depth("/root/a/b", n), Some(2));
+        assert_eq!(home_binding_depth("$HOME/a/b", n), Some(2));
+        assert_eq!(
+            home_binding_depth("${HOME}/a/b", QuoteKind::Double),
+            Some(2)
+        );
+        assert_eq!(home_binding_depth("~/a/b", n), Some(2));
+        assert_eq!(home_binding_depth("~/a/b", QuoteKind::Double), None);
+        assert_eq!(home_binding_depth("$HOME/a/b", QuoteKind::Single), None);
+        assert_eq!(
+            home_binding_depth("/home/orca/a/b", QuoteKind::Single),
+            Some(2)
+        );
+        assert_eq!(home_binding_depth("/home", n), None);
+        assert_eq!(home_binding_depth("/home/", n), None);
+        assert_eq!(home_binding_depth("/home/../etc/x", n), None);
+        assert_eq!(home_binding_depth("/home/orca/../x/y", n), None);
+        assert_eq!(home_binding_depth("/home/$U/a/b", n), None);
+        assert_eq!(home_binding_depth("$HOMEX/a/b", n), None);
+        assert_eq!(home_binding_depth("${HOME:-/}/a/b", n), None);
+        assert_eq!(home_binding_depth("/rootfs/a/b", n), None);
+        assert_eq!(home_binding_depth("/home/orca/a\\ b/c", n), None);
+        assert_eq!(home_binding_depth("/etc/a/b", n), None);
+    }
+
     /// `--` no longer hides the paths after it from classification.
     #[test]
     fn test_rm_parser_terminator_is_transparent() {
@@ -3801,8 +4000,12 @@ mod tests {
         assert_allows_command(r#"W=$(mktemp -d); rm -rf -- "${W:?}""#);
         assert_allows_command(r#"export W=/tmp/w1; rm -rf "$W""#);
         assert_denies_with_rule(r#"B=/; rm -rf "$B""#, "core.filesystem:rm-rf-root-home");
-        assert_denies_with_rule(
+        // Fold r2: Helm case 1 passes end to end; its depth-1 parent denies.
+        assert_allows_command(
             r#"B=/home/orca/dev/_data/aw2/r7-prerebase; rm -rf "$B"; mkdir -p "$B""#,
+        );
+        assert_denies_with_rule(
+            r#"B=/home/orca/dev; rm -rf "$B""#,
             "core.filesystem:rm-rf-root-home",
         );
         assert_denies_with_rule(
