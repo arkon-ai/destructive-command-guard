@@ -134,7 +134,7 @@ jobs:
           fi
 
           sudo install -m 0755 "$BIN" /usr/local/bin/dcg
-          rm -rf "$WORK"
+          # No cleanup of $WORK: the GitHub runner workspace and mktemp -d under RUNNER_TEMP are ephemeral.
 
       - name: Verify dcg installation
         run: dcg --version
