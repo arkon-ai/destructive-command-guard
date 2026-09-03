@@ -709,6 +709,103 @@ mod tests {
         assert_blocks_with_pattern(&pack, "git restore -W \"src/main.rs\"", "restore-worktree");
     }
 
+    // Strict r1 Major 1 (fold r2): a quoted value stored for later execution
+    // is deferred execution, never content.
+    #[test]
+    fn test_wi3107_fold_deferred_assignment_execution_blocks() {
+        let pack = create_pack();
+
+        assert_blocks_with_pattern(
+            &pack,
+            "X=\"git restore --worktree .\"; $X",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "GIT_CMD=\"git restore --worktree .\"; eval \"$GIT_CMD\"",
+            "restore-worktree",
+        );
+        // Siblings: single-quoted value, quoted variable command word,
+        // unquoted eval, export.
+        assert_blocks_with_pattern(
+            &pack,
+            "X='git restore --worktree .'; \"$X\"",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "GIT_CMD=\"git restore -W .\"; eval $GIT_CMD",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "export X=\"git restore --worktree .\"; $X",
+            "restore-worktree",
+        );
+    }
+
+    // Strict r1 Major 2 (fold r2): non-shell interpreters execute quoted
+    // program text outside the `-c` / `-e` inline-code route.
+    #[test]
+    fn test_wi3107_fold_non_shell_interpreter_blocks() {
+        let pack = create_pack();
+
+        assert_blocks_with_pattern(
+            &pack,
+            "awk 'BEGIN{system(\"git restore --worktree .\")}'",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gawk 'BEGIN{system(\"git restore --worktree .\")}'",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "perl -e 'system(\"git restore --worktree .\")'",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "busybox ash -c \"git restore --worktree .\" && git status",
+            "restore-worktree",
+        );
+    }
+
+    // Strict r1 Major 3 (fold r2): a process substitution anywhere marks
+    // the whole command executing; a pipe into an executor marks its
+    // upstream segments executing.
+    #[test]
+    fn test_wi3107_fold_process_substitution_blocks() {
+        let pack = create_pack();
+
+        assert_blocks_with_pattern(
+            &pack,
+            "echo \"git restore --worktree .\" | tee >(bash)",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "cat <(echo \"git restore --worktree .\") | sh",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "tee >(sh) <<< \"git restore --worktree .\"",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "echo \"git restore --worktree .\" | xargs -0 sh -c",
+            "restore-worktree",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "echo \"git restore --worktree .\" | cat | bash",
+            "restore-worktree",
+        );
+    }
+
     #[test]
     fn test_branch_force_medium() {
         // Branch force delete is Medium severity (recoverable via reflog)
