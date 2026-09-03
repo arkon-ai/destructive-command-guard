@@ -1062,110 +1062,253 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     ]
 }
 
-/// Command words that execute a quoted string (or piped text) as code on
-/// THIS host without going through the classifier's `-c`/`-e` InlineCode
-/// route. Any live (unquoted) occurrence of one of these in a segment means
-/// a quoted `>` in that segment is a real local redirect and gets no
-/// quoted-text shield. Shells are listed explicitly (no `*sh` suffix
-/// heuristic: `ssh` ends in `sh` and is handled by the loopback check).
-const REDIRECT_LOCAL_EXECUTORS: &[&str] = &[
-    // shells
-    "bash",
-    "sh",
-    "zsh",
-    "ksh",
-    "dash",
-    "fish",
-    "ash",
-    "csh",
-    "tcsh",
-    "rbash",
-    "mksh",
-    "pdksh",
-    "yash",
-    "busybox", // shell builtins that run text
-    "eval",
-    "exec",
-    "source",
-    ".", // programs that run a string / stdin through a local shell
-    "xargs",
-    "su",
-    "runuser",
-    "watch",
-    "script",
-    "expect",
-    "tclsh",
-    "wish",
-    "osascript",
-    "screen",
-    "tmux",
-    "nsenter",
-    "unshare",
-    "chroot",
-    "parallel",
-    "at",
-    "batch",
-    "crontab",
-    "systemd-run",
-    "find",
-    "flock",
-    "strace",
-    "ltrace", // interpreters whose program text can open files
-    "awk",
-    "gawk",
-    "mawk",
-    "nawk",
-    "perl",
-    "python",
-    "python2",
-    "python3",
-    "ruby",
-    "node",
-    "nodejs",
-    "deno",
-    "bun",
-    "lua",
-    "php",
+/// Command words whose QUOTED ARGUMENTS are content — data the program
+/// carries somewhere else (a message body, a pattern, an HTTP payload, a
+/// remote host's command line) and never runs as code on THIS machine.
+///
+/// This list is an ALLOWLIST and it is the whole security boundary of the
+/// `redirect-truncate-root-home` scan view: **the default is fail CLOSED**.
+/// If a segment's command word is not on this list — an unknown program, a
+/// substitution (`$SHELL`, `${SHELL}`, `$(...)`), a quote- or
+/// backslash-obfuscated name (`"sh"`, `s\h`), an interpreter
+/// (`python3 run.py`), or a string-executing program (`git submodule
+/// foreach`, `ansible -m shell`, `nix-shell --run`, `npx -c`, `gdb -ex`,
+/// `sed …/e`) — the segment is left completely UNMASKED and the raw regex
+/// decides exactly as it did before this rule grew a scan view, i.e. it
+/// denies. Adding a name here is a security decision; leaving one out only
+/// costs a conservative denial.
+///
+/// Membership is necessary but not sufficient: `git`, `gh`, `curl`, `wget`,
+/// `sed`, `ssh`, `scp` and `sftp` carry extra conditions checked in
+/// `content_command_carries_data` (a `git` subcommand must be a message
+/// subcommand, an `ssh` destination must be a genuine remote host, and so
+/// on). `cat`/`tee`/`less` bodies arrive here already heredoc-masked by
+/// `crate::heredoc::mask_non_executing_heredocs`.
+const REDIRECT_CONTENT_COMMANDS: &[&str] = &[
+    // message/notification senders and printers: quoted args are prose
+    "orca", "echo", "printf",
+    // structured-text filters: quoted args are programs for a pure,
+    // non-executing expression language
+    "jq", // pattern matchers: quoted args are regexes over file content
+    "grep", "egrep", "fgrep", "rg", "ripgrep",
+    // sed: quoted args are a script — only when it cannot execute (no `e`)
+    "sed", // non-executing sinks/pagers (heredoc bodies already masked upstream)
+    "cat", "tee", "less",
+    // VCS / forge clients: only their message-carrying subcommands
+    "git", "gh", // HTTP clients: only their request-body payloads
+    "curl", "wget", // remote shells: the payload runs on the DESTINATION host
+    "ssh", "scp", "sftp",
 ];
 
-/// Wrappers that exec their ARGUMENT VECTOR directly (no shell), so the
-/// inner command word decides: `sudo echo "use > ~/file"` is content,
-/// `sudo sh -c '> /etc/passwd'` is local execution (the `sh` word is live).
-/// `sudo`/`doas` with a shell-mode flag (`-s`, `-i`) and `env -S` run text
-/// through a shell and count as executors themselves.
-const REDIRECT_TRANSPARENT_WRAPPERS: &[&str] = &[
-    "sudo", "doas", "env", "timeout", "nohup", "nice", "ionice", "time", "command", "setsid",
-    "stdbuf",
+/// `-o`/`-O` option keys an `ssh`/`scp`/`sftp` invocation may carry while its
+/// quoted payload still counts as content. Anything else (`ProxyCommand`,
+/// `LocalCommand`, `PermitLocalCommand`, `Match exec`, `ProxyJump` with a
+/// command, or any key not listed) can run a command through a LOCAL shell,
+/// so it makes the payload non-content. `Host`/`HostName` are listed but
+/// their value is additionally checked for locality; `ForwardAgent` is only
+/// safe as `no`.
+const SSH_SAFE_OPTION_KEYS: &[&str] = &[
+    "port",
+    "user",
+    "identityfile",
+    "identitiesonly",
+    "stricthostkeychecking",
+    "userknownhostsfile",
+    "connecttimeout",
+    "serveraliveinterval",
+    "batchmode",
+    "loglevel",
+    "forwardagent",
+    "host",
+    "hostname",
 ];
 
-/// Remote-shell clients: their quoted payload runs on the DESTINATION host,
-/// which is content unless the destination is this host (loopback, the
-/// machine's own name, or a substitution that could name it).
-const REDIRECT_REMOTE_SHELLS: &[&str] = &["ssh", "scp", "sftp"];
+/// A wrapper that execs its ARGUMENT VECTOR directly (no shell), so the
+/// INNER command word decides whether the quoted text is content:
+/// `sudo echo "use > ~/file"` is content, `sudo sh -c '> /etc/passwd'` is
+/// local execution. Each wrapper's own option scan stops at its first
+/// operand, so a flag that belongs to the inner program is never read as the
+/// wrapper's (`sudo grep -i "note: date > ~/stamp" file` is grep's `-i`, not
+/// sudo's shell mode).
+struct WrapperSpec {
+    name: &'static str,
+    /// Short option letters that consume the rest of the cluster, or the
+    /// next word, as their value.
+    arg_short: &'static [u8],
+    /// Long option names (without `--`) that consume the next word.
+    arg_long: &'static [&'static str],
+    /// Short letters that put the wrapper itself into shell-string mode
+    /// (`sudo -s`, `sudo -i`, `env -S`) — then the wrapper IS the executor.
+    shell_short: &'static [u8],
+    /// Long options that put the wrapper into shell-string mode.
+    shell_long: &'static [&'static str],
+    /// Non-option operands consumed before the inner command word
+    /// (`timeout <duration> cmd`).
+    pre_operands: usize,
+}
 
-/// A whitespace/metacharacter-delimited word of a segment. `live` is true
-/// when the word starts outside quotes (or inside a `$(...)`/backtick
-/// substitution, which the shell runs locally even inside double quotes);
-/// a word that starts with a quote character is quoted content.
+const REDIRECT_TRANSPARENT_WRAPPERS: &[WrapperSpec] = &[
+    WrapperSpec {
+        name: "sudo",
+        arg_short: b"ugpChDRTU",
+        arg_long: &[
+            "user",
+            "group",
+            "prompt",
+            "chdir",
+            "other-user",
+            "host",
+            "close-from",
+            "command-timeout",
+        ],
+        shell_short: b"si",
+        shell_long: &["shell", "login"],
+        pre_operands: 0,
+    },
+    WrapperSpec {
+        name: "doas",
+        arg_short: b"CuL",
+        arg_long: &[],
+        shell_short: b"si",
+        shell_long: &["shell", "login"],
+        pre_operands: 0,
+    },
+    WrapperSpec {
+        name: "env",
+        arg_short: b"uC",
+        arg_long: &["unset", "chdir"],
+        shell_short: b"S",
+        shell_long: &["split-string"],
+        pre_operands: 0,
+    },
+    WrapperSpec {
+        name: "timeout",
+        arg_short: b"sk",
+        arg_long: &["signal", "kill-after"],
+        shell_short: b"",
+        shell_long: &[],
+        pre_operands: 1,
+    },
+    WrapperSpec {
+        name: "nohup",
+        arg_short: b"",
+        arg_long: &[],
+        shell_short: b"",
+        shell_long: &[],
+        pre_operands: 0,
+    },
+    WrapperSpec {
+        name: "nice",
+        arg_short: b"n",
+        arg_long: &["adjustment"],
+        shell_short: b"",
+        shell_long: &[],
+        pre_operands: 0,
+    },
+    WrapperSpec {
+        name: "ionice",
+        arg_short: b"cnpPu",
+        arg_long: &["class", "classdata", "pid", "pgid", "uid"],
+        shell_short: b"",
+        shell_long: &[],
+        pre_operands: 0,
+    },
+    WrapperSpec {
+        name: "time",
+        arg_short: b"fo",
+        arg_long: &["format", "output"],
+        shell_short: b"",
+        shell_long: &[],
+        pre_operands: 0,
+    },
+    WrapperSpec {
+        name: "command",
+        arg_short: b"",
+        arg_long: &[],
+        shell_short: b"",
+        shell_long: &[],
+        pre_operands: 0,
+    },
+    WrapperSpec {
+        name: "setsid",
+        arg_short: b"",
+        arg_long: &[],
+        shell_short: b"",
+        shell_long: &[],
+        pre_operands: 0,
+    },
+    WrapperSpec {
+        name: "stdbuf",
+        arg_short: b"ioe",
+        arg_long: &["input", "output", "error"],
+        shell_short: b"",
+        shell_long: &[],
+        pre_operands: 0,
+    },
+];
+
+/// A whitespace/metacharacter-delimited word of a pipeline stage. `live` is
+/// true when the word starts OUTSIDE quotes; a word that starts with a quote
+/// character is quoted content and can never be a command word.
 struct SegmentWord<'a> {
     text: &'a str,
     live: bool,
-    /// Byte offset just past the word within the segment.
-    end: usize,
 }
 
-/// Split a segment into words. Unquoted whitespace and the metacharacters
-/// `| & ; ( ) { }` and backtick end a word, so `"> ~/x"|bash`, `(sh -c`
-/// and `{ sh -c` all surface their command words. Quoted runs stay one
-/// word (they are content, never a command word) except that a `$(` inside
-/// double quotes opens a live substitution.
-fn segment_words(segment: &str) -> Vec<SegmentWord<'_>> {
-    let bytes = segment.as_bytes();
-    let mut words = Vec::new();
-    let (mut in_single, mut in_double, mut in_backtick) = (false, false, false);
-    let mut subst_depth = 0usize;
-    let mut word_start: Option<(usize, bool)> = None;
-    let mut i = 0usize;
+/// Index just past the `$(...)` or backtick substitution that starts at `at`.
+/// Returns `bytes.len()` for an unterminated substitution.
+fn skip_substitution(bytes: &[u8], at: usize) -> usize {
+    if bytes[at] == b'`' {
+        let mut i = at + 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'`' => return i + 1,
+                _ => i += 1,
+            }
+        }
+        return bytes.len();
+    }
+    // `$(`
+    let mut depth = 1usize;
+    let mut i = at + 2;
+    let (mut in_single, mut in_double) = (false, false);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && !in_single {
+            i += 2;
+            continue;
+        }
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'(' if !in_single && !in_double => depth += 1,
+            b')' if !in_single && !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Split a segment into PIPELINE STAGES of words. A new stage starts at the
+/// beginning of the segment and after every live `|`, `&`, `;`, `(`, `)`,
+/// `{`, `}`, so `echo '> /etc/passwd' | "sh"`, `(sh -c …)` and
+/// `{ sh -c …; }` each surface the shell as a stage of its own — the segment
+/// only counts as content when EVERY stage is content.
+///
+/// A `$(...)`/backtick substitution is absorbed into the word it touches
+/// rather than opened as a stage: the classifier emits the whole
+/// substitution as one `InlineCode` span, which this scan view never masks
+/// (so a redirect inside it is already visible to the raw regex), while a
+/// word that merely CONTAINS a substitution (`user@$(uname -n)`, `$SHELL`)
+/// must fail closed as a command word or host.
+fn segment_stages(segment: &str) -> Vec<Vec<SegmentWord<'_>>> {
     fn end_word<'a>(
         segment: &'a str,
         start: &mut Option<(usize, bool)>,
@@ -1178,42 +1321,52 @@ fn segment_words(segment: &str) -> Vec<SegmentWord<'_>> {
             words.push(SegmentWord {
                 text: &segment[s..at],
                 live,
-                end: at,
             });
         }
     }
+
+    let bytes = segment.as_bytes();
+    let mut stages: Vec<Vec<SegmentWord<'_>>> = vec![Vec::new()];
+    let (mut in_single, mut in_double) = (false, false);
+    let mut word_start: Option<(usize, bool)> = None;
+    let mut i = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
-        let live = (!in_single && !in_double) || subst_depth > 0 || in_backtick;
+        let quoted = in_single || in_double;
         if b == b'\\' && !in_single {
             if word_start.is_none() {
-                word_start = Some((i, live));
+                word_start = Some((i, !quoted));
             }
             i += 2;
             continue;
         }
-        if !in_single && b == b'$' && bytes.get(i + 1) == Some(&b'(') {
-            end_word(segment, &mut word_start, i, &mut words);
-            subst_depth += 1;
-            i += 2;
+        if !in_single && ((b == b'$' && bytes.get(i + 1) == Some(&b'(')) || b == b'`') {
+            if word_start.is_none() {
+                word_start = Some((i, !quoted));
+            }
+            i = skip_substitution(bytes, i);
             continue;
         }
-        if !in_single && b == b'`' {
-            end_word(segment, &mut word_start, i, &mut words);
-            in_backtick = !in_backtick;
-            i += 1;
-            continue;
-        }
-        if live {
+        if !quoted {
             match b {
-                b' ' | b'\t' | b'\n' | b'\r' | b'|' | b'&' | b';' | b'(' | b'{' | b'}' => {
-                    end_word(segment, &mut word_start, i, &mut words);
+                b' ' | b'\t' | b'\n' | b'\r' => {
+                    end_word(
+                        segment,
+                        &mut word_start,
+                        i,
+                        stages.last_mut().expect("stages is never empty"),
+                    );
                     i += 1;
                     continue;
                 }
-                b')' => {
-                    end_word(segment, &mut word_start, i, &mut words);
-                    subst_depth = subst_depth.saturating_sub(1);
+                b'|' | b'&' | b';' | b'(' | b')' | b'{' | b'}' => {
+                    end_word(
+                        segment,
+                        &mut word_start,
+                        i,
+                        stages.last_mut().expect("stages is never empty"),
+                    );
+                    stages.push(Vec::new());
                     i += 1;
                     continue;
                 }
@@ -1221,8 +1374,7 @@ fn segment_words(segment: &str) -> Vec<SegmentWord<'_>> {
             }
         }
         if word_start.is_none() {
-            // A word beginning with a quote is quoted content.
-            word_start = Some((i, live && b != b'\'' && b != b'"'));
+            word_start = Some((i, !quoted && b != b'\'' && b != b'"'));
         }
         match b {
             b'\'' if !in_double => in_single = !in_single,
@@ -1231,28 +1383,538 @@ fn segment_words(segment: &str) -> Vec<SegmentWord<'_>> {
         }
         i += 1;
     }
-    end_word(segment, &mut word_start, bytes.len(), &mut words);
-    words
+    end_word(
+        segment,
+        &mut word_start,
+        bytes.len(),
+        stages.last_mut().expect("stages is never empty"),
+    );
+    stages
 }
 
-/// Reduce a word to its command name: strip shell sugar (`!`, `$`, quotes),
-/// then any directory prefix. `!sh` / `$HOME/bin/sh` / `"sh"` → `sh`.
-fn command_name(word: &str) -> &str {
-    let word = word.trim_matches(|c: char| matches!(c, '!' | '$' | '"' | '\'' | ';' | ')'));
-    word.rsplit(['/', '\\']).next().unwrap_or(word)
+/// Strip one layer of surrounding quotes.
+fn unquote(text: &str) -> &str {
+    text.trim_matches(|c| c == '"' || c == '\'')
 }
 
-/// Bare short-flag cluster (`-s`, `-Es`) containing one of `letters`.
-fn short_flag_has(word: &str, letters: &[u8]) -> bool {
-    word.len() > 1
-        && word.starts_with('-')
-        && !word.starts_with("--")
-        && word.bytes().skip(1).any(|b| letters.contains(&b))
+/// `NAME=value` environment prefix (`FOO=1 sh -c …`, `env FOO=1 …`).
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Reduce a command word to the program name to look up in
+/// `REDIRECT_CONTENT_COMMANDS`, or `None` when no literal name can be
+/// resolved.
+///
+/// Two rules, both load-bearing:
+/// 1. A word containing `$` or a backtick (`$SHELL`, `${SHELL}`,
+///    `$(which sh)`) names a program that is UNKNOWN at scan time, and an
+///    unknown program is never content — fail closed.
+/// 2. Quotes and backslash escapes are DEQUOTED (`"sh"` → `sh`, `s'h'` →
+///    `sh`, `s\h` → `sh`), mirroring `crate::normalize`'s
+///    `dequote_segment_command_words`, which the shipped entry point applies
+///    before pack evaluation. Dequoting rather than failing closed is what
+///    makes the pack API and the production path give the SAME answer: the
+///    dequoted name is then looked up in an allowlist of non-executing
+///    programs, so an obfuscated `sh` still misses the list and denies while
+///    an obfuscated `"orca"` is content at both layers.
+fn content_command_word(word: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if word.is_empty() || word.bytes().any(|b| matches!(b, b'$' | b'`')) {
+        return None;
+    }
+    let dequoted: std::borrow::Cow<'_, str> =
+        if word.bytes().any(|b| matches!(b, b'\'' | b'"' | b'\\')) {
+            let mut out = String::with_capacity(word.len());
+            let mut chars = word.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\'' | '"' => {}
+                    '\\' => {
+                        if let Some(next) = chars.next() {
+                            out.push(next);
+                        }
+                    }
+                    _ => out.push(c),
+                }
+            }
+            std::borrow::Cow::Owned(out)
+        } else {
+            std::borrow::Cow::Borrowed(word)
+        };
+    let name = match dequoted {
+        std::borrow::Cow::Borrowed(s) => {
+            let s = s.trim_start_matches('!');
+            std::borrow::Cow::Borrowed(s.rsplit('/').next().unwrap_or(s))
+        }
+        std::borrow::Cow::Owned(s) => {
+            let trimmed = s.trim_start_matches('!');
+            let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+            std::borrow::Cow::Owned(base.to_string())
+        }
+    };
+    (!name.is_empty()).then_some(name)
+}
+
+/// Index of the inner command word that a transparent wrapper will exec, or
+/// `None` when the wrapper itself runs a shell string (`sudo -s`, `env -S`).
+/// Only the option words BEFORE the wrapper's first operand are inspected.
+fn wrapper_inner_start(
+    spec: &WrapperSpec,
+    words: &[SegmentWord<'_>],
+    from: usize,
+) -> Option<usize> {
+    let mut pre = spec.pre_operands;
+    let mut i = from;
+    while let Some(word) = words.get(i) {
+        if !word.live {
+            return Some(i);
+        }
+        let text = word.text;
+        if text == "--" {
+            return Some(i + 1);
+        }
+        if let Some(long) = text.strip_prefix("--") {
+            let key = long.split('=').next().unwrap_or(long);
+            if spec.shell_long.contains(&key) {
+                return None;
+            }
+            i += 1;
+            if !long.contains('=') && spec.arg_long.contains(&key) {
+                i += 1;
+            }
+            continue;
+        }
+        if text.len() > 1 && text.starts_with('-') {
+            let cluster = &text[1..];
+            if cluster.bytes().any(|b| spec.shell_short.contains(&b)) {
+                return None;
+            }
+            i += 1;
+            if let Some(pos) = cluster.bytes().position(|b| spec.arg_short.contains(&b))
+                && pos + 1 == cluster.len()
+            {
+                i += 1;
+            }
+            continue;
+        }
+        if is_assignment(text) {
+            i += 1;
+            continue;
+        }
+        if pre > 0 {
+            pre -= 1;
+            i += 1;
+            continue;
+        }
+        return Some(i);
+    }
+    Some(i)
+}
+
+/// Whether ONE pipeline stage's quoted text is content: its command word
+/// (reached through any number of transparent wrappers) must be an
+/// allowlisted content-bearing program and must satisfy that program's extra
+/// conditions. A stage with nothing to run is vacuously content; a
+/// substituted command word never is.
+fn stage_is_content(words: &[SegmentWord<'_>], own_hostname: Option<&str>) -> bool {
+    let mut idx = 0usize;
+    loop {
+        while words
+            .get(idx)
+            .is_some_and(|w| w.live && (w.text == "!" || is_assignment(w.text)))
+        {
+            idx += 1;
+        }
+        let Some(word) = words.get(idx) else {
+            return true;
+        };
+        let Some(name) = content_command_word(word.text) else {
+            return false;
+        };
+        let name = name.as_ref();
+        if let Some(spec) = REDIRECT_TRANSPARENT_WRAPPERS
+            .iter()
+            .find(|s| s.name == name)
+        {
+            match wrapper_inner_start(spec, words, idx + 1) {
+                Some(next) => {
+                    idx = next;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        return REDIRECT_CONTENT_COMMANDS.contains(&name)
+            && content_command_carries_data(name, &words[idx + 1..], own_hostname);
+    }
+}
+
+/// The per-program conditions behind `REDIRECT_CONTENT_COMMANDS`.
+fn content_command_carries_data(
+    name: &str,
+    rest: &[SegmentWord<'_>],
+    own_hostname: Option<&str>,
+) -> bool {
+    match name {
+        "orca" | "echo" | "printf" | "jq" | "grep" | "egrep" | "fgrep" | "rg" | "ripgrep"
+        | "cat" | "tee" | "less" => true,
+        "sed" => !rest.iter().any(|w| sed_arg_executes(w.text)),
+        "git" => git_carries_message(rest),
+        "gh" => gh_carries_body(rest),
+        "curl" | "wget" => http_client_sends_payload(rest),
+        "ssh" | "scp" | "sftp" => remote_shell_payload_is_content(name, rest, own_hostname),
+        _ => false,
+    }
+}
+
+/// A `sed` argument that can make sed run a shell command: the `e` command,
+/// or an `s///e` substitution flag. `sed 's|x|…|e'` executes its result.
+fn sed_arg_executes(word: &str) -> bool {
+    let raw = unquote(word);
+    if let Some(script) = raw.strip_prefix("--expression=") {
+        return sed_script_executes(unquote(script));
+    }
+    if let Some(script) = raw.strip_prefix("-e") {
+        return !script.is_empty() && sed_script_executes(unquote(script));
+    }
+    if raw.starts_with('-') {
+        return false;
+    }
+    sed_script_executes(raw)
+}
+
+fn sed_script_executes(script: &str) -> bool {
+    for piece in script.split([';', '\n']) {
+        let bytes = piece
+            .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '{' | '}' | '!'))
+            .as_bytes();
+        let mut i = 0usize;
+        // Skip any line/regex address in front of the command letter.
+        while i < bytes.len() {
+            match bytes[i] {
+                b'$' | b',' | b'+' | b'~' | b' ' | b'\t' => i += 1,
+                d if d.is_ascii_digit() => i += 1,
+                b'/' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        let hit = bytes[i] == b'/';
+                        i += 1;
+                        if hit {
+                            break;
+                        }
+                    }
+                }
+                b'\\' if i + 1 < bytes.len() => {
+                    let delim = bytes[i + 1];
+                    i += 2;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        let hit = bytes[i] == delim;
+                        i += 1;
+                        if hit {
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        match bytes.get(i) {
+            Some(b'e') => return true,
+            Some(b's') if sed_substitution_has_e_flag(&bytes[i..]) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `s<delim>pattern<delim>replacement<delim>flags` with `e` among the flags.
+fn sed_substitution_has_e_flag(bytes: &[u8]) -> bool {
+    let Some(&delim) = bytes.get(1) else {
+        return false;
+    };
+    if delim.is_ascii_alphanumeric() || delim == b'\\' || delim.is_ascii_whitespace() {
+        return false;
+    }
+    let mut seen = 0usize;
+    let mut i = 1usize;
+    while i < bytes.len() && seen < 3 {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == delim {
+            seen += 1;
+        }
+        i += 1;
+    }
+    seen == 3
+        && bytes[i..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric())
+            .any(|&b| b == b'e')
+}
+
+/// Global `git` options that consume the following word as their value.
+const GIT_GLOBAL_ARG_OPTIONS: &[&str] = &[
+    "-c",
+    "-C",
+    "--exec-path",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+    "--super-prefix",
+];
+
+/// `git` is content only for its message-carrying subcommands carrying a
+/// message payload: `git commit`/`tag`/`notes`/`stash` with `-m`/`--message`/
+/// `-F`/`--file`. `git submodule foreach '…'`, `git config alias.x '!…'` and
+/// every other subcommand are NOT content and keep denying.
+///
+/// Global options in front of the subcommand are SKIPPED, not fail-closed,
+/// including `-c alias.x=!sh`: defining an alias does not run it, and the
+/// invocation that WOULD run it (`git x`) has a subcommand that is not a
+/// message subcommand and therefore denies. Failing closed here would also
+/// contradict the shipped path, which treats a `git commit -m` payload as
+/// data upstream of this rule (verified unchanged from base `0a38dee`).
+fn git_carries_message(rest: &[SegmentWord<'_>]) -> bool {
+    let live: Vec<&str> = rest.iter().filter(|w| w.live).map(|w| w.text).collect();
+    let mut idx = 0usize;
+    while let Some(&text) = live.get(idx) {
+        if !text.starts_with('-') {
+            break;
+        }
+        idx += 1;
+        if !text.contains('=') && GIT_GLOBAL_ARG_OPTIONS.contains(&text) {
+            idx += 1;
+        }
+    }
+    let Some(&subcommand) = live.get(idx) else {
+        return false;
+    };
+    if !matches!(subcommand, "commit" | "tag" | "notes" | "stash") {
+        return false;
+    }
+    live[idx + 1..].iter().any(|text| {
+        matches!(*text, "-m" | "--message" | "-F" | "--file")
+            || text.starts_with("--message=")
+            || text.starts_with("--file=")
+    })
+}
+
+/// `gh` is content only for issue/PR/release text subcommands carrying a
+/// `--body`/`--title` payload.
+fn gh_carries_body(rest: &[SegmentWord<'_>]) -> bool {
+    let mut subcommand: Option<&str> = None;
+    let mut has_body = false;
+    for word in rest.iter().filter(|w| w.live) {
+        let text = word.text;
+        if subcommand.is_none() {
+            if text.starts_with('-') {
+                return false;
+            }
+            subcommand = Some(text);
+            continue;
+        }
+        let key = text.split('=').next().unwrap_or(text);
+        if matches!(
+            key,
+            "-b" | "--body" | "--body-file" | "-F" | "-t" | "--title" | "--notes"
+        ) {
+            has_body = true;
+        }
+    }
+    has_body && matches!(subcommand, Some("issue" | "pr" | "release" | "gist"))
+}
+
+/// `curl`/`wget` are content only when the quoted text is a request BODY.
+/// An output option (`-o`, `-O`, `--output`) or a config/upload file makes
+/// the invocation something other than a pure payload carrier.
+fn http_client_sends_payload(rest: &[SegmentWord<'_>]) -> bool {
+    let mut has_data = false;
+    for word in rest.iter().filter(|w| w.live) {
+        let key = word.text.split('=').next().unwrap_or(word.text);
+        if matches!(
+            key,
+            "-d" | "--data"
+                | "--data-raw"
+                | "--data-binary"
+                | "--data-ascii"
+                | "--data-urlencode"
+                | "--post-data"
+                | "--body-data"
+        ) {
+            has_data = true;
+            continue;
+        }
+        if matches!(
+            key,
+            "-o" | "-O"
+                | "-K"
+                | "-T"
+                | "--output"
+                | "--output-dir"
+                | "--remote-name"
+                | "--config"
+                | "--upload-file"
+        ) {
+            return false;
+        }
+    }
+    has_data
+}
+
+/// Whether an `ssh`/`scp`/`sftp` invocation's quoted payload runs on ANOTHER
+/// machine. Content requires all three: a destination that names a genuine
+/// remote host, no `-o`/`-O` option outside `SSH_SAFE_OPTION_KEYS`
+/// (`ProxyCommand`/`LocalCommand` run through a LOCAL shell), and no
+/// command-shaped `-J`/`-W`/`-L`/`-R`/`-D` value. Nothing proved remote =
+/// not content.
+fn remote_shell_payload_is_content(
+    client: &str,
+    rest: &[SegmentWord<'_>],
+    own_hostname: Option<&str>,
+) -> bool {
+    let takes_arg: &[u8] = match client {
+        "scp" => b"cFiJloPSD",
+        "sftp" => b"BbcDFiJloPRSsX",
+        _ => b"bcDEeFIiJLlmOopQRSWwB",
+    };
+    let mut found_remote = false;
+    let mut idx = 0usize;
+    while idx < rest.len() {
+        let word = &rest[idx];
+        idx += 1;
+        if !word.live {
+            continue;
+        }
+        let text = word.text;
+        if text == "--" {
+            continue;
+        }
+        if let Some(cluster) = text
+            .strip_prefix('-')
+            .filter(|c| !c.is_empty() && !c.starts_with('-'))
+        {
+            let mut value: Option<&str> = None;
+            let mut taking: Option<u8> = None;
+            for (pos, letter) in cluster.bytes().enumerate() {
+                if takes_arg.contains(&letter) {
+                    taking = Some(letter);
+                    value = if pos + 1 < cluster.len() {
+                        Some(&cluster[pos + 1..])
+                    } else {
+                        let next = rest.get(idx).map(|w| w.text);
+                        idx += 1;
+                        next
+                    };
+                    break;
+                }
+            }
+            match taking {
+                Some(b'o' | b'O') => {
+                    let Some(value) = value else { return false };
+                    if !ssh_option_is_safe(value, own_hostname) {
+                        return false;
+                    }
+                }
+                Some(b'J' | b'W' | b'L' | b'R' | b'D') => {
+                    let Some(value) = value else { return false };
+                    if ssh_value_is_command_shaped(value) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if text.starts_with("--") {
+            continue;
+        }
+        if client == "ssh" {
+            // The first non-option operand is the destination; everything
+            // after it is the remote command line.
+            return !ssh_host_is_local_with(text, own_hostname);
+        }
+        // scp/sftp: every `host:path` operand must name a remote host.
+        let unq = unquote(text);
+        let host_part = if let Some(bracketed) = unq.strip_prefix('[') {
+            bracketed.split(']').next()
+        } else if unq.starts_with("ssh://") || unq.starts_with("sftp://") {
+            Some(unq)
+        } else {
+            unq.split_once(':').map(|(host, _)| host)
+        };
+        if let Some(host) = host_part {
+            if ssh_host_is_local_with(host, own_hostname) {
+                return false;
+            }
+            found_remote = true;
+        }
+    }
+    found_remote
+}
+
+/// One `-o Key=Value` (or `-oKey=Value`, or `-o "Key Value"`) is safe only
+/// for a known non-executing key with a non-local, quote-free value.
+fn ssh_option_is_safe(value: &str, own_hostname: Option<&str>) -> bool {
+    let text = unquote(value);
+    if text
+        .bytes()
+        .any(|b| matches!(b, b'\'' | b'"' | b'`' | b'$'))
+    {
+        return false;
+    }
+    let (key, val) = text
+        .split_once('=')
+        .or_else(|| text.split_once(char::is_whitespace))
+        .unwrap_or((text, ""));
+    let key = key.trim().to_ascii_lowercase();
+    if !SSH_SAFE_OPTION_KEYS.contains(&key.as_str()) {
+        return false;
+    }
+    let val = val.trim();
+    if key == "forwardagent" {
+        return val.eq_ignore_ascii_case("no");
+    }
+    if (key == "host" || key == "hostname") && ssh_host_is_local_with(val, own_hostname) {
+        return false;
+    }
+    true
+}
+
+/// A `-J`/`-W`/`-L`/`-R`/`-D` value that looks like a command line rather
+/// than a host/port spec.
+fn ssh_value_is_command_shaped(value: &str) -> bool {
+    let text = unquote(value);
+    text.is_empty()
+        || text.bytes().any(|b| {
+            matches!(
+                b,
+                b' ' | b'\t' | b'$' | b'`' | b'\'' | b'"' | b';' | b'|' | b'&'
+            )
+        })
 }
 
 /// Loopback / self-referencing destination for ssh/scp/sftp. Any
-/// substitution in the host position is treated as local (fail closed).
-fn ssh_host_is_local(host: &str) -> bool {
+/// substitution in the host position is treated as local (fail closed), and
+/// so is every host when this machine's own name could not be resolved
+/// (`own_hostname` is `None`) — an unknown own name must never let a
+/// possibly-local destination pass as remote.
+fn ssh_host_is_local_with(host: &str, own_hostname: Option<&str>) -> bool {
     let host = host.trim_matches(|c| c == '"' || c == '\'');
     let host = host
         .strip_prefix("ssh://")
@@ -1314,17 +1976,18 @@ fn ssh_host_is_local(host: &str) -> bool {
     {
         return true;
     }
-    let Some(own) = local_hostname() else {
-        return false;
+    // Fail closed: without our own name we cannot prove the host is remote.
+    let Some(own) = own_hostname.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
     };
     let own = own.to_ascii_lowercase();
-    if own.is_empty() {
-        return false;
-    }
     lower == own || lower.split('.').next() == own.split('.').next()
 }
 
-/// This host's name, read once from the kernel (not from the environment).
+/// This host's name, resolved once. Portable across the shipped targets:
+/// the Linux kernel files first, then `HOSTNAME`, then `uname -n` /
+/// `hostname` (macOS and any host without `/etc/hostname`). `None` means
+/// unresolvable, which `ssh_host_is_local_with` treats as LOCAL.
 fn local_hostname() -> Option<&'static str> {
     static HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     HOSTNAME
@@ -1332,211 +1995,110 @@ fn local_hostname() -> Option<&'static str> {
             ["/proc/sys/kernel/hostname", "/etc/hostname"]
                 .iter()
                 .find_map(|p| std::fs::read_to_string(p).ok())
+                .or_else(|| std::env::var("HOSTNAME").ok())
+                .or_else(|| hostname_from_command("uname", &["-n"]))
+                .or_else(|| hostname_from_command("hostname", &[]))
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
         .as_deref()
 }
 
-/// Whitespace-separated shell operands of `text`: quoted runs, `$(...)`
-/// and backtick substitutions stay inside one operand so a destination like
-/// `user@$(hostname)` or `"$HOSTNAME"` is seen whole.
-fn shell_operands(text: &str) -> Vec<&str> {
-    let bytes = text.as_bytes();
-    let mut ops = Vec::new();
-    let (mut in_single, mut in_double, mut in_backtick) = (false, false, false);
-    let mut depth = 0usize;
-    let mut start: Option<usize> = None;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        let nested = in_single || in_double || in_backtick || depth > 0;
-        if b == b'\\' && !in_single {
-            start.get_or_insert(i);
-            i += 2;
-            continue;
-        }
-        if !nested && b.is_ascii_whitespace() {
-            if let Some(s) = start.take() {
-                ops.push(&text[s..i]);
+/// Run a hostname-reporting command with a one-second budget. Any spawn
+/// failure, non-zero exit or timeout yields `None`.
+fn hostname_from_command(program: &str, args: &[&str]) -> Option<String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
             }
-            i += 1;
-            continue;
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
         }
-        start.get_or_insert(i);
-        if !in_single && b == b'$' && bytes.get(i + 1) == Some(&b'(') {
-            depth += 1;
-            i += 2;
-            continue;
-        }
-        match b {
-            b'`' if !in_single => in_backtick = !in_backtick,
-            b')' if !in_single && depth > 0 => depth -= 1,
-            b'\'' if !in_double && !in_backtick && depth == 0 => in_single = !in_single,
-            b'"' if !in_single && !in_backtick && depth == 0 => in_double = !in_double,
-            _ => {}
-        }
-        i += 1;
     }
-    if let Some(s) = start {
-        ops.push(&text[s..]);
-    }
-    ops
+    let output = child.wait_with_output().ok()?;
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
-/// Whether the `ssh`/`scp`/`sftp` invocation whose argument text is `rest`
-/// targets this host. Option arguments are consumed per client so a port or
-/// login name is never mistaken for the destination; `-o Host=`/`HostName=`
-/// naming a local address counts too.
-fn remote_shell_targets_local(client: &str, rest: &str) -> bool {
-    let takes_arg: &[u8] = match client {
-        "scp" => b"cFiJloPSD",
-        "sftp" => b"BbcDFiJloPRSsX",
-        _ => b"bcDEeFIiJLlmOopQRSWwB",
-    };
-    let ops = shell_operands(rest);
-    let mut idx = 0usize;
-    while idx < ops.len() {
-        let word = ops[idx];
-        idx += 1;
-        if word == "--" {
-            continue;
-        }
-        if let Some(cluster) = word
-            .strip_prefix('-')
-            .filter(|c| !c.is_empty() && !c.starts_with('-'))
-        {
-            let mut value: Option<&str> = None;
-            let mut is_o = false;
-            for (pos, letter) in cluster.bytes().enumerate() {
-                if takes_arg.contains(&letter) {
-                    is_o = letter == b'o';
-                    value = if pos + 1 < cluster.len() {
-                        Some(&cluster[pos + 1..])
-                    } else {
-                        let v = ops.get(idx).copied();
-                        idx += 1;
-                        v
-                    };
-                    break;
-                }
-            }
-            if is_o && let Some(v) = value {
-                let v = v.trim_matches(|c| c == '"' || c == '\'');
-                let (key, host) = v
-                    .split_once('=')
-                    .or_else(|| v.split_once(char::is_whitespace))
-                    .unwrap_or((v, ""));
-                if (key.eq_ignore_ascii_case("host") || key.eq_ignore_ascii_case("hostname"))
-                    && ssh_host_is_local(host.trim())
-                {
-                    return true;
-                }
-            }
-            continue;
-        }
-        if word.starts_with("--") {
-            continue;
-        }
-        if client == "ssh" {
-            // First non-option operand is the destination.
-            return ssh_host_is_local(word);
-        }
-        // scp/sftp: any `host:path` operand names a host.
-        let unq = word.trim_matches(|c| c == '"' || c == '\'');
-        let host_part = if let Some(rest) = unq.strip_prefix('[') {
-            rest.split(']').next()
-        } else if unq.starts_with("ssh://") || unq.starts_with("sftp://") {
-            Some(unq)
-        } else {
-            unq.split_once(':').map(|(h, _)| h)
-        };
-        if host_part.is_some_and(ssh_host_is_local) {
-            return true;
-        }
-    }
-    false
-}
-
-/// True when any live word of this segment shows that its quoted text runs
-/// on THIS host: a local executor (`sh`, `eval`, `script`, `... | bash`,
-/// `(sh -c ...)`, `$(sh -c ...)`), a shell-mode wrapper (`sudo -s`,
-/// `env -S`), or a remote-shell client pointed at this machine.
-fn segment_is_locally_executed(segment: &str) -> bool {
-    let words = segment_words(segment);
-    for (i, word) in words.iter().enumerate() {
-        if !word.live {
-            continue;
-        }
-        let name = command_name(word.text);
-        if REDIRECT_LOCAL_EXECUTORS.contains(&name) {
-            return true;
-        }
-        if REDIRECT_TRANSPARENT_WRAPPERS.contains(&name) {
-            let rest = &words[i + 1..];
-            let shell_mode = match name {
-                "sudo" | "doas" => rest.iter().any(|w| {
-                    w.live
-                        && (matches!(w.text, "--shell" | "--login")
-                            || short_flag_has(w.text, b"si"))
-                }),
-                "env" => rest.iter().any(|w| {
-                    w.live && (w.text == "--split-string" || short_flag_has(w.text, b"S"))
-                }),
-                _ => false,
-            };
-            if shell_mode {
-                return true;
-            }
-            continue;
-        }
-        if REDIRECT_REMOTE_SHELLS.contains(&name)
-            && remote_shell_targets_local(name, &segment[word.end..])
-        {
-            return true;
-        }
-    }
-    false
+/// Whether a whole segment's quoted text is content: EVERY pipeline stage
+/// must be content. One non-content stage (`… | "sh"`, `… | at now`) leaves
+/// the segment unmasked.
+fn segment_is_content(segment: &str, own_hostname: Option<&str>) -> bool {
+    segment_stages(segment)
+        .iter()
+        .all(|stage| stage_is_content(stage, own_hostname))
 }
 
 /// Scan view for `redirect-truncate-root-home`: a redirect operator is only a
-/// redirect when it is UNQUOTED on the local command line. `>` bytes that sit
-/// inside quoted data of a non-executing position (single-quoted `Data`
-/// spans and plain double-quoted `Argument` spans — ssh/scp remote payloads,
-/// `--body`/`--subject`/`-m` message text, quoted echo prose) are blanked to
-/// a space so the regex cannot match them. Everything else is untouched:
-/// quoted TARGETS after an unquoted operator stay visible, `InlineCode`
-/// spans (`bash -c '...'`) stay visible, and any segment that runs its
-/// quoted text on THIS host (`segment_is_locally_executed`: a live local
-/// executor word such as `eval`, `xargs`, `script -c`, `su -c`, `... | bash`,
-/// `(sh -c ...)`, `$(sh -c ...)`; a shell-mode wrapper such as `sudo -s`;
-/// or `ssh`/`scp`/`sftp` pointed at loopback, this machine's own name, or
-/// a substituted host) is left completely unmasked. Byte length is
-/// preserved so match spans still index the original text.
+/// redirect when it is UNQUOTED on the local command line.
+///
+/// **The default is fail CLOSED.** A `>` byte is blanked to a space (so the
+/// regex cannot match it) only when ALL of the following hold: it sits in a
+/// quoted `Data`/`Argument` span, and every pipeline stage of its segment
+/// has an allowlisted content-bearing command word
+/// (`REDIRECT_CONTENT_COMMANDS`, reached through transparent wrappers such
+/// as `sudo`/`env`/`timeout`), and that command word's own condition holds
+/// (a `git` message subcommand, a `curl -d` payload, an `ssh` destination
+/// that is a genuine remote host with no locally-executing `-o` option).
+/// Anything else — an unknown program, `$SHELL`, `"sh"`, `s\h`, `$(…)` in
+/// the command word, `python3 run.py`, `git submodule foreach`,
+/// `ansible -m shell`, `nix-shell --run`, `gdb -ex`, `sed …/e`, a shell-mode
+/// wrapper (`sudo -s`, `env -S`), a pipe into any of those, or ssh pointed
+/// at this machine — is left completely unmasked and denies exactly as it
+/// did before this rule grew a scan view.
+///
+/// Never masked regardless: unquoted operators, quoted TARGETS after an
+/// unquoted operator, and `InlineCode` spans (`bash -c '…'`, `$(…)`,
+/// backticks). Byte length is preserved so match spans still index the
+/// original text.
 fn redirect_unquoted_scan_view(cmd: &str) -> std::borrow::Cow<'_, str> {
+    redirect_unquoted_scan_view_with(cmd, local_hostname())
+}
+
+/// `redirect_unquoted_scan_view` with this host's name injected, so both
+/// arms of the loopback rule (own name resolvable / unresolvable) are
+/// testable without depending on the build host.
+fn redirect_unquoted_scan_view_with<'a>(
+    cmd: &'a str,
+    own_hostname: Option<&str>,
+) -> std::borrow::Cow<'a, str> {
     if !cmd.bytes().any(|b| matches!(b, b'\'' | b'"')) {
         return std::borrow::Cow::Borrowed(cmd);
     }
     let spans = crate::context::classify_command(cmd);
-    let base = cmd.as_ptr() as usize;
     let mut out: Option<Vec<u8>> = None;
-    for segment in crate::packs::split_command_segments(cmd) {
-        if segment_is_locally_executed(segment) {
+    for range in crate::packs::split_command_segment_ranges(cmd) {
+        if !segment_is_content(&cmd[range.clone()], own_hostname) {
             continue;
         }
-        // Every segment is a subslice of `cmd` (split_command_segments only
-        // trims), so the offset cannot underflow; leave the segment unmasked
-        // (regex sees everything) rather than panic if it ever did.
-        let Some(seg_start) = (segment.as_ptr() as usize).checked_sub(base) else {
-            continue;
-        };
-        let seg_end = seg_start + segment.len();
         for span in spans.spans() {
             if !matches!(span.kind, SpanKind::Data | SpanKind::Argument) {
                 continue;
             }
-            let start = span.byte_range.start.max(seg_start);
-            let end = span.byte_range.end.min(seg_end);
+            let start = span.byte_range.start.max(range.start);
+            let end = span.byte_range.end.min(range.end);
             for idx in start..end {
                 if cmd.as_bytes()[idx] == b'>' {
                     out.get_or_insert_with(|| cmd.as_bytes().to_vec())[idx] = b' ';
@@ -3285,74 +3847,336 @@ mod tests {
     // ---------- WI-3135: quoted redirect text is content, not a redirect ----------
     //
     // The 14-case suite (SPEC-WI-3135-r2). D1-D7 are real shell redirects on
-    // the local command line (operator unquoted, or inside a LOCAL executor's
-    // quoted payload) and must keep denying with the same rule id and
-    // severity. A1-A7 carry the same text inside quoted data of a
-    // non-executing position (ssh remote payloads, --body/--subject/-m
-    // message arguments, quoted echo prose) or use append, and must allow.
+    // the local command line (operator unquoted, or inside a quoted payload
+    // that some LOCAL program will execute) and must keep denying with the
+    // same rule id and severity. A1-A7 carry the same text inside quoted data
+    // of an allowlisted content-bearing command (ssh remote payloads,
+    // --body/--subject/-m message arguments, quoted echo prose) or use
+    // append, and must allow.
+    //
+    // Every fixture below is asserted at BOTH layers: the pack API
+    // (`create_pack()` / `Pack::check`, which sees the raw string) and the
+    // SHIPPED path (`crate::evaluator::evaluate_detailed`, which sees
+    // `normalize_command(strip_wrapper_prefixes(cmd))` with heredocs masked).
+    // See `redirect_truncate_suite_holds_on_production_path_wi3135_fold3`.
+
+    /// D1-D7 of the 14-case suite.
+    const WI3135_SUITE_DENY: &[&str] = &[
+        // D1: bare redirect to home.
+        "> ~/x",
+        // D2: unquoted redirect to a home secret.
+        "echo x > ~/.ssh/id_ed25519",
+        // D3: the incident's remote payload, run LOCALLY unquoted.
+        "date -u +%FT%TZ > ~/offload/wi112/WI112-R8-BUNDLE-STAMP",
+        // D4: unquoted redirect to /etc.
+        "echo x > /etc/passwd",
+        // D5: quoted TARGET, unquoted operator.
+        "echo x > \"/etc/passwd\"",
+        // D6: compound.
+        "true && > /etc/passwd",
+        // D7: LOCAL executor with a quoted payload.
+        "sudo bash -c '> /etc/passwd'",
+    ];
+
+    /// A1-A7 of the 14-case suite.
+    const WI3135_SUITE_ALLOW: &[&str] = &[
+        // A1: incident I1 verbatim — ssh single-quoted remote payload.
+        "scp /home/brynn-bendixen/dev/_deck/wi112-b5feeaf.bundle /home/brynn-bendixen/dev/_deck/LAUNCH-BRIEF-wi112-r8.md orca@100.117.246.48:offload/wi112/ && ssh orca@100.117.246.48 'sha256sum ~/offload/wi112/wi112-b5feeaf.bundle && cp ~/offload/wi112/R7-EXCLUDED-FILES.txt ~/offload/wi112/R8-EXCLUDED-FILES.txt && wc -l ~/offload/wi112/R8-EXCLUDED-FILES.txt && date -u +%FT%TZ > ~/offload/wi112/WI112-R8-BUNDLE-STAMP'",
+        // A2: double-quoted remote payload.
+        "ssh orca@100.117.246.48 \"date -u +%FT%TZ > ~/offload/wi112/stamp\"",
+        // A3: incident I2 verbatim — prose message body.
+        "orca orchestration send --type status --subject \"deploy-wi2096 report\" --body \"Denial to report: at 10:04 dcg BLOCKED a compound scp+ssh command whose remote payload wrote date -u > ~/offload/wi112/stamp; worked around by splitting\"",
+        // A4: compound with a prose body.
+        "orca orchestration send --subject \"receipt\" --body \"remote wrote date > ~/offload/stamp\" && git status",
+        // A5: prose in a quoted echo argument.
+        "echo \"use > ~/file to truncate\"",
+        // A6: commit message.
+        "git commit -m \"fix: log redirect > ~/log was wrong\"",
+        // A7: append (existing carve-out).
+        "echo x >> ~/.bashrc",
+    ];
+
+    /// The quoted-text shield must not extend to local shell-string
+    /// executors: these run the quoted text on THIS host.
+    const WI3135_LOCAL_EXECUTOR_DENY: &[&str] = &[
+        "bash -c \"> ~/x\"",
+        "sh -c '> /etc/passwd'",
+        "eval '> ~/.bashrc'",
+        "timeout 5 bash -c '> /etc/passwd'",
+        "env FOO=1 sh -c '> ~/x'",
+        "xargs -0 sh -c '> /etc/passwd'",
+        "echo \"> ~/x\" | bash",
+        "echo '> /etc/passwd' | sudo sh",
+    ];
+
+    /// fold r2 / strict r1 Major 1: shell sugar in front of the executor
+    /// word must not hide it (`(sh`, `{ sh`, `! bash`, `$(sh`, backticks).
+    const WI3135_SUGAR_DENY: &[&str] = &[
+        "(sh -c '> /etc/passwd')",
+        "{ sh -c '> /etc/passwd'; }",
+        "! bash -c '> /etc/passwd'",
+        "$(sh -c '> /etc/passwd')",
+        "echo `sh -c '> /etc/passwd'`",
+        "echo \"$(sh -c '> /etc/passwd')\"",
+        "true && (sh -c '> ~/.bashrc')",
+        "echo '> /etc/passwd' | (sh)",
+        "echo \"> ~/x\"|bash",
+        "FOO=1 sh -c '> /etc/passwd'",
+        "!sh -c '> /etc/passwd'",
+    ];
+
+    /// fold r2 / strict r1 Major 2: programs that run a string (or stdin)
+    /// through a local shell or interpreter outside the classifier's `-c`
+    /// InlineCode route. None of these is an allowlisted content command.
+    const WI3135_STRING_RUNNER_DENY: &[&str] = &[
+        "script -qc '> /etc/passwd' /dev/null",
+        "script -c '> /etc/passwd' /dev/null",
+        "script -ec \"> ~/x\" /dev/null",
+        "su -c '> /etc/passwd'",
+        "su root -c '> /etc/passwd'",
+        "runuser -u x -c '> /etc/passwd'",
+        "doas -s '> /etc/passwd'",
+        "sudo -s '> /etc/passwd'",
+        "sudo -i '> /etc/passwd'",
+        "sudo -u root -Es '> /etc/passwd'",
+        "expect -c 'spawn sh -c \"> /etc/passwd\"'",
+        "tclsh run.tcl '> /etc/passwd'",
+        "osascript -e 'do shell script \"> /etc/passwd\"'",
+        "screen -X stuff '> /etc/passwd'",
+        // tmux types the text into a live local shell; Enter runs it.
+        "tmux send-keys '> /etc/passwd' Enter",
+        "tmux run-shell '> /etc/passwd'",
+        "nsenter -t 1 -m -- '> /etc/passwd'",
+        "unshare -r '> /etc/passwd'",
+        "chroot /mnt '> /etc/passwd'",
+        "parallel '> /etc/passwd' ::: x",
+        "env -S '> /etc/passwd'",
+        "echo '> /etc/passwd' | at now",
+        "echo '> /etc/passwd' | batch",
+        "systemd-run --shell '> /etc/passwd'",
+        "xargs -I {} sh -c '> /etc/passwd'",
+        "find . -exec sh -c '> /etc/passwd' \\;",
+        "find . -execdir '> /etc/passwd' \\;",
+        "flock /tmp/l -c '> /etc/passwd'",
+        "watch '> ~/x'",
+        "awk 'BEGIN { print \"x\" > \"/etc/passwd\" }'",
+        "python3 run.py '> /etc/passwd'",
+        "busybox sh -c '> /etc/passwd'",
+        "sudo /bin/sh -c '> /etc/passwd'",
+    ];
+
+    /// fold r2 / strict r1 Major 3: ssh/scp/sftp whose destination is THIS
+    /// host run the payload locally; the quoted `>` is a real truncate.
+    const WI3135_LOOPBACK_DENY: &[&str] = &[
+        "ssh localhost 'date > ~/.ssh/authorized_keys'",
+        "ssh 127.0.0.1 \"date > ~/.ssh/authorized_keys\"",
+        "ssh ::1 \"date > ~/.ssh/authorized_keys\"",
+        "ssh -p 2222 root@localhost 'date > ~/x'",
+        "ssh -p2222 -l root localhost 'date > ~/x'",
+        "ssh -vp 2222 localhost 'date > ~/x'",
+        "ssh root@[::1] 'date > ~/x'",
+        "ssh ssh://root@localhost:22 'date > ~/x'",
+        "ssh localhost.localdomain 'date > ~/x'",
+        "ssh ip6-localhost 'date > ~/x'",
+        "ssh 127.1 'date > ~/x'",
+        "ssh 0.0.0.0 'date > ~/x'",
+        "ssh ::ffff:127.0.0.1 'date > ~/x'",
+        "ssh 2130706433 'date > ~/x'",
+        "ssh 0x7f000001 'date > ~/x'",
+        "ssh -o Host=localhost bogus 'date > ~/x'",
+        "ssh -oHostName=127.0.0.1 bogus 'date > ~/x'",
+        "ssh -o \"HostName localhost\" bogus 'date > ~/x'",
+        "ssh $(hostname) 'date > ~/x'",
+        "ssh \"$(hostname -f)\" 'date > ~/x'",
+        "ssh user@$(uname -n) 'date > ~/x'",
+        "ssh `hostname -s` 'date > ~/x'",
+        "ssh \"$HOSTNAME\" 'date > ~/x'",
+        "ssh $HOSTNAME 'date > ~/x'",
+        "ssh ${HOSTNAME} 'date > ~/x'",
+        "timeout 30 ssh localhost 'date -u > ~/offload/stamp'",
+        "sudo ssh -i key localhost 'date > ~/x'",
+        "scp localhost:x /tmp && ssh localhost 'date > ~/x'",
+    ];
+
+    /// fold r2: a real remote host keeps the quoted payload as content,
+    /// including when wrapped or named through `-o Host`.
+    const WI3135_REMOTE_ALLOW: &[&str] = &[
+        "ssh orca@100.117.246.48 'date -u > ~/offload/stamp'",
+        "ssh user@host.example \"date > ~/stamp\"",
+        "ssh -p 2222 -l root 100.117.246.48 'date > ~/x'",
+        "ssh -o Host=100.117.246.48 deploy-box 'date > ~/x'",
+        "ssh -J jump.example user@host.example 'date > ~/x'",
+        "ssh root@[2001:db8::10] 'date > ~/x'",
+        "ssh -4 host.example 'date > ~/x'",
+        "ssh -- host.example 'date > ~/x'",
+        "timeout 30 ssh orca@100.117.246.48 'date -u > ~/offload/stamp'",
+        "scp file orca@100.117.246.48:~/x && ssh orca@100.117.246.48 'date > ~/x'",
+        "ssh host.example 'date > ~/stamp' | tee log",
+        "ssh host.example \"date > ~/stamp-$(date +%F)\"",
+    ];
+
+    /// fold r2 (sol Minor): an argv-exec wrapper in front of a
+    /// content-bearing command is that inner command.
+    const WI3135_WRAPPER_ALLOW: &[&str] = &[
+        "sudo echo \"use > ~/file to truncate\"",
+        "env echo \"use > ~/file to truncate\"",
+        "timeout 5 echo \"use > ~/file to truncate\"",
+        "nohup orca send --body \"wrote date > ~/x\"",
+        "nice -n 10 printf \"%s\" \"> ~/x\"",
+        "sudo -u deploy orca send --body \"wrote date > ~/x\"",
+    ];
+
+    /// fold r2: a wrapper in front of a real executor still denies.
+    const WI3135_WRAPPER_DENY: &[&str] = &[
+        "sudo sh -c '> /etc/passwd'",
+        "sudo -u root sh -c '> /etc/passwd'",
+        "env FOO=1 bash -c '> /etc/passwd'",
+        "timeout 5 eval '> /etc/passwd'",
+        "sudo echo '> /etc/passwd' | sh",
+        "nohup script -c '> /etc/passwd' /dev/null",
+    ];
+
+    /// fold r2 (opus): quote tricks around an UNQUOTED operator never mask it.
+    const WI3135_ADVERSARIAL_DENY: &[&str] = &[
+        "echo \"x\" >\"/etc/passwd\"",
+        "echo \"it's fine\" > /etc/passwd",
+        "echo \\' > /etc/passwd",
+        "echo a\\\"b > /etc/passwd",
+        "echo x 2> /etc/passwd",
+        "echo x &> /etc/passwd",
+        "echo \"done\" >| /etc/passwd",
+        "orca send --body \"wrote date > ~/x\" > ~/realfile",
+    ];
+
+    // ---------- WI-3135 fold r3: the shield is an ALLOWLIST (fail closed) ----------
+
+    /// strict r2 Critical + Major (`filesystem.rs:1468`, `:1071`): the
+    /// command word must be an allowlisted CONTENT-BEARING program. A
+    /// substitution, an unlisted program, an interpreter or a
+    /// string-executing subcommand leaves the segment unmasked, so the raw
+    /// regex denies exactly as it did on base `0a38dee`.
+    const WI3135_UNLISTED_COMMAND_DENY: &[&str] = &[
+        // Critical: substituted command words.
+        "$SHELL -c '> /etc/passwd'",
+        "${SHELL} -c '> /etc/passwd'",
+        "$(which sh) -c '> /etc/passwd'",
+        "\"$SHELL\" -c '> /etc/passwd'",
+        // Critical: quote/backslash-obfuscated names — dequoted to `sh`,
+        // which is not a content command, at BOTH layers.
+        "\"sh\" -c '> /etc/passwd'",
+        "s'h' -c '> /etc/passwd'",
+        "s\\h -c '> /etc/passwd'",
+        "echo '> /etc/passwd' | \"sh\"",
+        "echo '> /etc/passwd' | s\\h",
+        // Major: string-executing programs the r2 denylist missed.
+        "git submodule foreach '> ~/.ssh/authorized_keys'",
+        "git config alias.wipe '> /etc/passwd'",
+        "git commit '> /etc/passwd'",
+        "ansible localhost -m shell -a '> /etc/passwd'",
+        "ansible-playbook -e 'cmd=> /etc/passwd' p.yml",
+        "nix-shell --run '> /etc/passwd'",
+        "npx -c '> /etc/passwd'",
+        "gdb -ex 'shell > /etc/passwd'",
+        "make '> /etc/passwd'",
+        "just '> /etc/passwd'",
+        // sed with an executing script (`s///e` runs the result).
+        "sed 's|x|> /etc/passwd|e' file",
+        "sed -e 's@y@> ~/.bashrc@e' file",
+        "sed '1,$e cat > /etc/passwd' file",
+        // Interpreters (strict r2 Minor `:1112`): answered by the allowlist
+        // model — an interpreter is simply not a content command. Recorded
+        // as a deliberately CONSERVATIVE denial, not a false positive the
+        // WI must fix.
+        "python3 run.py '> /etc/passwd'",
+        "python3 tools/send.py --body \"wrote date > ~/stamp\"",
+        "perl -e '> /etc/passwd'",
+        "node -e '> /etc/passwd'",
+        // Shell-mode wrappers.
+        "sudo -s '> /etc/passwd'",
+        "env -S 'sh -c \"> /etc/passwd\"'",
+        // curl/wget are content only for a pure request BODY.
+        "curl -o out '> /etc/passwd' https://h.example/",
+        "curl \"date > ~/x\" | sh",
+        "wget -O - '> /etc/passwd' https://h.example/",
+    ];
+
+    /// strict r2 Major (`filesystem.rs:1391`): an `ssh` option that runs a
+    /// command through a LOCAL shell makes the payload non-content, whatever
+    /// the destination.
+    const WI3135_SSH_OPTION_DENY: &[&str] = &[
+        "ssh -oProxyCommand=\"sh -c '> /etc/passwd'\" host.example",
+        "ssh -o ProxyCommand=\"sh -c '> /etc/passwd'\" host.example",
+        "ssh -o LocalCommand=\"date > ~/x\" -o PermitLocalCommand=yes host.example",
+        "ssh -o ProxyJump=\"sh -c '> ~/x'\" host.example",
+        "ssh -o \"Match exec date > ~/x\" host.example",
+        "ssh -o PermitLocalCommand=yes host.example 'date > ~/x'",
+        "ssh -o UnknownKey=x host.example 'date > ~/x'",
+        "ssh -o ForwardAgent=yes host.example 'date > ~/x'",
+        "ssh -J \"x;date > ~/x\" host.example 'true'",
+        "scp -o ProxyCommand=\"date > ~/x\" file host.example:/tmp/f",
+    ];
+
+    /// strict r2 Major (`filesystem.rs:1468`): the allowlist test applies to
+    /// the COMMAND WORD only. A listed name in argument position is
+    /// irrelevant, and the extra per-program conditions hold.
+    const WI3135_CONTENT_ALLOW: &[&str] = &[
+        // Command position only: `python`/`sh` as a --subject value.
+        "orca send --subject python --body \"use > ~/file\"",
+        "orca send --subject sh --body \"date > ~/x\"",
+        "orca send --subject \"bash -c\" --body \"date > ~/x\"",
+        // Dequoted command word agrees with the shipped normalization.
+        "\"orca\" send --body \"date > ~/x\"",
+        // Wrapper option scan stops at its first operand: `-i` is grep's.
+        "sudo grep -i \"note: date > ~/stamp\" file",
+        "grep -rn \"date > ~/x\" src",
+        // git/gh message payloads.
+        "git commit -m \"log > ~/x\"",
+        "git notes add -m \"log > ~/x\"",
+        // Global options in front of a message subcommand are skipped, not
+        // fail-closed: defining an alias does not run it, and both layers
+        // agree here (the shipped path treats the `-m` payload as data).
+        "git -c alias.x='!sh' commit -m \"log > ~/x\"",
+        "gh pr comment 5 --body \"wrote date > ~/stamp\"",
+        "gh issue create --title \"date > ~/x\" --body \"date > ~/x\"",
+        // curl request body only.
+        "curl -d \"date > ~/x\" https://h.example/",
+        // sed script that cannot execute (no `e` flag).
+        "sed 's|x|> /etc/passwd|' file",
+        // ssh with only safe -o options and a genuine remote destination.
+        "ssh -o StrictHostKeyChecking=no -p 2222 orca@100.117.246.48 'date -u > ~/offload/stamp'",
+        "ssh -o BatchMode=yes -o ConnectTimeout=5 host.example 'date > ~/x'",
+        "ssh -o ForwardAgent=no host.example 'date > ~/x'",
+        "timeout 30 ssh orca@100.117.246.48 'date -u > ~/offload/stamp'",
+        // The substitution is InlineCode (never masked); the `>` sits in the
+        // surrounding plain double-quoted Argument span of a content command.
+        "echo \"$(date) > ~/x\"",
+    ];
+
+    fn assert_pack_denies_redirect(pack: &Pack, cmd: &str) {
+        assert_blocks_with_severity(pack, cmd, Severity::Critical);
+        assert_blocks_with_pattern(pack, cmd, "redirect-truncate-root-home");
+    }
 
     #[test]
     fn redirect_truncate_unquoted_operator_still_blocks_wi3135() {
         let pack = create_pack();
-        for cmd in [
-            // D1: bare redirect to home.
-            "> ~/x",
-            // D2: unquoted redirect to a home secret.
-            "echo x > ~/.ssh/id_ed25519",
-            // D3: the incident's remote payload, run LOCALLY unquoted.
-            "date -u +%FT%TZ > ~/offload/wi112/WI112-R8-BUNDLE-STAMP",
-            // D4: unquoted redirect to /etc.
-            "echo x > /etc/passwd",
-            // D5: quoted TARGET, unquoted operator.
-            "echo x > \"/etc/passwd\"",
-            // D6: compound.
-            "true && > /etc/passwd",
-            // D7: LOCAL executor with a quoted payload.
-            "sudo bash -c '> /etc/passwd'",
-        ] {
-            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
-            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        for cmd in WI3135_SUITE_DENY {
+            assert_pack_denies_redirect(&pack, cmd);
         }
     }
 
     #[test]
     fn redirect_truncate_quoted_payload_or_message_body_is_allowed_wi3135() {
         let pack = create_pack();
-        for cmd in [
-            // A1: incident I1 verbatim — ssh single-quoted remote payload.
-            "scp /home/brynn-bendixen/dev/_deck/wi112-b5feeaf.bundle /home/brynn-bendixen/dev/_deck/LAUNCH-BRIEF-wi112-r8.md orca@100.117.246.48:offload/wi112/ && ssh orca@100.117.246.48 'sha256sum ~/offload/wi112/wi112-b5feeaf.bundle && cp ~/offload/wi112/R7-EXCLUDED-FILES.txt ~/offload/wi112/R8-EXCLUDED-FILES.txt && wc -l ~/offload/wi112/R8-EXCLUDED-FILES.txt && date -u +%FT%TZ > ~/offload/wi112/WI112-R8-BUNDLE-STAMP'",
-            // A2: double-quoted remote payload.
-            "ssh orca@100.117.246.48 \"date -u +%FT%TZ > ~/offload/wi112/stamp\"",
-            // A3: incident I2 verbatim — prose message body.
-            "orca orchestration send --type status --subject \"deploy-wi2096 report\" --body \"Denial to report: at 10:04 dcg BLOCKED a compound scp+ssh command whose remote payload wrote date -u > ~/offload/wi112/stamp; worked around by splitting\"",
-            // A4: compound with a prose body.
-            "orca orchestration send --subject \"receipt\" --body \"remote wrote date > ~/offload/stamp\" && git status",
-            // A5: prose in a quoted echo argument.
-            "echo \"use > ~/file to truncate\"",
-            // A6: commit message.
-            "git commit -m \"fix: log redirect > ~/log was wrong\"",
-            // A7: append (existing carve-out).
-            "echo x >> ~/.bashrc",
-        ] {
+        for cmd in WI3135_SUITE_ALLOW {
             assert_no_match(&pack, cmd);
         }
     }
 
     #[test]
     fn redirect_truncate_quoted_text_fed_to_local_executor_still_blocks_wi3135() {
-        // The quoted-text shield must not extend to local shell-string
-        // executors: these run the quoted text on THIS host.
         let pack = create_pack();
-        for cmd in [
-            "bash -c \"> ~/x\"",
-            "sh -c '> /etc/passwd'",
-            "eval '> ~/.bashrc'",
-            "timeout 5 bash -c '> /etc/passwd'",
-            "env FOO=1 sh -c '> ~/x'",
-            "xargs -0 sh -c '> /etc/passwd'",
-            "echo \"> ~/x\" | bash",
-            "echo '> /etc/passwd' | sudo sh",
-        ] {
+        for cmd in WI3135_LOCAL_EXECUTOR_DENY {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
     }
@@ -3361,118 +4185,41 @@ mod tests {
 
     #[test]
     fn redirect_truncate_paren_or_sugar_prefixed_local_shell_still_blocks_wi3135_fold() {
-        // Major 1: shell sugar in front of the executor word must not hide
-        // it from the shield (`(sh`, `{ sh`, `! bash`, `$(sh`, backticks).
         let pack = create_pack();
-        for cmd in [
-            "(sh -c '> /etc/passwd')",
-            "{ sh -c '> /etc/passwd'; }",
-            "! bash -c '> /etc/passwd'",
-            "$(sh -c '> /etc/passwd')",
-            "echo `sh -c '> /etc/passwd'`",
-            "echo \"$(sh -c '> /etc/passwd')\"",
-            "true && (sh -c '> ~/.bashrc')",
-            "echo '> /etc/passwd' | (sh)",
-            "echo \"> ~/x\"|bash",
-            "FOO=1 sh -c '> /etc/passwd'",
-            "!sh -c '> /etc/passwd'",
-        ] {
-            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
-            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        for cmd in WI3135_SUGAR_DENY {
+            assert_pack_denies_redirect(&pack, cmd);
         }
     }
 
     #[test]
     fn redirect_truncate_string_running_wrappers_still_block_wi3135_fold() {
-        // Major 2: programs that run a string (or stdin) through a local
-        // shell / interpreter outside the classifier's -c InlineCode route.
         let pack = create_pack();
-        for cmd in [
-            "script -qc '> /etc/passwd' /dev/null",
-            "script -c '> /etc/passwd' /dev/null",
-            "script -ec \"> ~/x\" /dev/null",
-            "su -c '> /etc/passwd'",
-            "su root -c '> /etc/passwd'",
-            "runuser -u x -c '> /etc/passwd'",
-            "doas -s '> /etc/passwd'",
-            "sudo -s '> /etc/passwd'",
-            "sudo -i '> /etc/passwd'",
-            "sudo -u root -Es '> /etc/passwd'",
-            "expect -c 'spawn sh -c \"> /etc/passwd\"'",
-            "tclsh run.tcl '> /etc/passwd'",
-            "osascript -e 'do shell script \"> /etc/passwd\"'",
-            "screen -X stuff '> /etc/passwd'",
-            // tmux types the text into a live local shell; Enter runs it.
-            "tmux send-keys '> /etc/passwd' Enter",
-            "tmux run-shell '> /etc/passwd'",
-            "nsenter -t 1 -m -- '> /etc/passwd'",
-            "unshare -r '> /etc/passwd'",
-            "chroot /mnt '> /etc/passwd'",
-            "parallel '> /etc/passwd' ::: x",
-            "env -S '> /etc/passwd'",
-            "echo '> /etc/passwd' | at now",
-            "echo '> /etc/passwd' | batch",
-            "systemd-run --shell '> /etc/passwd'",
-            "xargs -I {} sh -c '> /etc/passwd'",
-            "find . -exec sh -c '> /etc/passwd' \\;",
-            "find . -execdir '> /etc/passwd' \\;",
-            "flock /tmp/l -c '> /etc/passwd'",
-            "watch '> ~/x'",
-            "awk 'BEGIN { print \"x\" > \"/etc/passwd\" }'",
-            "python3 run.py '> /etc/passwd'",
-            "busybox sh -c '> /etc/passwd'",
-            "sudo /bin/sh -c '> /etc/passwd'",
-        ] {
-            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
-            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        for cmd in WI3135_STRING_RUNNER_DENY {
+            assert_pack_denies_redirect(&pack, cmd);
         }
     }
 
     #[test]
     fn redirect_truncate_loopback_ssh_is_local_wi3135_fold() {
-        // Major 3: ssh/scp/sftp whose destination is THIS host run the
-        // payload locally; the quoted `>` is a real truncate.
         let pack = create_pack();
-        let mut cmds = vec![
-            "ssh localhost 'date > ~/.ssh/authorized_keys'".to_string(),
-            "ssh 127.0.0.1 \"date > ~/.ssh/authorized_keys\"".to_string(),
-            "ssh ::1 \"date > ~/.ssh/authorized_keys\"".to_string(),
-            "ssh -p 2222 root@localhost 'date > ~/x'".to_string(),
-            "ssh -p2222 -l root localhost 'date > ~/x'".to_string(),
-            "ssh -vp 2222 localhost 'date > ~/x'".to_string(),
-            "ssh root@[::1] 'date > ~/x'".to_string(),
-            "ssh ssh://root@localhost:22 'date > ~/x'".to_string(),
-            "ssh localhost.localdomain 'date > ~/x'".to_string(),
-            "ssh ip6-localhost 'date > ~/x'".to_string(),
-            "ssh 127.1 'date > ~/x'".to_string(),
-            "ssh 0.0.0.0 'date > ~/x'".to_string(),
-            "ssh ::ffff:127.0.0.1 'date > ~/x'".to_string(),
-            "ssh 2130706433 'date > ~/x'".to_string(),
-            "ssh 0x7f000001 'date > ~/x'".to_string(),
-            "ssh -o Host=localhost bogus 'date > ~/x'".to_string(),
-            "ssh -oHostName=127.0.0.1 bogus 'date > ~/x'".to_string(),
-            "ssh -o \"HostName localhost\" bogus 'date > ~/x'".to_string(),
-            "ssh $(hostname) 'date > ~/x'".to_string(),
-            "ssh \"$(hostname -f)\" 'date > ~/x'".to_string(),
-            "ssh user@$(uname -n) 'date > ~/x'".to_string(),
-            "ssh `hostname -s` 'date > ~/x'".to_string(),
-            "ssh \"$HOSTNAME\" 'date > ~/x'".to_string(),
-            "ssh $HOSTNAME 'date > ~/x'".to_string(),
-            "ssh ${HOSTNAME} 'date > ~/x'".to_string(),
-            "timeout 30 ssh localhost 'date -u > ~/offload/stamp'".to_string(),
-            "sudo ssh -i key localhost 'date > ~/x'".to_string(),
-            "scp localhost:x /tmp && ssh localhost 'date > ~/x'".to_string(),
-        ];
-        if let Some(own) = local_hostname() {
-            cmds.push(format!("ssh {own} 'date > ~/x'"));
-            cmds.push(format!("ssh admin@{own} 'date > ~/x'"));
-            if let Some(short) = own.split('.').next() {
-                cmds.push(format!("ssh {short}.example.internal 'date > ~/x'"));
-            }
+        for cmd in WI3135_LOOPBACK_DENY {
+            assert_pack_denies_redirect(&pack, cmd);
         }
-        for cmd in &cmds {
-            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
-            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        // The machine's own name is local too. `local_hostname` must answer on
+        // every shipped target (strict r2 Major `filesystem.rs:1328`): this
+        // assertion is what stops the arm below from silently self-skipping.
+        let own = local_hostname().expect("local_hostname must resolve on a shipped target");
+        for cmd in [
+            format!("ssh {own} 'date > ~/x'"),
+            format!("ssh admin@{own} 'date > ~/x'"),
+        ] {
+            assert_pack_denies_redirect(&pack, &cmd);
+        }
+        if let Some(short) = own.split('.').next() {
+            assert_pack_denies_redirect(
+                &pack,
+                &format!("ssh {short}.example.internal 'date > ~/x'"),
+            );
         }
         // Loopback without a redirect: no rule, no panic.
         for cmd in [
@@ -3490,104 +4237,260 @@ mod tests {
 
     #[test]
     fn redirect_truncate_genuine_remote_payload_stays_content_wi3135_fold() {
-        // A1/A2/A5-class: a real remote host keeps the quoted payload as
-        // content, including when wrapped or given via -o Host.
         let pack = create_pack();
-        for cmd in [
-            "ssh orca@100.117.246.48 'date -u > ~/offload/stamp'",
-            "ssh user@host.example \"date > ~/stamp\"",
-            "ssh -p 2222 -l root 100.117.246.48 'date > ~/x'",
-            "ssh -o Host=100.117.246.48 deploy-box 'date > ~/x'",
-            "ssh -J jump.example user@host.example 'date > ~/x'",
-            "ssh root@[2001:db8::10] 'date > ~/x'",
-            "ssh -4 host.example 'date > ~/x'",
-            "ssh -- host.example 'date > ~/x'",
-            "timeout 30 ssh orca@100.117.246.48 'date -u > ~/offload/stamp'",
-            "scp file orca@100.117.246.48:~/x && ssh orca@100.117.246.48 'date > ~/x'",
-            "ssh host.example 'date > ~/stamp' | tee log",
-            "ssh host.example \"date > ~/stamp-$(date +%F)\"",
-        ] {
+        for cmd in WI3135_REMOTE_ALLOW {
             assert_no_match(&pack, cmd);
         }
     }
 
     #[test]
     fn redirect_truncate_transparent_wrapper_prose_is_content_wi3135_fold() {
-        // sol Minor: an argv-exec wrapper in front of a NON-executor command
-        // is that inner command; the quoted prose stays content.
         let pack = create_pack();
-        for cmd in [
-            "sudo echo \"use > ~/file to truncate\"",
-            "env echo \"use > ~/file to truncate\"",
-            "timeout 5 echo \"use > ~/file to truncate\"",
-            "nohup orca send --body \"wrote date > ~/x\"",
-            "nice -n 10 printf \"%s\" \"> ~/x\"",
-            "sudo -u deploy orca send --body \"wrote date > ~/x\"",
-        ] {
+        for cmd in WI3135_WRAPPER_ALLOW {
             assert_no_match(&pack, cmd);
         }
-        // ... but never when a real executor follows the wrapper.
-        for cmd in [
-            "sudo sh -c '> /etc/passwd'",
-            "sudo -u root sh -c '> /etc/passwd'",
-            "env FOO=1 bash -c '> /etc/passwd'",
-            "timeout 5 eval '> /etc/passwd'",
-            "sudo echo '> /etc/passwd' | sh",
-            "nohup script -c '> /etc/passwd' /dev/null",
-        ] {
+        for cmd in WI3135_WRAPPER_DENY {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
     }
 
     #[test]
     fn redirect_truncate_adversarial_quoting_still_blocks_wi3135_fold() {
-        // opus: quote tricks around an UNQUOTED operator never mask it.
         let pack = create_pack();
-        for cmd in [
-            "echo \"x\" >\"/etc/passwd\"",
-            "echo \"it's fine\" > /etc/passwd",
-            "echo \\' > /etc/passwd",
-            "echo a\\\"b > /etc/passwd",
-            "echo x 2> /etc/passwd",
-            "echo x &> /etc/passwd",
-            "echo \"done\" >| /etc/passwd",
-            "orca send --body \"wrote date > ~/x\" > ~/realfile",
-        ] {
-            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
-            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        for cmd in WI3135_ADVERSARIAL_DENY {
+            assert_pack_denies_redirect(&pack, cmd);
+        }
+    }
+
+    // ---------- WI-3135 fold r3: allowlist inversion, ssh options, hostname ----------
+
+    #[test]
+    fn redirect_truncate_unlisted_command_word_still_blocks_wi3135_fold3() {
+        let pack = create_pack();
+        for cmd in WI3135_UNLISTED_COMMAND_DENY {
+            assert_pack_denies_redirect(&pack, cmd);
         }
     }
 
     #[test]
+    fn redirect_truncate_locally_executing_ssh_options_still_block_wi3135_fold3() {
+        let pack = create_pack();
+        for cmd in WI3135_SSH_OPTION_DENY {
+            assert_pack_denies_redirect(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_content_command_word_is_allowed_wi3135_fold3() {
+        let pack = create_pack();
+        for cmd in WI3135_CONTENT_ALLOW {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    /// strict r2 Major (`filesystem.rs:1328`): both arms of the own-hostname
+    /// rule, injected through the `Option<&str>` seam so neither can
+    /// self-skip on a host where the name is unresolvable.
+    #[test]
+    fn redirect_truncate_hostname_resolution_is_fail_closed_wi3135_fold3() {
+        let cmd = "ssh build-box.example 'date > ~/.ssh/authorized_keys'";
+        // Resolvable and equal (fully qualified or short) => LOCAL => the
+        // segment stays unmasked, so the raw regex denies.
+        assert!(redirect_unquoted_scan_view_with(cmd, Some("build-box.example")).contains('>'));
+        assert!(redirect_unquoted_scan_view_with(cmd, Some("build-box")).contains('>'));
+        // Unresolvable => fail closed to LOCAL => still unmasked.
+        assert!(redirect_unquoted_scan_view_with(cmd, None).contains('>'));
+        // A genuinely different host => remote => content => masked.
+        assert!(!redirect_unquoted_scan_view_with(cmd, Some("laptop-42")).contains('>'));
+
+        assert!(ssh_host_is_local_with(
+            "build-box.example",
+            Some("build-box.example")
+        ));
+        assert!(ssh_host_is_local_with(
+            "build-box",
+            Some("build-box.example")
+        ));
+        assert!(ssh_host_is_local_with("host.example", None));
+        assert!(ssh_host_is_local_with("localhost", None));
+        assert!(!ssh_host_is_local_with("host.example", Some("build-box")));
+        // An empty host is not a host at all, resolvable or not.
+        assert!(!ssh_host_is_local_with("", None));
+    }
+
+    #[test]
     fn redirect_scan_view_helpers_wi3135_fold() {
-        let live: Vec<&str> = segment_words("(sh -c '> /etc/passwd')")
-            .into_iter()
-            .filter(|w| w.live)
-            .map(|w| w.text)
-            .collect();
-        assert_eq!(live, ["sh", "-c"]);
-        let live: Vec<&str> = segment_words("orca send --body \"sh > ~/x\" && x")
-            .into_iter()
-            .filter(|w| w.live)
-            .map(|w| w.text)
-            .collect();
-        assert_eq!(live, ["orca", "send", "--body", "x"]);
+        // Stages: a live `|`, `(`, `{` or `)` starts a new one; a quoted run
+        // stays one word; a `$(...)` is absorbed into the word it touches.
+        let stage_texts = |segment: &str| -> Vec<Vec<String>> {
+            segment_stages(segment)
+                .into_iter()
+                .map(|stage| stage.into_iter().map(|w| w.text.to_string()).collect())
+                .filter(|stage: &Vec<String>| !stage.is_empty())
+                .collect()
+        };
         assert_eq!(
-            shell_operands("-p 2222 user@$(hostname -f) 'date > ~/x'"),
-            ["-p", "2222", "user@$(hostname -f)", "'date > ~/x'"]
+            stage_texts("(sh -c '> /etc/passwd')"),
+            [["sh", "-c", "'> /etc/passwd'"]]
         );
-        assert!(ssh_host_is_local("localhost"));
-        assert!(ssh_host_is_local("root@127.0.0.1"));
-        assert!(ssh_host_is_local("[::1]:22"));
-        assert!(ssh_host_is_local("$(hostname)"));
-        assert!(!ssh_host_is_local("orca@100.117.246.48"));
-        assert!(!ssh_host_is_local("host.example"));
-        assert!(!ssh_host_is_local("2001:db8::10"));
-        assert!(!ssh_host_is_local(""));
-        assert!(segment_is_locally_executed("sudo -s '> x'"));
-        assert!(!segment_is_locally_executed("sudo echo '> x'"));
-        assert!(!segment_is_locally_executed("ssh host.example 'x'"));
-        assert!(segment_is_locally_executed("ssh localhost 'x'"));
+        assert_eq!(
+            stage_texts("echo '> /etc/passwd' | \"sh\""),
+            [
+                vec!["echo".to_string(), "'> /etc/passwd'".to_string()],
+                vec!["\"sh\"".to_string()]
+            ]
+        );
+        assert_eq!(
+            stage_texts("ssh user@$(uname -n) 'x'"),
+            [["ssh", "user@$(uname -n)", "'x'"]]
+        );
+
+        // Command-word resolution: dequote, but never guess a substitution.
+        assert_eq!(content_command_word("\"sh\"").as_deref(), Some("sh"));
+        assert_eq!(content_command_word("s'h'").as_deref(), Some("sh"));
+        assert_eq!(content_command_word("s\\h").as_deref(), Some("sh"));
+        assert_eq!(content_command_word("/bin/sh").as_deref(), Some("sh"));
+        assert_eq!(content_command_word("!sh").as_deref(), Some("sh"));
+        assert_eq!(content_command_word("$SHELL"), None);
+        assert_eq!(content_command_word("${SHELL}"), None);
+        assert_eq!(content_command_word("$(which sh)"), None);
+
+        // The inverted default: content only for an allowlisted command word.
+        assert!(segment_is_content(
+            "orca send --body '> x'",
+            Some("build-box")
+        ));
+        assert!(segment_is_content("sudo echo '> x'", Some("build-box")));
+        assert!(segment_is_content(
+            "sudo grep -i '> x' f",
+            Some("build-box")
+        ));
+        assert!(!segment_is_content("sudo -s '> x'", Some("build-box")));
+        assert!(!segment_is_content("mystery-tool '> x'", Some("build-box")));
+        assert!(!segment_is_content("$SHELL -c '> x'", Some("build-box")));
+        assert!(!segment_is_content(
+            "echo '> x' | mystery-tool",
+            Some("build-box")
+        ));
+        assert!(segment_is_content(
+            "ssh host.example 'x'",
+            Some("build-box")
+        ));
+        assert!(!segment_is_content("ssh localhost 'x'", Some("build-box")));
+        assert!(!segment_is_content(
+            "ssh -o ProxyCommand=x host.example 'y'",
+            Some("build-box")
+        ));
+
+        // sed executes only with an `e` flag / `e` command.
+        assert!(sed_arg_executes("'s|x|y|e'"));
+        assert!(sed_arg_executes("'1,$e cat'"));
+        assert!(!sed_arg_executes("'s|x|y|g'"));
+        assert!(!sed_arg_executes("'/here/d'"));
+        assert!(!sed_arg_executes("-n"));
+
+        // Nit (`packs/mod.rs:305`): the view preserves byte length.
+        for cmd in WI3135_SUITE_DENY
+            .iter()
+            .chain(WI3135_SUITE_ALLOW)
+            .chain(WI3135_UNLISTED_COMMAND_DENY)
+            .chain(WI3135_SSH_OPTION_DENY)
+            .chain(WI3135_CONTENT_ALLOW)
+        {
+            assert_eq!(
+                redirect_unquoted_scan_view(cmd).len(),
+                cmd.len(),
+                "scan view changed byte length for `{cmd}`"
+            );
+        }
+    }
+
+    /// strict r2 Major (`filesystem.rs:3285`): every WI-3135 fixture is
+    /// asserted on the SHIPPED decision path — `evaluate_detailed`, which
+    /// applies `strip_wrapper_prefixes` + `normalize_command` (including the
+    /// command-word dequoting at `normalize.rs:1453`) and heredoc masking
+    /// before pack evaluation — not only against `create_pack()`. Where the
+    /// two layers could disagree (quote-obfuscated command words), the code
+    /// was changed so they agree; see `content_command_word`.
+    #[test]
+    fn redirect_truncate_suite_holds_on_production_path_wi3135_fold3() {
+        for cmd in WI3135_SUITE_DENY
+            .iter()
+            .chain(WI3135_LOCAL_EXECUTOR_DENY)
+            .chain(WI3135_SUGAR_DENY)
+            .chain(WI3135_STRING_RUNNER_DENY)
+            .chain(WI3135_LOOPBACK_DENY)
+            .chain(WI3135_WRAPPER_DENY)
+            .chain(WI3135_ADVERSARIAL_DENY)
+            .chain(WI3135_UNLISTED_COMMAND_DENY)
+            .chain(WI3135_SSH_OPTION_DENY)
+        {
+            assert_production_denies_redirect(cmd);
+        }
+        for cmd in WI3135_SUITE_ALLOW
+            .iter()
+            .chain(WI3135_REMOTE_ALLOW)
+            .chain(WI3135_WRAPPER_ALLOW)
+            .chain(WI3135_CONTENT_ALLOW)
+        {
+            assert_production_allows_redirect(cmd);
+        }
+    }
+
+    /// Run a fixture through the shipped entry point.
+    fn production_result(cmd: &str) -> crate::evaluator::EvaluationResult {
+        crate::evaluator::evaluate_detailed(cmd, &crate::config::Config::default()).result
+    }
+
+    fn assert_production_denies_redirect(cmd: &str) {
+        let result = production_result(cmd);
+        let info = result.pattern_info.as_ref().unwrap_or_else(|| {
+            panic!(
+                "production path allowed `{cmd}`; expected \
+                 core.filesystem:redirect-truncate-root-home at Critical"
+            )
+        });
+        assert_eq!(
+            info.pattern_name.as_deref(),
+            Some("redirect-truncate-root-home"),
+            "production path denied `{cmd}` by {:?} in pack {:?}, not redirect-truncate-root-home",
+            info.pattern_name,
+            info.pack_id
+        );
+        assert_eq!(
+            info.pack_id.as_deref(),
+            Some("core.filesystem"),
+            "production path denied `{cmd}` from the wrong pack"
+        );
+        assert_eq!(
+            info.severity,
+            Some(Severity::Critical),
+            "production path denied `{cmd}` at the wrong severity"
+        );
+        assert!(
+            result.is_denied(),
+            "production path matched but did not deny `{cmd}`"
+        );
+    }
+
+    fn assert_production_allows_redirect(cmd: &str) {
+        let result = production_result(cmd);
+        if let Some(info) = &result.pattern_info {
+            assert_ne!(
+                info.pattern_name.as_deref(),
+                Some("redirect-truncate-root-home"),
+                "production path denied `{cmd}` by redirect-truncate-root-home; expected content"
+            );
+        }
+        assert!(
+            result.is_allowed(),
+            "production path denied `{cmd}` by {:?} in pack {:?}",
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|i| i.pattern_name.clone()),
+            result.pattern_info.as_ref().and_then(|i| i.pack_id.clone())
+        );
     }
 
     #[test]

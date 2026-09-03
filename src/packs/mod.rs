@@ -291,11 +291,27 @@ pub struct DestructivePattern {
 }
 
 impl DestructivePattern {
+    /// Apply a `scan_view`, enforcing the byte-length invariant the field
+    /// documents: `find` spans index the ORIGINAL text, so a view that
+    /// changed length would report a span pointing at the wrong bytes.
+    fn apply_scan_view(
+        view: fn(&str) -> std::borrow::Cow<'_, str>,
+        cmd: &str,
+    ) -> std::borrow::Cow<'_, str> {
+        let viewed = view(cmd);
+        debug_assert_eq!(
+            viewed.len(),
+            cmd.len(),
+            "scan_view must preserve byte length (match spans index the original text)"
+        );
+        viewed
+    }
+
     /// Check whether this pattern matches, honouring its `scan_view`.
     #[must_use]
     pub fn is_match(&self, cmd: &str) -> bool {
         match self.scan_view {
-            Some(view) => self.raw_regex.is_match(&view(cmd)),
+            Some(view) => self.raw_regex.is_match(&Self::apply_scan_view(view, cmd)),
             None => self.raw_regex.is_match(cmd),
         }
     }
@@ -304,7 +320,7 @@ impl DestructivePattern {
     #[must_use]
     pub fn find(&self, cmd: &str) -> Option<(usize, usize)> {
         match self.scan_view {
-            Some(view) => self.raw_regex.find(&view(cmd)),
+            Some(view) => self.raw_regex.find(&Self::apply_scan_view(view, cmd)),
             None => self.raw_regex.find(cmd),
         }
     }
@@ -2326,8 +2342,32 @@ pub fn pack_aware_quick_reject(cmd: &str, enabled_keywords: &[&str]) -> bool {
 /// segment path without changing existing behavior.
 #[must_use]
 pub fn split_command_segments(cmd: &str) -> Vec<&str> {
+    split_command_segment_ranges(cmd)
+        .into_iter()
+        .map(|range| &cmd[range])
+        .collect()
+}
+
+/// Byte ranges of the segments [`split_command_segments`] returns.
+///
+/// Callers that need to map a segment back onto an offset in `cmd` (a
+/// rule-scoped `scan_view`, a span report) must use these ranges rather than
+/// deriving an offset from a returned subslice's address: a future splitter
+/// that returned owned or rewritten segments would make pointer arithmetic
+/// silently wrong with no compile error.
+#[must_use]
+pub fn split_command_segment_ranges(cmd: &str) -> Vec<std::ops::Range<usize>> {
+    /// Range of `cmd[start..end]` with leading and trailing whitespace
+    /// removed, or `None` when the slice is entirely whitespace.
+    fn trimmed(cmd: &str, start: usize, end: usize) -> Option<std::ops::Range<usize>> {
+        let slice = &cmd[start..end];
+        let lead = slice.len() - slice.trim_start().len();
+        let trail = slice.len() - slice.trim_end().len();
+        (lead + trail < slice.len()).then(|| start + lead..end - trail)
+    }
+
     let bytes = cmd.as_bytes();
-    let mut segments: Vec<&str> = Vec::new();
+    let mut segments: Vec<std::ops::Range<usize>> = Vec::new();
     let mut segment_start = 0usize;
     let mut i = 0usize;
     let mut in_single = false;
@@ -2366,9 +2406,8 @@ pub fn split_command_segments(cmd: &str) -> Vec<&str> {
         };
 
         if let Some(width) = split_width {
-            let seg = cmd[segment_start..i].trim();
-            if !seg.is_empty() {
-                segments.push(seg);
+            if let Some(range) = trimmed(cmd, segment_start, i) {
+                segments.push(range);
             }
             i += width;
             segment_start = i;
@@ -2378,15 +2417,13 @@ pub fn split_command_segments(cmd: &str) -> Vec<&str> {
         i += 1;
     }
 
-    let tail = cmd[segment_start..].trim();
-    if !tail.is_empty() {
-        segments.push(tail);
+    if let Some(range) = trimmed(cmd, segment_start, cmd.len()) {
+        segments.push(range);
     }
 
     if segments.is_empty() {
-        let trimmed = cmd.trim();
-        if !trimmed.is_empty() {
-            segments.push(trimmed);
+        if let Some(range) = trimmed(cmd, 0, cmd.len()) {
+            segments.push(range);
         }
     }
 
