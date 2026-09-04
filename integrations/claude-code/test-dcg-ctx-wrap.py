@@ -7,6 +7,9 @@ shell channel. These assertions FAIL if that regresses.
 
 No network, no secrets, no real dcg: DCG_WRAP_BIN points at a stub that records
 the synthetic Bash payload it was handed and returns a DENY decision.
+WI-3059 cases also stub DCG_BIN (`dcg scan`) so file-content verdicts are
+exercised without a live binary; the canary asserts matched file text never
+appears on the deny reason / stdout / stderr.
 
 Run: python3 integrations/claude-code/test-dcg-ctx-wrap.py   (exit 0 = pass)
 """
@@ -690,6 +693,117 @@ def main():
         check("values are still scanned under an unknown key", "x" in cmd)
         check("dict keys are NOT scanned (documented residual, deferred to transformate WI-3067)",
               "git reset --hard origin/main" not in cmd)
+
+
+        # ── transformate WI-3059: ctx_execute_file content scan, no alert exfil ──
+        #
+        # The residual: payload strings are scanned (path + code), but the FILE's
+        # contents were not — because feeding them through dcg-wrap would post the
+        # body to Discord. The close is a separate `dcg scan` whose matched text
+        # never leaves the adapter toward stdout/reason/wrap.
+        SECRET = "WI3059_EXFIL_CANARY_do_not_echo"
+        bad_file = os.path.join(tmp, "payload_secret.sh")
+        with open(bad_file, "w") as fh:
+            fh.write(SECRET + "\ninfisical secrets --plain\n")
+
+        # Allowing payload-text scanner (dcg-wrap): silence = allow (real dcg shape).
+        allow_wrap = os.path.join(tmp, "allow_wrap")
+        with open(allow_wrap, "w") as fh:
+            fh.write("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        os.chmod(allow_wrap, 0o755)
+
+        # File scanner stub: returns a deny finding that INCLUDES the secret in
+        # extracted_command — the adapter must still withhold it from the reason.
+        scan_stub = os.path.join(tmp, "dcg_scan_stub")
+        with open(scan_stub, "w") as fh:
+            fh.write(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "print(json.dumps({\n"
+                "  'schema_version': 1,\n"
+                "  'summary': {'findings_total': 1, 'decisions': {'deny': 1}},\n"
+                "  'findings': [{\n"
+                "    'file': sys.argv[sys.argv.index('--paths')+1] if '--paths' in sys.argv else '?',\n"
+                "    'line': 2,\n"
+                "    'extractor_id': 'shell.script',\n"
+                "    'extracted_command': %r,\n"
+                "    'decision': 'deny',\n"
+                "    'severity': 'error',\n"
+                "    'rule_id': 'transformate.secrets_emit:infisical-secrets-bulk-print',\n"
+                "    'reason': 'blocked'\n"
+                "  }]\n"
+                "}))\n"
+                "sys.exit(1)\n"
+                % SECRET
+            )
+        os.chmod(scan_stub, 0o755)
+
+        def run_file_case(tool_name, tool_input, wrap_bin, dcg_bin):
+            proc = subprocess.run(
+                [sys.executable, WRAP],
+                input=json.dumps({"tool_name": tool_name, "tool_input": tool_input}),
+                capture_output=True, text=True,
+                env=dict(os.environ, DCG_WRAP_BIN=wrap_bin, DCG_BIN=dcg_bin),
+                timeout=30,
+            )
+            try:
+                out = json.loads(proc.stdout)
+            except ValueError:
+                out = {}
+            return _with_exit(out, proc.returncode), proc.stdout, proc.stderr
+
+        out, stdout, stderr = run_file_case(
+            PLUGIN + "ctx_execute_file",
+            {"code": "echo hello", "language": "shell", "path": bad_file},
+            allow_wrap, scan_stub,
+        )
+        check("WI-3059: execute_file with dirty referenced file is DENIED", denied(out))
+        reason = (out.get("hookSpecificOutput") or {}).get("permissionDecisionReason") or ""
+        check("WI-3059: deny reason names the rule id",
+              "transformate.secrets_emit:infisical-secrets-bulk-print" in reason)
+        check("WI-3059: deny reason names the path", bad_file in reason)
+        check("WI-3059: file body never reaches stdout reason", SECRET not in reason)
+        check("WI-3059: file body never reaches raw stdout", SECRET not in (stdout or ""))
+        check("WI-3059: file body never reaches stderr", SECRET not in (stderr or ""))
+
+        # Bare ctx_execute must NOT invoke the file scanner even if a path key is present.
+        # Use a scan stub that would DENY hard if called.
+        out, stdout, stderr = run_file_case(
+            PLUGIN + "ctx_execute",
+            {"code": "echo hello", "language": "shell", "path": bad_file},
+            allow_wrap, scan_stub,
+        )
+        check("WI-3059: bare ctx_execute does not file-scan a path key", allowed(out))
+        check("WI-3059: bare ctx_execute allow carries no secret", SECRET not in (stdout or ""))
+
+        # Clean referenced file + clean payload => allow.
+        clean_file = os.path.join(tmp, "clean.sh")
+        with open(clean_file, "w") as fh:
+            fh.write("echo clean\n")
+        clean_scan = os.path.join(tmp, "dcg_scan_clean")
+        with open(clean_scan, "w") as fh:
+            fh.write(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "print(json.dumps({'schema_version':1,'summary':{'findings_total':0,"
+                "'decisions':{'deny':0}},'findings':[]}))\n"
+                "sys.exit(0)\n"
+            )
+        os.chmod(clean_scan, 0o755)
+        out, _, _ = run_file_case(
+            PLUGIN + "ctx_execute_file",
+            {"code": "echo hello", "path": clean_file},
+            allow_wrap, clean_scan,
+        )
+        check("WI-3059: clean file + clean payload allows", allowed(out))
+
+        # Missing file: skip content verdict (sandbox will fail the tool).
+        out, _, _ = run_file_case(
+            PLUGIN + "ctx_execute_file",
+            {"code": "echo hello", "path": os.path.join(tmp, "no-such-file.sh")},
+            allow_wrap, scan_stub,
+        )
+        check("WI-3059: missing referenced file does not false-deny", allowed(out))
 
     if failures:
         for f in failures:
