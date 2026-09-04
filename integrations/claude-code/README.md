@@ -19,7 +19,8 @@ The adapter:
    `{tool_name: "Bash", tool_input: {command: <code>}}` shape.
 3. Pipes the rewritten payload through `dcg-wrap` (which runs `dcg` + the
    Discord alert path).
-4. Emits `dcg-wrap`'s decision back to Claude Code unchanged.
+4. Emits `dcg-wrap`'s decision body back to Claude Code unchanged, with the exit
+   status normalised to 0 or 2 (see the decision contract below).
 
 **Matching is by SUBSTRING, never exact name** (transformate WI-2096). The harness renamed
 these tools from `mcp__context-mode__ctx_execute` to
@@ -78,13 +79,17 @@ adapter on a host without `dcg-wrap` rejects every `ctx_execute`,
 
 ```
 test -x ~/.local/bin/dcg-wrap || echo "install dcg-wrap FIRST — ctx tools will be denied"
+mkdir -p ~/.local/bin
 cp dcg-ctx-wrap ~/.local/bin/dcg-ctx-wrap
 chmod +x ~/.local/bin/dcg-ctx-wrap
 ```
 
 ### Verify
 
+From the repository root:
+
 ```
+cd integrations/claude-code
 python3 test-dcg-ctx-wrap.py         # adapter routing, extraction, decision contract
 node test-apply-wi2096-matcher.mjs   # applier gating, canaries, publish ordering
 ```
@@ -173,7 +178,7 @@ matcher text, and the matcher text is not the control.
 |---|---|---|
 | `HOOK_SETTINGS` | `~/.claude/settings.json` | canonical hook config to patch |
 | `HOOK_SWEEP` | `~/dev/warden-memory/scripts/audit-hook-matchers.mjs` | coverage sweep |
-| `CTX_WRAP` | `~/.local/bin/dcg-ctx-wrap` | wrapper basename the routing check uses |
+| `CTX_WRAP` | `~/.local/bin/dcg-ctx-wrap` | only its **basename** is used: the name a routing hook command must end in. The canaries run the command in the settings document, never this path. |
 | `HOOK_SWEEP_TIMEOUT_MS` | `120000` | ceiling on a hung sweep |
 
 The sweep script reads `DCG_CTX_WRAP`, not `CTX_WRAP`. The applier sets both to the
@@ -222,11 +227,12 @@ contract without ever engaging it. See "Identification fails closed too".
 
 | situation | decision |
 |---|---|
+| stdin cannot be READ at all (decode or memory error mid-read) | DENY — a failed read is not an empty one; a call arrived whose content was destroyed. An empty stdin still reads as "no call" and is allowed. |
 | stdin is not parseable JSON, and its raw bytes name no guarded tool | ALLOW — the call cannot be identified and nothing claims it should be. The harness writes this stdin; malformed input means the harness is broken. |
 | stdin cannot be identified (unparseable, not an object, or `tool_name` missing/empty/not a string) **but its raw bytes name a guarded tool** | DENY |
 | `tool_name` is a string naming something other than a context-mode exec tool | ALLOW — not this adapter's surface. |
 | payload carried strings and all of them are blank | ALLOW — there is genuinely no code text to scan. |
-| `tool_input` is not an object | DENY |
+| `tool_input` is missing, not an object, or an empty object | DENY — a guarded call with no payload is a truncated or malformed invocation, not a deliberate no-op. |
 | payload carries no string fields at all | DENY — an unrecognized shape, which is what a schema rename looks like from inside the adapter. |
 | payload nests deeper than `MAX_DEPTH` | DENY — scanning only the shallow part would report a verdict on a fraction of the payload. |
 | `dcg-wrap` cannot be invoked, times out, or dies | DENY |
@@ -235,8 +241,11 @@ contract without ever engaging it. See "Identification fails closed too".
 | `dcg-wrap` writes output that is not a recognisable decision, at any exit status | DENY |
 | any unexpected exception after the tool was identified as guarded | DENY |
 
-A parseable decision from `dcg-wrap` is passed through untouched, exit status
-included — it signals a block with exit 2, and rewriting that would mask its DENY.
+A recognisable decision from `dcg-wrap` (`continue`, or a `hookSpecificOutput` with
+`permissionDecision` allow / deny / ask) has its body passed through untouched. The exit
+status is **normalised**, not forwarded: 2 stays 2, everything else becomes 0. The host
+reads 2 as blocking and every other non-zero as non-blocking-and-proceed, so forwarding a
+deny that happened to exit 3 would print the denial and run the call anyway.
 
 **This replaces the previous blanket fail-open guarantee**, which read "the adapter
 must never block real work because of its own bugs". That is a sound principle
@@ -289,5 +298,5 @@ scoped to `Bash` only.
 Re-opened 2026-07-19 (transformate WI-2037 sweep, RED; fixed under transformate WI-2096): the same
 control had gone dark again, this time because the tool names changed
 underneath it. No observed leak — a missing control, found by the sweep rather
-than by an incident. The suffix matching and the sweep exist so the third
+than by an incident. The substring matching and the sweep exist so the third
 occurrence trips a red timer instead of a postmortem.

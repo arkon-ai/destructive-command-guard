@@ -26,6 +26,9 @@ const APPLY = path.join(HERE, "apply-wi2096-matcher.mjs");
 const LOOSE = "context-mode__ctx_(execute|execute_file|batch_execute)";
 
 const tmp = mkdtempSync(path.join(tmpdir(), "wi2096-"));
+// Removed on EXIT, not only at the bottom of the file: a throw anywhere in between used to
+// leave the whole tree (stub wrappers, settings fixtures) behind under tmpdir (WI-3068 T16).
+process.on("exit", () => rmSync(tmp, { recursive: true, force: true }));
 const failures = [];
 const check = (desc, cond) => { if (!cond) failures.push(desc); };
 
@@ -454,7 +457,7 @@ if (process.platform !== "win32") {
   // the runner's own pid, so no planted link ever sat on the path the applier used and the
   // assertion passed against the unfixed applier too. A throwaway child tells us where the
   // counter is now; the applier is the next fork after it.
-  const probe = spawnSync(process.execPath, ["-e", ""]);
+  const probe = spawnSync(process.execPath, ["-e", ""], { timeout: 120000 });
   const from = (probe.pid || process.pid) + 1;
   for (let p = from; p < from + 250; p++) {
     try { symlinkSync(secret, `${s}.tmp-wi2096-${p}`); } catch { /* taken */ }
@@ -662,6 +665,7 @@ if (process.platform !== "win32") {
   const s = settings([staleEntry(bin)]);
   const r = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: {
       ...process.env,
       HOOK_SETTINGS: s,
@@ -684,6 +688,7 @@ if (process.platform !== "win32") {
   writeFileSync(leakSweep, "process.exit(process.env.DCG_WRAP_BIN ? 3 : 0);\n");
   const r2 = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: {
       ...process.env,
       HOOK_SETTINGS: settings([staleEntry(bin)]),
@@ -747,6 +752,7 @@ if (process.platform !== "win32") {
   const sA = settings([staleEntry(bin)], { DCG_WRAP_BIN: CONFIG_PICK });
   const rA = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: opEnv({ HOOK_SETTINGS: sA, HOOK_SWEEP: sweep(0), CTX_WRAP: bin }),
   });
   const outA = (rA.stdout || "") + (rA.stderr || "");
@@ -759,6 +765,7 @@ if (process.platform !== "win32") {
   const sB = settings([staleEntry(bin)], { DCG_WRAP_BIN: CONFIG_PICK });
   const rB = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: opEnv({
       HOOK_SETTINGS: sB, HOOK_SWEEP: sweep(0), CTX_WRAP: bin,
       DCG_WRAP_BIN: SHELL_PICK,
@@ -777,6 +784,7 @@ if (process.platform !== "win32") {
     `process.exit(process.env.DCG_WRAP_BIN === ${JSON.stringify(CONFIG_PICK)} ? 0 : 3);\n`);
   const rC = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: opEnv({
       HOOK_SETTINGS: settings([staleEntry(bin)], { DCG_WRAP_BIN: CONFIG_PICK }),
       HOOK_SWEEP: cfgSweep, CTX_WRAP: bin,
@@ -812,6 +820,7 @@ if (process.platform !== "win32") {
   const sD = settings([staleEntry(deleg)], { DCG_WRAP_BIN: silentStub });
   const rD = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: opEnv({ HOOK_SETTINGS: sD, HOOK_SWEEP: sweep(0), CTX_WRAP: deleg }),
   });
   const outD = (rD.stdout || "") + (rD.stderr || "");
@@ -827,7 +836,7 @@ if (process.platform !== "win32") {
   //     ALREADY CURRENT and emits from a different place in the script.
   const sE = settings([staleEntry(bin)], { DCG_WRAP_BIN: CONFIG_PICK });
   const eEnv = opEnv({ HOOK_SETTINGS: sE, HOOK_SWEEP: sweep(0), CTX_WRAP: bin });
-  const rE = spawnSync(process.execPath, [APPLY], { encoding: "utf8", env: eEnv });
+  const rE = spawnSync(process.execPath, [APPLY], { encoding: "utf8", timeout: 120000, env: eEnv });
   const outE = (rE.stdout || "") + (rE.stderr || "");
   check("T3e: patch branch goes green", rE.status === 0);
   check("T3e: patch branch names the resolved scanner it invoked",
@@ -849,7 +858,7 @@ if (process.platform !== "win32") {
   check("T3e: the env block survives the publish",
     JSON.parse(readFileSync(sE, "utf8")).env.DCG_WRAP_BIN === CONFIG_PICK);
 
-  const rE2 = spawnSync(process.execPath, [APPLY], { encoding: "utf8", env: eEnv });
+  const rE2 = spawnSync(process.execPath, [APPLY], { encoding: "utf8", timeout: 120000, env: eEnv });
   const outE2 = (rE2.stdout || "") + (rE2.stderr || "");
   check("T3e: already-current branch goes green", rE2.status === 0);
   check("T3e: already-current branch still says so", /^already current/m.test(outE2));
@@ -915,6 +924,7 @@ if (process.platform !== "win32") {
   const sA = settings([staleEntry(probe)]);
   const rA = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: opEnv({
       HOOK_SETTINGS: sA, HOOK_SWEEP: sweep(0), CTX_WRAP: probe,
       PYTHONPATH: path.join(d, "evil-site-packages"),
@@ -960,6 +970,7 @@ if (process.platform !== "win32") {
 
   const rC = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: opEnv({
       HOOK_SETTINGS: settings([staleEntry(pathProbe)], { PATH: wantPath }),
       HOOK_SWEEP: sweep(0), CTX_WRAP: pathProbe,
@@ -1001,6 +1012,7 @@ if (process.platform !== "win32") {
   const sD = settings([staleEntry(interpWrap)]);
   const rD = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: opEnv({
       HOOK_SETTINGS: sD, HOOK_SWEEP: sweep(0), CTX_WRAP: interpWrap,
       // The ONLY thing that makes the wrapper runnable, and it lives in the operator's shell.
@@ -1068,6 +1080,7 @@ if (process.platform !== "win32") {
   const beforeA = readFileSync(sA, "utf8");
   const rA = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: opEnv({
       HOOK_SETTINGS: sA, HOOK_SWEEP: sweep(0), CTX_WRAP: interpWrap,
       PATH: `${opBin}${path.delimiter}${process.env.PATH || ""}`,
@@ -1086,6 +1099,7 @@ if (process.platform !== "win32") {
   // Same wrapper, same operator PATH — now green, because canary and hook agree on PATH.
   const rAok = spawnSync(process.execPath, [APPLY], {
     encoding: "utf8",
+    timeout: 120000,
     env: opEnv({
       HOOK_SETTINGS: settings([staleEntry(interpWrap)], { PATH: opBin }),
       HOOK_SWEEP: sweep(0), CTX_WRAP: interpWrap,
@@ -1751,6 +1765,145 @@ if (process.platform !== "win32") {
     check(`M-a: the regex and the operator text agree about \`${ch}\``, inRegex === inText);
     check(`M-a: and neither of them admits \`${ch}\``, inRegex === false);
   }
+}
+
+// ── transformate WI-3068 — R6 deferred bundle: the mechanism fixes, each pinned ─────────────
+//
+// T2: a hook spelled `$HOME/...` is accepted on exactly the rule `~/...` already has — HOME is
+//     a key in the document's env block, absolute, plain literal — and only when UNQUOTED. Neither
+//     `~` nor `$HOME` expands inside quotes, so a quoted form would make the shell exec a literal
+//     string; that is refused rather than expanded.
+{
+  const d = mkdtempSync(path.join(tmp, "t3068-home-"));
+  const w = path.join(d, "dcg-ctx-wrap");
+  copyFileSync(SCANNER, w);
+  chmodSync(w, 0o755);
+  const s = settings([staleEntry("$HOME/dcg-ctx-wrap")], { HOME: d });
+  const r = run(s, sweep(0), [], w);
+  check("T2: a $HOME/ hook command with HOME declared is accepted", r.status === 0);
+  check("T2: a $HOME/ hook command publishes LOOSE",
+    r.status === 0 && JSON.parse(readFileSync(s, "utf8")).hooks.PreToolUse[0].matcher === LOOSE);
+  const sq = settings([staleEntry("'$HOME/dcg-ctx-wrap'")], { HOME: d });
+  const rq = run(sq, sweep(0), [], w);
+  check("T2: a QUOTED $HOME/ hook command is refused", rq.status !== 0 && /NONE execs/.test(rq.out));
+  const st = settings([staleEntry("'~/dcg-ctx-wrap'")], { HOME: d });
+  const rt = run(st, sweep(0), [], w);
+  check("T2: a QUOTED ~/ hook command is refused too", rt.status !== 0 && /NONE execs/.test(rt.out));
+  const sn = settings([staleEntry("$HOME/dcg-ctx-wrap")]);
+  const rn = run(sn, sweep(0), [], w);
+  check("T2: a $HOME/ hook command WITHOUT a declared HOME is refused",
+    rn.status !== 0 && /NONE execs/.test(rn.out));
+  check("T2: the refusal text names $HOME/ beside ~/", /`\$HOME\/`/.test(rn.out));
+}
+
+// T9: a settings document of the wrong SHAPE is refused with the applier's own message. The
+//     parse guard only covered "does not parse"; a document that parses to null, or whose
+//     PreToolUse is an object, threw a bare TypeError stack past every structured message.
+{
+  const stack = /^\s+at /m;
+  const shapes = [
+    ["null document", "null"],
+    ["string document", '"hooks"'],
+    ["array document", "[]"],
+    ["hooks not an object", JSON.stringify({ hooks: "x", env: pins({}) })],
+    ["hooks is an array", JSON.stringify({ hooks: [], env: pins({}) })],
+    ["PreToolUse not an array", JSON.stringify({ hooks: { PreToolUse: {} }, env: pins({}) })],
+    ["non-object entry", JSON.stringify({ hooks: { PreToolUse: ["mcp__context-mode__ctx_execute"] }, env: pins({}) })],
+    ["null entry", JSON.stringify({ hooks: { PreToolUse: [null] }, env: pins({}) })],
+  ];
+  for (const [name, body] of shapes) {
+    const p = path.join(tmp, `t3068-shape-${name.replace(/\W+/g, "-")}.json`);
+    writeFileSync(p, body + "\n");
+    const r = run(p, sweep(0));
+    check(`T9: ${name} exits non-zero`, r.status !== 0);
+    check(`T9: ${name} is refused without a stack trace`, !stack.test(r.out));
+    check(`T9: ${name} is refused with a structured message`, /cannot use .*: /.test(r.out));
+  }
+}
+
+// T10: HOOK_SWEEP_TIMEOUT_MS is validated at the door. A non-numeric value used to reach
+//      spawnSync as NaN and die with a bare RangeError; `0` silently DISABLED the ceiling the
+//      variable exists to set.
+{
+  const s = settings([looseEntry()]);
+  for (const bad of ["abc", "-5", "0", "1.5", "10s"]) {
+    const r = spawnSync(process.execPath, [APPLY], {
+      encoding: "utf8",
+      timeout: 120000,
+      env: { ...process.env, HOOK_SETTINGS: s, HOOK_SWEEP: sweep(0), CTX_WRAP: SCANNER,
+             HOOK_SWEEP_TIMEOUT_MS: bad },
+    });
+    const out = (r.stdout || "") + (r.stderr || "");
+    check(`T10: HOOK_SWEEP_TIMEOUT_MS=${JSON.stringify(bad)} exits non-zero`, r.status !== 0);
+    check(`T10: HOOK_SWEEP_TIMEOUT_MS=${JSON.stringify(bad)} is refused by name, not a stack`,
+      /HOOK_SWEEP_TIMEOUT_MS/.test(out) && !/^\s+at /m.test(out) && !/RangeError/.test(out));
+    check(`T10: HOOK_SWEEP_TIMEOUT_MS=${JSON.stringify(bad)} ran no canary`, !/canary 1:/.test(out));
+  }
+  const ok = run(s, sweep(0));
+  check("T10: the default ceiling still certifies", ok.status === 0);
+}
+
+// T12: a hollow sibling is NOT rewritten — it never routes to the wrapper, so it is not a
+//      target — and the note must say that instead of promising a rewrite that never happens.
+{
+  const hollowSibling = { matcher: "context-mode__ctx_execute_file", hooks: [] };
+  const s = settings([staleEntry(), hollowSibling]);
+  const r = run(s, sweep(0));
+  check("T12: a hollow sibling does not stop a publish", r.status === 0);
+  const after = JSON.parse(readFileSync(s, "utf8")).hooks.PreToolUse;
+  check("T12: the routing entry was rewritten to LOOSE", after[0].matcher === LOOSE);
+  check("T12: the hollow sibling's matcher was NOT rewritten",
+    after[1].matcher === "context-mode__ctx_execute_file");
+  check("T12: the note is printed for the hollow sibling", /NOTE 1 context-mode matcher/.test(r.out));
+  check("T12: the note does not claim the hollow entry will be rewritten", !/will be rewritten/.test(r.out));
+  check("T12: the note says the hollow entry is left as it is", /left as (it is|they are)/.test(r.out));
+}
+
+// T8: --dry-run runs NO canary and must not say it is verifying anything. Driven with a RED
+//     sweep so a dry run that quietly started verifying would be caught either way.
+{
+  const s = settings([looseEntry()]);
+  const before = readFileSync(s, "utf8");
+  const r = run(s, sweep(3), ["--dry-run"]);
+  check("T8: dry-run on an already-current file exits 0", r.status === 0);
+  check("T8: dry-run on an already-current file touches nothing", readFileSync(s, "utf8") === before);
+  check("T8: dry-run does not claim to be verifying the control", !/verifying the control/.test(r.out));
+  check("T8: dry-run ran no canary", !/canary [123]:/.test(r.out) && !/CANARY FAILED/.test(r.out));
+  check("T8: dry-run says the canaries were NOT run", /dry-run: .*canar(y|ies).*NOT run/.test(r.out));
+  const s2 = settings([staleEntry()]);
+  const r2 = run(s2, sweep(3), ["--dry-run"]);
+  check("T8: dry-run on a stale file exits 0", r2.status === 0);
+  check("T8: dry-run on a stale file says the canaries were NOT run",
+    /dry-run: .*canar(y|ies).*NOT run/.test(r2.out));
+}
+
+// T6: the chown fallback is a diagnostic, not a gate. The positive case (a source file owned
+//     by someone else, chown refused) needs root to construct, so it is not pinned here; what
+//     is pinned is that the ordinary run — the file is ours — does not emit the note.
+{
+  const s = settings([staleEntry()]);
+  const r = run(s, sweep(0));
+  check("T6: an ordinary publish prints no ownership note", r.status === 0 && !/could not restore owner/.test(r.out));
+  check("T6: the ownership note exists in the applier", /could not restore owner/.test(readFileSync(APPLY, "utf8")));
+}
+
+// T15 / T16: pinned on this file's own source, in the M-a style. Every subprocess this
+//            self-check spawns carries a timeout, and the temp tree is removed on exit.
+{
+  const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
+  const sites = [];
+  const re = /^\s*(?:const \w+ = )?spawnSync\(/gm;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    const end = src.indexOf(");", m.index);
+    sites.push(src.slice(m.index, end + 2));
+  }
+  check("T15: the self-check has spawn sites to pin", sites.length >= 15);
+  const untimed = sites.filter((chunk) => !/timeout:\s*\d+/.test(chunk));
+  check(`T15: every spawnSync in the self-check carries a timeout (${untimed.length} without)`,
+    untimed.length === 0);
+  check("T16: the temp tree is removed on process exit, not only at the bottom of the file",
+    /process\.on\("exit", \(\) => rmSync\(tmp/.test(src));
 }
 
 rmSync(tmp, { recursive: true, force: true });
