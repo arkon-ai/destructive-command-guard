@@ -54,16 +54,19 @@ The observable consequence, so it is not mistaken for a bug: a dangerous-looking
 That over-matching is the deliberate trade — dcg scans text, so a needless scan
 costs nothing and a missed one is the incident.
 
-The matching residual worth knowing: the adapter verdicts on the payload's own
-text. For `ctx_execute_file` it does **not** read the file named by `path` — and
-deliberately so, because the extracted text flows into the synthetic command,
-into dcg, and into dcg-wrap's Discord alert path, which would turn the guard into
-an exfiltration channel for any file it was pointed at. `code` is required by the
-tool's schema, so the executable text is present and scanned; the file's
-*contents* are data the sandbox reads, not code this adapter can verdict.
+Payload text (every string value under `tool_input`, including `path` and
+`code`) still flows through `dcg-wrap` as a synthetic Bash command — that is the
+original WI-2096 path and it is unchanged.
 
-Tracked as transformate WI-3059, which also records what a real fix would have to
-do: keep file contents out of the alerting path entirely.
+**transformate WI-3059 (closed):** for `ctx_execute_file` only, after a clean
+payload-text verdict the adapter runs a **separate** `dcg scan --paths <path>
+--format json --redact aggressive` on the referenced file. That report is parsed
+for deny/error findings; the deny reason carries **rule id + path + line only**.
+The matched snippet / file body is deliberately dropped and is **never** forwarded
+to `dcg-wrap`, so it cannot reach the Discord alert path. Reading the file into
+the synthetic command was considered and refused at merge authority on 2026-08-20
+for exactly that exfil reason; this is the remedy that keeps contents off the
+alert channel.
 
 For non-shell languages (javascript / python / ruby / etc.), DCG's regex
 patterns still scan the raw source — substrings like `infisical secrets --plain`
