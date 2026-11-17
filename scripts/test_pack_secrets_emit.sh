@@ -5,7 +5,7 @@
 # Tests blocking/allowing behavior for the secret-emission guard pack.
 # Pack covers v1.0.0 (8 patterns) + v1.1.0 (at-c-job-env-dump, proc-environ-read)
 # + v1.3.0 (proc-cmdline-bulk, ps-argv-env-dump, pgrep-list-full — argv/env leak class,
-#   transformate WI-750; each carries a --no-secrets-near legit-use escape).
+#   transformate WI-750; each carries a NO_SECRETS_NEAR=1 legit-use escape).
 #
 # Usage:
 #   ./scripts/test_pack_secrets_emit.sh [--verbose] [--binary PATH]
