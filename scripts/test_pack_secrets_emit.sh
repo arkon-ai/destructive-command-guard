@@ -26,9 +26,18 @@ TESTS_FAILED=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --verbose|-v) VERBOSE=true; shift ;;
-        --binary|-b) BINARY="$2"; shift 2 ;;
-        *) echo "Unknown: $1"; exit 1 ;;
+        --verbose|-v)
+            VERBOSE=true
+            shift
+            ;;
+        --binary|-b)
+            BINARY="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown: $1"
+            exit 1
+            ;;
     esac
 done
 
@@ -77,11 +86,26 @@ test_cmd() {
     escaped_cmd=$(json_escape "$cmd")
     local json="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$escaped_cmd\"}}"
 
+    # Keep the binary's exit status: a missing binary (126/127), a crash or any
+    # status other than 0 fails the case. dcg answers both allow and deny with rc 0.
     local out
-    out=$(echo -n "$json" | DCG_PACKS="$PACK_NAME" "$BINARY" 2>&1 || true)
+    local rc
+    if out=$(printf '%s' "$json" | DCG_PACKS="$PACK_NAME" "$BINARY" 2>&1); then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    if [[ "$rc" -ne 0 ]]; then
+        echo -e "${RED}FAIL${NC} [$(echo "$expected" | tr '[:lower:]' '[:upper:]')] $desc"
+        echo "  Binary exited with status $rc (want 0), output: $out"
+        TESTS_FAILED=$((TESTS_FAILED+1))
+        return 0
+    fi
 
     if [[ "$expected" == "block" ]]; then
-        if echo "$out" | grep -q '"permissionDecision"' && echo "$out" | grep -q '"deny"'; then
+        # A BLOCK needs a non-empty deny answer from the binary.
+        if [[ -n "$out" ]] && echo "$out" | grep -q '"permissionDecision"' && echo "$out" | grep -q '"deny"'; then
             [[ "$VERBOSE" == "true" ]] && echo -e "${GREEN}PASS${NC} [BLOCK] $desc"
             TESTS_PASSED=$((TESTS_PASSED+1))
         else
@@ -90,12 +114,13 @@ test_cmd() {
             TESTS_FAILED=$((TESTS_FAILED+1))
         fi
     else
-        if [[ -z "$out" ]] || ! echo "$out" | grep -q '"permissionDecision"'; then
+        # An ALLOW needs rc 0 (checked above) AND empty output.
+        if [[ -z "$out" ]]; then
             [[ "$VERBOSE" == "true" ]] && echo -e "${GREEN}PASS${NC} [ALLOW] $desc"
             TESTS_PASSED=$((TESTS_PASSED+1))
         else
             echo -e "${RED}FAIL${NC} [ALLOW] $desc"
-            echo "  Expected allow, got: $out"
+            echo "  Expected allow (empty output), got: $out"
             TESTS_FAILED=$((TESTS_FAILED+1))
         fi
     fi
@@ -247,6 +272,50 @@ test_cmd "pgrep -af NO_SECRETS_NEAR" "block" "escape token as search arg still b
 test_cmd "cat /proc/1/cmdline /tmp/NO_SECRETS_NEAR/x" "block" "escape token in decoy path still blocks"
 test_cmd "pgrep -af NO_SECRETS_NEAR=1" "block" "escape= in arg position still blocks"
 test_cmd "foo; NO_SECRETS_NEAR=1 pgrep -af nginx" "allow" "escape env-assign after ; allows"
+
+# --- v1.3.0 review round 1 fixes (transformate WI-750) ---
+
+# multi-line command: the listing on a later line still blocks; an escape on
+# another line does not relax it
+test_cmd $'cd /tmp\npgrep -af foo' "block" "pgrep -af on line 2 (newline before listing)"
+test_cmd $'sleep 1\nps -ef' "block" "ps -ef on line 2 (newline before listing)"
+test_cmd $'true\ncat /proc/*/cmdline' "block" "cat /proc/*/cmdline on line 2 (newline before read)"
+test_cmd $'pgrep -af foo\nNO_SECRETS_NEAR=1 true' "block" "escape on another line does not relax line 1"
+
+# ps full format when -f/-F is not the first option
+test_cmd "ps -e -f" "block" "ps -e -f (split -ef)"
+test_cmd "ps -p 123 -f" "block" "ps -p PID -f (full format after selector)"
+test_cmd 'ps -p "$PID" -F' "block" "ps -p \"\$PID\" -F (extra-full after selector)"
+test_cmd "ps -A -f" "block" "ps -A -f (split -Af)"
+test_cmd "ps -e -Lf" "block" "ps -e -Lf (threads, full format)"
+test_cmd "pgrep -f foo | xargs -I% ps -p % -f" "block" "xargs ps -p % -f (full format via xargs)"
+
+# safe patterns no longer carry a /proc read or a second segment
+test_cmd "grep -a . /proc/*/cmdline" "block" "grep over /proc/*/cmdline glob"
+test_cmd "grep -c foo app.log; pgrep -af foo" "block" "grep segment then pgrep -af"
+test_cmd "cat README.md; ps -ef" "block" "cat README segment then ps -ef"
+test_cmd "cat README.md /proc/*/cmdline" "block" "cat README plus /proc/*/cmdline"
+test_cmd "cat README.md; cat /proc/123/environ" "block" "cat README segment then /proc environ"
+test_cmd "grep -c x app.log; cat /proc/123/environ" "block" "grep segment then /proc environ"
+test_cmd "grep -n foo app.log" "allow" "grep -n on a log (safe pattern still allows)"
+
+# narrow forms the fleet uses stay allowed
+test_cmd "pgrep -c node && ls -la /tmp" "allow" "pgrep -c then ls -la (a flag in a later segment)"
+test_cmd "pgrep -x bash >/dev/null && uname -a" "allow" "pgrep -x then uname -a (a flag in a later segment)"
+test_cmd "pgrep -f 'rsync -av' | wc -l" "allow" "pgrep -f quoted pattern holding -av"
+test_cmd "pgrep -f 'java -jar app.jar' | wc -l" "allow" "pgrep -f quoted pattern holding -jar"
+test_cmd "docker compose ps api" "allow" "docker compose ps (service listing)"
+test_cmd "docker compose ps redis" "allow" "docker compose ps redis (service listing)"
+test_cmd "docker ps -f name=web" "allow" "docker ps -f filter (container listing)"
+test_cmd "pgrep -f 'foo' -a" "block" "pgrep -a after a quoted pattern still blocks"
+test_cmd "pgrep '-af' foo" "block" "pgrep quoted -af still blocks"
+
+# cd into a /proc pid dir, then read cmdline
+test_cmd "cd /proc/123 && cat cmdline" "block" "cd /proc/PID then cat cmdline"
+
+# long-option prefix and AIX format alias
+test_cmd "pgrep --list-f foo" "block" "pgrep --list-f (unambiguous prefix of --list-full)"
+test_cmd "ps -eo '%p %a'" "block" "ps -eo %a (AIX args alias)"
 
 echo "----------------------------------------"
 echo "Tests Passed: $TESTS_PASSED"
