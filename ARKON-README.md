@@ -15,7 +15,7 @@ Arkon-AI policy: prefer org-owned binaries over upstream `curl | bash` dependenc
 
 In `packs-arkon/`. Currently:
 
-- `transformate.secrets_emit.yaml` — blocks Bash patterns that emit secret VALUES to stdout (closes upstream's emission-class gap). 8 destructive + 6 safe patterns, schema-validated, 29/29 smoke tests pass.
+- `transformate.secrets_emit.yaml` — blocks Bash patterns that emit secret VALUES to stdout (closes upstream's emission-class gap). 15 destructive + 6 safe patterns, schema-validated, 127/127 smoke tests pass (`scripts/test_pack_secrets_emit.sh`). v1.3.0 adds the argv/env leak class (`proc-cmdline-bulk`, `ps-argv-env-dump`, `pgrep-list-full`; transformate WI-750). The env-assign `NO_SECRETS_NEAR=1` is the legit-use escape: it relaxes those three rules on its own line only (a `--no-secrets-near` flag breaks the real cat, ps and pgrep).
 
 To install on a host: copy YAML files into `~/.config/dcg/packs/`.
 
